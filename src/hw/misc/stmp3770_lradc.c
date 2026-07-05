@@ -137,14 +137,11 @@ static void lradc_complete_scheduled(STMP3770LRADCState *s)
     int ch;
     uint32_t schedule = s->ctrl0 & CTRL0_SCHEDULE_MASK;
 
-    qemu_log_mask(LOG_GUEST_ERROR, "lradc schedule=0x%02x\n", schedule);
-
     for (ch = 0; ch < 8; ch++) {
         if (schedule & (1U << ch)) {
             /* Instant conversion: set TOGGLE and a plausible 12-bit value */
             s->channel[ch] &= ~CH_VALUE_MASK;
             s->channel[ch] |= CH_TOGGLE | 0x00000ABC;
-            qemu_log_mask(LOG_GUEST_ERROR, "lradc ch%d -> 0x%08x\n", ch, s->channel[ch]);
         }
     }
 
@@ -187,11 +184,10 @@ static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
              *
              * Simulate disconnected battery (USB powered):
              */
+            ret = s->channel[ch];
             if (ch == 7) {
-                ret = 2748;  /* Match ExistOS observation: "adc:2748" */
-            } else {
-                /* Channels 0-6: Keyboard matrix, return mid-range */
-                ret = s->channel[ch];
+                /* Replace VALUE field with simulated battery ADC, keep control bits */
+                ret = (ret & ~CH_VALUE_MASK) | (2748 & CH_VALUE_MASK);
             }
         }
         break;
