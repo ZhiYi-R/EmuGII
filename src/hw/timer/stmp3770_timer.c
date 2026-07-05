@@ -311,9 +311,19 @@ static void stmp3770_timer_write_rotctrl(STMP3770TimerState *s,
     stmp3770_timer_apply_write(
         &s->rotctrl, ROTCTRL_WRITABLE_MASK, value, sct);
 
-    if (s->rotctrl & ROTCTRL_SFTRST) {
+    /*
+     * STMP3770 SFTRST protocol: when software writes SFTRST=1, hardware
+     * resets the module and automatically sets CLKGATE=1. Software polls
+     * CLKGATE until it reads 1, then clears both SFTRST and CLKGATE.
+     *
+     * Emulation: trigger reset when SFTRST transitions 0->1, then force
+     * CLKGATE=1 so firmware sees the expected state.
+     */
+    if (!(old & ROTCTRL_SFTRST) && (s->rotctrl & ROTCTRL_SFTRST)) {
         stmp3770_timer_reset(DEVICE(s));
-        return;
+        /* After reset, ROTCTRL = SFTRST|CLKGATE|PRESENT. Preserve the
+         * SFTRST bit that firmware just wrote, so next read sees both set. */
+        s->rotctrl |= ROTCTRL_SFTRST;
     }
 
     if ((old ^ s->rotctrl) & ROTCTRL_CLKGATE) {
