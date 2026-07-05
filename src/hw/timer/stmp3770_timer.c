@@ -206,14 +206,18 @@ static void stmp3770_timer_configure(STMP3770TimerState *s, int idx,
     }
 
     /*
-     * A limit of zero with periodic mode would fire continuously.
-     * Model it as stopped to avoid interrupt storms.
+     * Do not start the timer if limit is zero - hardware would have
+     * nothing to count down from. Wait for software to write a non-zero
+     * fixed count value before starting.
      */
-    if (limit == 0 && periodic) {
+    if (limit == 0) {
         ptimer_stop(t->ptimer);
         t->running = false;
+    } else if (periodic) {
+        ptimer_run(t->ptimer, 0);  /* periodic mode */
+        t->running = true;
     } else {
-        ptimer_run(t->ptimer, periodic ? 0 : 1);
+        ptimer_run(t->ptimer, 1);  /* oneshot mode */
         t->running = true;
     }
 
@@ -481,8 +485,16 @@ static void stmp3770_timer_init(Object *obj)
         sysbus_init_irq(sbd, &s->irq[i]);
         s->cb_info[i].s = s;
         s->cb_info[i].idx = i;
+        /* Use policy matching STMP3770 hardware:
+         * - Counter represents actual value (not value-1)
+         * - Trigger only when decrementing to 0
+         * - Wrap after one period at 0 in periodic mode
+         */
         s->timer[i].ptimer = ptimer_init(stmp3770_timer_tick,
-                                         &s->cb_info[i], PTIMER_POLICY_LEGACY);
+                                         &s->cb_info[i],
+                                         PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                         PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT |
+                                         PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD);
     }
 
     s->version = 0x01010000; /* TIMROT Block v1.1 */
