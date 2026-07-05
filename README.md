@@ -4,6 +4,8 @@
 
 STMP3770 是一款基于 ARM926EJ-S 的嵌入式 SoC,广泛用于便携式媒体播放器(如 HP 39gII 计算器)。
 
+**注**: HP 39gII 仅有 512KB 片上 SRAM,无外部 DRAM。ExistOS 使用 NAND Flash 作为虚拟内存交换空间。
+
 ## 项目特点
 
 - **完整的 SoC 模拟** - 18 个外设模块,涵盖中断、时钟、DMA、NAND Flash、显示、音频等
@@ -92,7 +94,7 @@ EmuGII/
 ## 已实现组件
 
 ### 核心
-- **STMP3770 SoC** - ARM926EJ-S + 512KB SRAM + DRAM 支持
+- **STMP3770 SoC** - ARM926EJ-S + 512KB SRAM (HP 39gII 无外部 DRAM)
 - **ICOLL** - 中断控制器 (64 源, 4 级优先级, IRQ/FIQ 路由)
 - **CLKCTRL** - 时钟控制器 (480MHz PLL, 多时钟域)
 - **DIGCTL** - 芯片 ID、版本、复位控制
@@ -127,7 +129,6 @@ EmuGII/
 | 地址 | 模块 | 状态 |
 |------|------|------|
 | 0x00000000 | SRAM (512KB) | ✅ |
-| 0x40000000 | DRAM (外部) | ✅ |
 | 0x80000000 | ICOLL | ✅ |
 | 0x80004000 | APBH DMA | ✅ |
 | 0x80008000 | BCH/ECC | ✅ |

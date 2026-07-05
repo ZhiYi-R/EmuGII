@@ -4,13 +4,18 @@
  * Mimics the real hardware environment including Boot ROM initialization.
  *
  * Hardware configuration based on ExistOS-For-HP39GII BSP:
- * - 512KB on-chip SRAM
- * - 128MB external DRAM
+ * - 512KB on-chip SRAM (no external DRAM)
  * - NAND Flash (Samsung K9F1G08U0D: 128MB, 2KB page, 64 pages/block)
  * - 131×64 monochrome LCD (grayscale capable)
  * - Matrix keyboard (6×9)
  * - USB 2.0 OTG
  * - Audio DAC/ADC
+ *
+ * Memory architecture:
+ * - Physical SRAM: 512KB @ 0x00000000
+ * - Virtual memory: ExistOS uses NAND Flash as swap space
+ *   - VM ROM: 0x00100000-0x006FFFFF (6MB virtual, mapped to Flash)
+ *   - VM RAM: 0x02000000-0x022FFFFF (3MB virtual, mapped to Flash)
  *
  * Copyright (C) 2024
  *
@@ -34,8 +39,8 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 
-/* HP 39gII hardware configuration */
-#define STMP3770_BOARD_RAM_DEFAULT  (128 * MiB)
+/* HP 39gII hardware: 512KB SRAM only, no external DRAM */
+#define STMP3770_BOARD_RAM_DEFAULT  (0)
 
 #define TYPE_STMP3770_BOARD MACHINE_TYPE_NAME("stmp3770")
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BoardState, STMP3770_BOARD)
@@ -120,8 +125,24 @@ static void stmp3770_board_init(MachineState *machine)
      * expected Boot ROM / reset state for reference.
      */
 
-    /* External DRAM - provided by machine core via default_ram_id */
-    memory_region_add_subregion(sysmem, STMP3770_DRAM_ADDR, machine->ram);
+    /*
+     * 3. No external DRAM on HP 39gII
+     *
+     * HP 39gII has NO external DRAM - only 512KB on-chip SRAM.
+     * STMP3770 SoC has a DRAM controller (EMI) but it's unused on this board.
+     *
+     * ExistOS virtual memory (VM_RAM_BASE @ 0x02000000, 3MB) is mapped to
+     * NAND Flash via MMU, not to physical DRAM. The DRAM address range
+     * (0x40000000+) is unmapped and will cause data abort if accessed.
+     *
+     * For generic firmware that expects DRAM, machine->ram can be optionally
+     * provided and mapped to 0x40000000, but this doesn't match HP 39gII
+     * hardware.
+     */
+    if (machine->ram_size > 0) {
+        /* Optional external DRAM for non-HP39gII firmware */
+        memory_region_add_subregion(sysmem, STMP3770_DRAM_ADDR, machine->ram);
+    }
 
     /* Load kernel or firmware if provided */
     if (machine->firmware) {
@@ -136,16 +157,16 @@ static void stmp3770_board_init(MachineState *machine)
         /* Set entry point */
         s->soc.cpu.env.regs[15] = STMP3770_SRAM_ADDR;
     } else if (machine->kernel_filename) {
-        /* Load kernel to DRAM */
+        /* Load kernel to SRAM (HP 39gII has no DRAM) */
         if (load_image_targphys(machine->kernel_filename,
-                                STMP3770_DRAM_ADDR,
-                                machine->ram_size) < 0) {
+                                STMP3770_SRAM_ADDR,
+                                STMP3770_SRAM_SIZE) < 0) {
             error_report("Failed to load kernel '%s'", machine->kernel_filename);
             exit(1);
         }
 
         /* Set entry point */
-        s->soc.cpu.env.regs[15] = STMP3770_DRAM_ADDR;
+        s->soc.cpu.env.regs[15] = STMP3770_SRAM_ADDR;
     } else {
         /* No kernel - CPU will try to boot from ROM/SRAM */
         warn_report("No kernel specified, CPU will execute from 0x0 (SRAM)");
