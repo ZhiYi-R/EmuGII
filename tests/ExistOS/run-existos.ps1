@@ -52,6 +52,7 @@ if ($Snapshot) {
     Write-Host "Mode:  snapshot, runtime Flash changes are discarded by QEMU"
 } else {
     Write-Host "Mode:  writable runtime Flash copy under build\ExistOS"
+    Write-Host "Note:  runtime Flash may grow with appended OOB metadata"
 }
 Write-Host ""
 

@@ -35,6 +35,8 @@
 #define DEFAULT_OOB_SIZE        64
 #define DEFAULT_PAGE_BUF_SIZE   (DEFAULT_PAGE_SIZE + DEFAULT_OOB_SIZE)
 
+static const uint8_t gpmi_appended_oob_magic[16] = "STMP3770GPMIOOB1";
+
 static inline bool gpmi_enabled(STMP3770GPMIState *s)
 {
     return (s->ctrl0 & (GPMI_CTRL0_SFTRST | GPMI_CTRL0_CLKGATE)) == 0;
@@ -200,95 +202,259 @@ static void gpmi_decode_address(STMP3770GPMIState *s)
     s->nand_block = s->nand_row / s->pages_per_block;
 }
 
-/*
- * Determine whether the backing image includes OOB.  If the image is at least
- * as large as the full data+OOB layout, treat it as a raw NAND dump with OOB
- * interleaved; otherwise assume a data-only image.
- */
-static uint32_t gpmi_page_stride(STMP3770GPMIState *s)
+static uint64_t gpmi_total_pages(STMP3770GPMIState *s)
 {
-    uint64_t oob_total = (uint64_t)s->pages_per_block * s->num_blocks *
-                         s->page_buf_size;
-    if (s->storage_size >= oob_total) {
-        return s->page_buf_size;
-    }
-    return s->page_size;
+    return (uint64_t)s->pages_per_block * s->num_blocks;
 }
 
-static bool gpmi_nand_load_page(STMP3770GPMIState *s)
+static uint64_t gpmi_data_area_size(STMP3770GPMIState *s)
 {
-    uint64_t offset;
-    uint32_t stride = gpmi_page_stride(s);
+    return gpmi_total_pages(s) * s->page_size;
+}
 
-    if (!s->storage) {
-        return false;
-    }
+static uint64_t gpmi_oob_area_size(STMP3770GPMIState *s)
+{
+    return gpmi_total_pages(s) * s->oob_size;
+}
 
-    offset = (uint64_t)s->nand_row * stride;
-    if (offset + s->page_size > s->storage_size) {
+static uint64_t gpmi_interleaved_area_size(STMP3770GPMIState *s)
+{
+    return gpmi_total_pages(s) * s->page_buf_size;
+}
+
+static uint64_t gpmi_appended_oob_offset(STMP3770GPMIState *s)
+{
+    return gpmi_data_area_size(s);
+}
+
+static uint64_t gpmi_appended_image_size(STMP3770GPMIState *s)
+{
+    return gpmi_data_area_size(s) + gpmi_oob_area_size(s);
+}
+
+static bool gpmi_nand_page_offsets(STMP3770GPMIState *s, uint64_t *data_offset,
+                                   uint64_t *oob_offset)
+{
+    if (s->nand_row >= gpmi_total_pages(s)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-gpmi: page %u out of range\n", s->nand_row);
         return false;
     }
 
-    memcpy(s->page_buf, s->storage + offset, s->page_size);
-    if (stride == s->page_buf_size &&
-        offset + s->page_buf_size <= s->storage_size) {
-        memcpy(s->page_buf + s->page_size, s->storage + offset + s->page_size,
-               s->oob_size);
+    if (s->storage_layout == GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB) {
+        *data_offset = (uint64_t)s->nand_row * s->page_buf_size;
+        *oob_offset = *data_offset + s->page_size;
     } else {
-        memset(s->page_buf + s->page_size, 0xFF, s->oob_size);
+        *data_offset = (uint64_t)s->nand_row * s->page_size;
+        *oob_offset = gpmi_appended_oob_offset(s) +
+                      (uint64_t)s->nand_row * s->oob_size;
     }
+
+    if (*data_offset + s->page_size > s->storage_size ||
+        *oob_offset + s->oob_size > s->storage_size) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: page %u outside backing storage\n",
+                      s->nand_row);
+        return false;
+    }
+
+    return true;
+}
+
+static bool gpmi_nand_load_page(STMP3770GPMIState *s)
+{
+    uint64_t data_offset;
+    uint64_t oob_offset;
+
+    if (!s->storage) {
+        return false;
+    }
+
+    if (!gpmi_nand_page_offsets(s, &data_offset, &oob_offset)) {
+        return false;
+    }
+
+    memcpy(s->page_buf, s->storage + data_offset, s->page_size);
+    memcpy(s->page_buf + s->page_size, s->storage + oob_offset, s->oob_size);
     return true;
 }
 
 static bool gpmi_nand_store_page(STMP3770GPMIState *s)
 {
-    uint64_t offset;
-    uint32_t stride = gpmi_page_stride(s);
+    uint64_t data_offset;
+    uint64_t oob_offset;
 
     if (!s->storage) {
         return false;
     }
 
-    offset = (uint64_t)s->nand_row * stride;
-    if (offset + s->page_size > s->storage_size) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "stmp3770-gpmi: page %u out of range\n", s->nand_row);
+    if (!gpmi_nand_page_offsets(s, &data_offset, &oob_offset)) {
         return false;
     }
 
-    memcpy(s->storage + offset, s->page_buf, s->page_size);
-    if (stride == s->page_buf_size &&
-        offset + s->page_buf_size <= s->storage_size) {
-        memcpy(s->storage + offset + s->page_size, s->page_buf + s->page_size,
-               s->oob_size);
-    }
+    memcpy(s->storage + data_offset, s->page_buf, s->page_size);
+    memcpy(s->storage + oob_offset, s->page_buf + s->page_size, s->oob_size);
 
     if (s->blk) {
-        int ret = blk_pwrite(s->blk, offset, s->page_size, s->page_buf, 0);
+        int ret = blk_pwrite(s->blk, data_offset, s->page_size, s->page_buf, 0);
         if (ret < 0) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "stmp3770-gpmi: failed to write page %u\n",
                           s->nand_row);
             return false;
         }
-        if (stride == s->page_buf_size &&
-            offset + s->page_buf_size <= s->storage_size) {
-            ret = blk_pwrite(s->blk, offset + s->page_size, s->oob_size,
-                             s->page_buf + s->page_size, 0);
-            if (ret < 0) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "stmp3770-gpmi: failed to write OOB %u\n",
-                              s->nand_row);
-                return false;
-            }
+        ret = blk_pwrite(s->blk, oob_offset, s->oob_size,
+                         s->page_buf + s->page_size, 0);
+        if (ret < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "stmp3770-gpmi: failed to write OOB %u\n",
+                          s->nand_row);
+            return false;
         }
     }
 
     s->page_write_cnt++;
     gpmi_log_progress(s, "write", s->nand_row);
     return true;
+}
+
+static bool gpmi_nand_erase_block(STMP3770GPMIState *s)
+{
+    uint64_t data_offset;
+    uint64_t data_size;
+    uint64_t oob_offset;
+    uint64_t erase_oob_size;
+
+    if (!s->storage) {
+        return false;
+    }
+    if (s->nand_block >= s->num_blocks) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: block %u out of range\n",
+                      s->nand_block);
+        return false;
+    }
+
+    if (s->storage_layout == GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB) {
+        data_offset = (uint64_t)s->nand_block * s->pages_per_block *
+                      s->page_buf_size;
+        data_size = (uint64_t)s->pages_per_block * s->page_buf_size;
+        oob_offset = 0;
+        erase_oob_size = 0;
+    } else {
+        data_offset = (uint64_t)s->nand_block * s->pages_per_block *
+                      s->page_size;
+        data_size = (uint64_t)s->pages_per_block * s->page_size;
+        oob_offset = gpmi_appended_oob_offset(s) +
+                     (uint64_t)s->nand_block * s->pages_per_block *
+                     s->oob_size;
+        erase_oob_size = (uint64_t)s->pages_per_block * s->oob_size;
+    }
+
+    if (data_offset + data_size > s->storage_size ||
+        (erase_oob_size &&
+         oob_offset + erase_oob_size > s->storage_size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: erase block %u outside backing storage\n",
+                      s->nand_block);
+        return false;
+    }
+
+    memset(s->storage + data_offset, 0xFF, data_size);
+    if (erase_oob_size) {
+        memset(s->storage + oob_offset, 0xFF, erase_oob_size);
+    }
+
+    if (s->blk) {
+        int ret = blk_pwrite(s->blk, data_offset, data_size,
+                             s->storage + data_offset, 0);
+        if (ret < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "stmp3770-gpmi: failed to erase block %u\n",
+                          s->nand_block);
+            return false;
+        }
+        if (erase_oob_size) {
+            ret = blk_pwrite(s->blk, oob_offset, erase_oob_size,
+                             s->storage + oob_offset, 0);
+            if (ret < 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "stmp3770-gpmi: failed to erase OOB block %u\n",
+                              s->nand_block);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static uint64_t gpmi_appended_magic_offset(STMP3770GPMIState *s)
+{
+    return gpmi_appended_image_size(s);
+}
+
+static bool gpmi_has_appended_oob_magic(STMP3770GPMIState *s,
+                                        uint64_t file_size)
+{
+    uint8_t magic[sizeof(gpmi_appended_oob_magic)];
+    uint64_t offset = gpmi_appended_magic_offset(s);
+
+    if (!s->blk || file_size < offset + sizeof(magic)) {
+        return false;
+    }
+
+    if (blk_pread(s->blk, offset, sizeof(magic), magic, 0) < 0) {
+        return false;
+    }
+
+    return memcmp(magic, gpmi_appended_oob_magic, sizeof(magic)) == 0;
+}
+
+static void gpmi_persist_appended_oob_layout(STMP3770GPMIState *s)
+{
+    uint64_t oob_offset = gpmi_appended_oob_offset(s);
+    uint64_t oob_size = gpmi_oob_area_size(s);
+    uint64_t magic_offset = gpmi_appended_magic_offset(s);
+    Error *local_err = NULL;
+    int ret;
+
+    if (!s->blk ||
+        s->storage_layout != GPMI_STORAGE_LAYOUT_APPENDED_OOB) {
+        return;
+    }
+
+    ret = blk_truncate(s->blk,
+                       magic_offset + sizeof(gpmi_appended_oob_magic),
+                       true, PREALLOC_MODE_OFF, 0, &local_err);
+    if (ret < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: failed to resize NAND image: %s\n",
+                      local_err ? error_get_pretty(local_err) : "unknown");
+        if (local_err) {
+            error_free(local_err);
+        }
+        return;
+    }
+
+    ret = blk_pwrite(s->blk, oob_offset, oob_size,
+                     s->storage + oob_offset, 0);
+    if (ret < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: failed to initialise appended OOB\n");
+        return;
+    }
+
+    ret = blk_pwrite(s->blk, magic_offset, sizeof(gpmi_appended_oob_magic),
+                     gpmi_appended_oob_magic, 0);
+    if (ret < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-gpmi: failed to write appended OOB marker\n");
+        return;
+    }
+
+    s->storage_file_size = magic_offset + sizeof(gpmi_appended_oob_magic);
+    blk_flush(s->blk);
 }
 
 static void gpmi_nand_command(STMP3770GPMIState *s, uint8_t cmd)
@@ -357,7 +523,7 @@ static void gpmi_nand_address(STMP3770GPMIState *s, uint8_t addr)
             s->data_count = s->page_size;
             s->data_ptr = 0;
             s->data_dir_write = true;
-            memset(s->page_buf, 0xFF, s->page_size);
+            memset(s->page_buf, 0xFF, s->page_buf_size);
         }
         break;
 
@@ -422,12 +588,12 @@ static void gpmi_nand_write_data_byte(STMP3770GPMIState *s, uint8_t val)
 {
     switch (s->nand_cmd) {
     case NAND_CMD_PROGRAM_1ST:
-        if (s->data_ptr < s->page_size) {
+        if (s->data_ptr < s->page_buf_size) {
             s->page_buf[s->data_ptr] = val;
         }
         s->data_ptr++;
         if (s->data_ptr >= s->data_count) {
-            s->nand_state = NAND_STATE_WAIT_READY;
+            s->nand_state = NAND_STATE_CMD;
         }
         break;
 
@@ -461,16 +627,7 @@ static void gpmi_nand_second_command(STMP3770GPMIState *s, uint8_t cmd)
 
     case NAND_CMD_ERASE_1ST:
         if (cmd == NAND_CMD_ERASE_2ND) {
-            uint32_t stride = gpmi_page_stride(s);
-            uint64_t block_size = (uint64_t)s->pages_per_block * stride;
-            uint64_t offset = (uint64_t)s->nand_block * block_size;
-            if (s->storage && offset + block_size <= s->storage_size) {
-                memset(s->storage + offset, 0xFF, block_size);
-                if (s->blk) {
-                    blk_pwrite(s->blk, offset, block_size,
-                               s->storage + offset, 0);
-                }
-            }
+            gpmi_nand_erase_block(s);
             s->nand_state = NAND_STATE_WAIT_READY;
             s->block_erase_cnt++;
             gpmi_log_progress(s, "erase", s->nand_block * s->pages_per_block);
@@ -817,24 +974,59 @@ static void gpmi_realize(DeviceState *dev, Error **errp)
             (s->total_size) >> 20);
 
     if (s->blk) {
-        uint64_t perm = BLK_PERM_CONSISTENT_READ |
-                        (blk_supports_write_perm(s->blk) ? BLK_PERM_WRITE : 0);
+        uint64_t perm = BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE |
+                        BLK_PERM_RESIZE;
+        int64_t file_size;
+        uint64_t read_size;
+        bool has_appended_oob;
+
         if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
             return;
         }
 
-        s->storage_size = blk_getlength(s->blk);
-        if (s->storage_size == 0) {
-            s->storage_size = s->total_size;
+        file_size = blk_getlength(s->blk);
+        if (file_size < 0) {
+            error_setg(errp, "stmp3770-gpmi: failed to get NAND image size");
+            return;
+        }
+        s->storage_file_size = file_size;
+        has_appended_oob =
+            gpmi_has_appended_oob_magic(s, s->storage_file_size);
+
+        if (has_appended_oob) {
+            s->storage_layout = GPMI_STORAGE_LAYOUT_APPENDED_OOB;
+            s->storage_size = gpmi_appended_image_size(s);
+            read_size = MIN(s->storage_file_size, s->storage_size);
+        } else if (s->storage_file_size >= gpmi_interleaved_area_size(s)) {
+            s->storage_layout = GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB;
+            s->storage_size = s->storage_file_size;
+            read_size = s->storage_size;
+        } else {
+            s->storage_layout = GPMI_STORAGE_LAYOUT_APPENDED_OOB;
+            s->storage_size = gpmi_appended_image_size(s);
+            read_size = MIN(s->storage_file_size, gpmi_data_area_size(s));
         }
 
+        fprintf(stderr, "stmp3770-gpmi: NAND image layout: %s (%" PRIu64
+                " bytes backing)\n",
+                s->storage_layout == GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB ?
+                "interleaved-oob" : "appended-oob",
+                s->storage_size);
+
         s->storage = blk_blockalign(s->blk, s->storage_size);
-        if (blk_pread(s->blk, 0, s->storage_size, s->storage, 0) < 0) {
+        memset(s->storage, 0xFF, s->storage_size);
+        if (read_size > 0 &&
+            blk_pread(s->blk, 0, read_size, s->storage, 0) < 0) {
             error_setg(errp, "stmp3770-gpmi: failed to read NAND image");
             return;
         }
+        if (!has_appended_oob) {
+            gpmi_persist_appended_oob_layout(s);
+        }
     } else {
-        s->storage_size = s->total_size;
+        s->storage_file_size = 0;
+        s->storage_layout = GPMI_STORAGE_LAYOUT_APPENDED_OOB;
+        s->storage_size = gpmi_appended_image_size(s);
         s->storage = g_malloc(s->storage_size);
         memset(s->storage, 0xFF, s->storage_size);
     }
@@ -938,7 +1130,20 @@ static int stmp3770_gpmi_dma_handler(STMP3770DMAState *dma,
 
     if (event == STMP3770_DMA_EVENT_DATA_WRITE) {
         const uint8_t *src = buf;
+        unsigned int mode = (s->ctrl0 >> GPMI_CTRL0_COMMAND_MODE_SHIFT) &
+                            GPMI_CTRL0_COMMAND_MODE_MASK;
+        unsigned int address = (s->ctrl0 >> GPMI_CTRL0_ADDRESS_SHIFT) &
+                               GPMI_CTRL0_ADDRESS_MASK;
+        uint32_t count = s->ctrl0 & GPMI_CTRL0_XFER_COUNT_MASK;
         size_t n;
+
+        if (mode == GPMI_COMMAND_MODE_WRITE &&
+            address == GPMI_ADDRESS_DATA &&
+            s->nand_cmd == NAND_CMD_PROGRAM_1ST &&
+            s->data_dir_write && count > s->data_count) {
+            s->data_count = MIN(count, s->page_buf_size);
+        }
+
         for (n = 0; n < len; n++) {
             gpmi_handle_write_byte(s, src[n]);
         }

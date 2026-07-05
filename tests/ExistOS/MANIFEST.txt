@@ -14,3 +14,4 @@ Files:
 
 Runtime copy:
 - run-existos.ps1 copies flash.initial.bin to build\ExistOS\flash.bin when the runtime Flash does not exist, or when -ResetFlash is passed.
+- The emulator may expand build\ExistOS\flash.bin with appended OOB metadata; the hash above is only for the read-only seed image.

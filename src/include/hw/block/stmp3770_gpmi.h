@@ -140,6 +140,11 @@ typedef enum {
     NAND_STATE_WAIT_READY,
 } STMP3770NandState;
 
+typedef enum {
+    GPMI_STORAGE_LAYOUT_APPENDED_OOB = 0,
+    GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB = 1,
+} STMP3770GPMIStorageLayout;
+
 struct STMP3770GPMIState {
     SysBusDevice parent_obj;
 
@@ -149,6 +154,8 @@ struct STMP3770GPMIState {
     BlockBackend *blk;
     uint8_t *storage;
     uint64_t storage_size;
+    uint64_t storage_file_size;
+    STMP3770GPMIStorageLayout storage_layout;
 
     /* Configuration */
     uint32_t page_size;
