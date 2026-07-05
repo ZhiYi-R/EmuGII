@@ -1,5 +1,16 @@
 /*
- * STMP3770 Development Board
+ * STMP3770 Development Board (HP 39gII Calculator)
+ *
+ * Mimics the real hardware environment including Boot ROM initialization.
+ *
+ * Hardware configuration based on ExistOS-For-HP39GII BSP:
+ * - 512KB on-chip SRAM
+ * - 128MB external DRAM
+ * - NAND Flash (Samsung K9F1G08U0D: 128MB, 2KB page, 64 pages/block)
+ * - 131×64 monochrome LCD (grayscale capable)
+ * - Matrix keyboard (6×9)
+ * - USB 2.0 OTG
+ * - Audio DAC/ADC
  *
  * Copyright (C) 2024
  *
@@ -23,6 +34,7 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 
+/* HP 39gII hardware configuration */
 #define STMP3770_BOARD_RAM_DEFAULT  (128 * MiB)
 
 #define TYPE_STMP3770_BOARD MACHINE_TYPE_NAME("stmp3770")
@@ -67,19 +79,46 @@ static void stmp3770_board_init(MachineState *machine)
     }
 
     /*
-     * Pre-configure Debug UART (PL011) as if Boot ROM had initialized it.
-     * ExistOS expects the UART to be already enabled.
+     * Simulate Boot ROM initialization.
+     * Real STMP3770 Boot ROM configures basic peripherals before firmware runs.
+     * Based on ExistOS-For-HP39GII BSP analysis.
+     */
+
+    /* 1. Pre-configure Debug UART (PL011)
+     *
+     * ExistOS Uart::init() is a no-op because Boot ROM already configured UART.
      * PL011 Control Register (UARTCR) @ offset 0x30:
      *   Bit 0: UARTEN (UART enable)
      *   Bit 8: TXE (transmit enable)
      *   Bit 9: RXE (receive enable)
      */
     {
-        uint32_t uartcr_val = (1 << 0) | (1 << 8) | (1 << 9); /* UARTEN | TXE | RXE */
-        MemoryRegion *uart_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(s->soc.uart[0]), 0);
-        /* Write to UARTCR register (offset 0x30) */
-        memory_region_dispatch_write(uart_mr, 0x30, uartcr_val, MO_32, MEMTXATTRS_UNSPECIFIED);
+        uint32_t uartcr_val = (1 << 0) | (1 << 8) | (1 << 9);
+        MemoryRegion *uart_mr = sysbus_mmio_get_region(
+            SYS_BUS_DEVICE(s->soc.uart[0]), 0);
+        memory_region_dispatch_write(uart_mr, 0x30, uartcr_val,
+                                      MO_32, MEMTXATTRS_UNSPECIFIED);
     }
+
+    /*
+     * 2. CPU starts at 24MHz XTAL (not PLL)
+     *
+     * Real hardware: CPU runs at 24MHz until firmware enables PLL and switches
+     * to high-frequency domain. CLKCTRL reset values:
+     *   - CLKCTRL_CLKSEQ.BYPASS_CPU = 1 (use 24MHz XTAL, not PLL/480MHz)
+     *   - CLKCTRL_PLLCTRL0.POWER = 0 (PLL disabled)
+     *   - CLKCTRL_FRAC.CLKGATECPU = 1 (CPU clock gated by default)
+     *
+     * ExistOS Clk::init() sequence:
+     *   1. Enable PLL (PLLCTRL0.POWER=1)
+     *   2. Ungate CPU clock (FRAC.CLKGATECPU=0)
+     *   3. Set temporary dividers (CPU=5, HBUS=4 → 96MHz/24MHz)
+     *   4. Switch to PLL domain (CLKSEQ.BYPASS_CPU=0)
+     *   5. Set final dividers (CPU frac=22, HBUS=2 → 392.7MHz/240MHz)
+     *
+     * Note: CLKCTRL reset() should handle these values. This comment documents
+     * expected Boot ROM / reset state for reference.
+     */
 
     /* External DRAM - provided by machine core via default_ram_id */
     memory_region_add_subregion(sysmem, STMP3770_DRAM_ADDR, machine->ram);
@@ -117,7 +156,7 @@ static void stmp3770_board_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "STMP3770 Development Board";
+    mc->desc = "STMP3770 Development Board (HP 39gII Calculator)";
     mc->init = stmp3770_board_init;
     mc->max_cpus = 1;
     mc->min_cpus = 1;
