@@ -121,6 +121,7 @@ struct STMP3770State {
 
     /* Memory regions */
     MemoryRegion sram;          /* 512KB on-chip SRAM */
+    MemoryRegion dflpt;         /* Hardware L1 page-table RAM */
 };
 
 /* Memory map - based on STMP3770 Reference Manual */
@@ -224,6 +225,10 @@ struct STMP3770State {
 /* On-chip SRAM - 512KB */
 #define STMP3770_SRAM_ADDR          0x00000000
 #define STMP3770_SRAM_SIZE          0x80000     /* 512KB */
+
+/* Hardware DFLPT first-level page-table RAM */
+#define STMP3770_DFLPT_ADDR         0x800C0000
+#define STMP3770_DFLPT_SIZE         0x4000
 
 /* DRAM - external, up to 128MB typically */
 #define STMP3770_DRAM_ADDR          0x40000000

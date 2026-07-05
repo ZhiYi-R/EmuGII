@@ -125,6 +125,10 @@ static const uint32_t bank_pin_mask[STMP3770_PINCTRL_NUM_BANKS] = {
     0x003FFFFF,  /* Bank 3: pins 0-21 */
 };
 
+#define HP39GII_KEY_COL_BANK 1
+#define HP39GII_KEY_COL_MASK ((1U << 22) | (1U << 23) | (1U << 25) | \
+                              (1U << 26) | (1U << 27))
+
 static inline int bank_from_offset(unsigned offset)
 {
     if (offset >= REG_DOUT0 && offset < REG_DOUT0 + 0x100) {
@@ -170,6 +174,19 @@ static void stmp3770_pinctrl_update_irq(STMP3770PINCTRLState *s)
     /* Update IRQOUT bits in CTRL (read-only view) */
     s->ctrl &= ~(CTRL_IRQOUT0 | CTRL_IRQOUT1 | CTRL_IRQOUT2 | CTRL_IRQOUT3);
     s->ctrl |= irqout & 0xF;
+}
+
+static uint32_t stmp3770_pinctrl_read_din(STMP3770PINCTRLState *s, int bank)
+{
+    uint32_t val = s->din[bank] | (s->dout[bank] & s->doe[bank]);
+
+    if (bank == HP39GII_KEY_COL_BANK) {
+        uint32_t input_cols = HP39GII_KEY_COL_MASK & ~s->doe[bank];
+
+        val |= input_cols;
+    }
+
+    return val;
 }
 
 static void stmp3770_pinctrl_reset(DeviceState *dev)
@@ -268,8 +285,7 @@ static uint64_t stmp3770_pinctrl_read(void *opaque, hwaddr offset,
 
     case REG_DIN0 ... REG_DIN3:
         bank = (offset - REG_DIN0) >> 4;
-        /* For initial implementation, DIN reflects DOUT for simple loopback */
-        val = s->din[bank] | (s->dout[bank] & s->doe[bank]);
+        val = stmp3770_pinctrl_read_din(s, bank);
         break;
 
     case REG_DOE0 ... REG_DOE3:

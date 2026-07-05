@@ -165,6 +165,16 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     }
     memory_region_add_subregion(system_memory, STMP3770_SRAM_ADDR, &s->sram);
 
+    /*
+     * STMP37xx exposes a small hardware first-level page-table RAM used by
+     * ExistOS when USE_HARDWARE_DFLPT is enabled.
+     */
+    if (!memory_region_init_ram(&s->dflpt, OBJECT(dev), "stmp3770.dflpt",
+                                STMP3770_DFLPT_SIZE, errp)) {
+        return;
+    }
+    memory_region_add_subregion(system_memory, STMP3770_DFLPT_ADDR, &s->dflpt);
+
     /* Realize interrupt controller (ICOLL) */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->icoll), errp)) {
         return;

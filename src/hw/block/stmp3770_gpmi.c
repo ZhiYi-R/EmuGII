@@ -325,7 +325,9 @@ static void gpmi_nand_command(STMP3770GPMIState *s, uint8_t cmd)
 
 static void gpmi_nand_address(STMP3770GPMIState *s, uint8_t addr)
 {
-    s->nand_addr |= (uint32_t)addr << (s->nand_addr_cycles * 8);
+    if (s->nand_addr_cycles < 4) {
+        s->nand_addr |= (uint32_t)addr << (s->nand_addr_cycles * 8);
+    }
     s->nand_addr_cycles++;
 
     switch (s->nand_cmd) {
@@ -337,16 +339,19 @@ static void gpmi_nand_address(STMP3770GPMIState *s, uint8_t addr)
         break;
 
     case NAND_CMD_READ_1ST:
-        /* Expect 5 address cycles (2 column + 3 row), then wait for 0x30 */
-        if (s->nand_addr_cycles >= 5) {
+        /*
+         * This board has 64K pages total, so two row cycles are sufficient.
+         * Some firmware still sends a fifth zero row byte; keep accepting it.
+         */
+        if (s->nand_addr_cycles >= 4) {
             gpmi_decode_address(s);
             s->nand_state = NAND_STATE_CMD;  /* waiting for READ_2ND */
         }
         break;
 
     case NAND_CMD_PROGRAM_1ST:
-        /* Expect 5 address cycles, then data in */
-        if (s->nand_addr_cycles >= 5) {
+        /* 2 column + 2 row cycles are enough for the modeled NAND geometry. */
+        if (s->nand_addr_cycles >= 4) {
             gpmi_decode_address(s);
             s->nand_state = NAND_STATE_DATA_IN;
             s->data_count = s->page_size;
@@ -738,6 +743,20 @@ static const MemoryRegionOps gpmi_ops = {
     },
 };
 
+static bool gpmi_dma_pio_starts_command(uint32_t ctrl0)
+{
+    unsigned int mode = (ctrl0 >> GPMI_CTRL0_COMMAND_MODE_SHIFT) &
+                        GPMI_CTRL0_COMMAND_MODE_MASK;
+
+    /*
+     * MXS APBH DMA PIO descriptors launch the GPMI command after the PIO
+     * register words are staged. WRITE commands whose bytes come from the DMA
+     * data phase are handled as those bytes arrive, so starting here would be
+     * too early for them.
+     */
+    return mode != GPMI_COMMAND_MODE_WRITE;
+}
+
 static void gpmi_reset(DeviceState *dev)
 {
     STMP3770GPMIState *s = STMP3770_GPMI(dev);
@@ -841,9 +860,9 @@ static void gpmi_unrealize(DeviceState *dev)
 /*
  * APBH DMA handler for GPMI channels.  The PIO words in the DMA descriptor
  * are written to GPMI registers starting at offset 0x00 (CTRL0) and stepping
- * by 0x10, matching the GPMI register layout.  If the RUN bit is set in
- * CTRL0, the command is executed immediately.  Data read/write events copy
- * bytes between the DMA buffer and the GPMI data FIFO.
+ * by 0x10, matching the GPMI register layout.  DMA PIO descriptors start
+ * non-WRITE GPMI commands even when firmware leaves CTRL0.RUN clear.  Data
+ * read/write events copy bytes between the DMA buffer and the GPMI data FIFO.
  */
 static int stmp3770_gpmi_dma_handler(STMP3770DMAState *dma,
                                      int channel, STMP3770DMAEvent event,
@@ -889,8 +908,12 @@ static int stmp3770_gpmi_dma_handler(STMP3770DMAState *dma,
                               i, ch->pio_words[i]);
             }
         }
-        if (nwords > 0 && (ctrl0 & GPMI_CTRL0_RUN)) {
-            gpmi_write(s, GPMI_CTRL0, ctrl0, 4);
+        if (nwords > 0) {
+            if (ctrl0 & GPMI_CTRL0_RUN) {
+                gpmi_write(s, GPMI_CTRL0, ctrl0, 4);
+            } else if (gpmi_dma_pio_starts_command(ctrl0)) {
+                gpmi_execute_command(s);
+            }
         }
         return nwords * sizeof(uint32_t);
     }

@@ -1,0 +1,16 @@
+ExistOS boot fixture files
+
+Source paths:
+- hypervisor-rom.bin: D:\Projects\ExistOS-For-HP39GII\build\Hypervisor\rom.bin
+- flash.initial.bin: build\verify\existos_system_nand.bin, generated during EmuGII ExistOS boot verification
+
+Files:
+- hypervisor-rom.bin
+  Size: 91761 bytes
+  SHA256: 88B3A3402C06414DECD675E1FBF30BF02ED4C8EAC9F43D3E764B1B1DA5025721
+- flash.initial.bin
+  Size: 134217728 bytes
+  SHA256: 5F89581B31BBB502B41B2AC540A227221527B7BF3C013A3F85F3AC02AD7C410A
+
+Runtime copy:
+- run-existos.ps1 copies flash.initial.bin to build\ExistOS\flash.bin when the runtime Flash does not exist, or when -ResetFlash is passed.

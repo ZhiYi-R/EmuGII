@@ -2,7 +2,9 @@
  * GPMI/NAND DMA smoke test for STMP3770 QEMU
  *
  * Builds a small APBH DMA descriptor chain to perform READ ID and prints
- * the result.
+ * the result.  The descriptor directions use MXS APBH terminology:
+ * DMA_READ moves memory to the peripheral, DMA_WRITE moves the peripheral
+ * result back to memory.
  */
 
 #define UART_BASE 0x80070000
@@ -25,7 +27,6 @@
 #define GPMI_BASE 0x8000C000
 #define GPMI_CTRL0     (*(volatile unsigned int *)(GPMI_BASE + 0x00))
 
-#define CTRL0_RUN           (1U << 29)
 #define CTRL0_COMMAND_MODE_SHIFT 24
 #define CTRL0_ADDRESS_SHIFT 17
 #define CTRL0_XFER_COUNT_MASK 0xFFFF
@@ -89,8 +90,7 @@ static unsigned int make_ctrl0(unsigned int mode, unsigned int addr,
                                unsigned int count) {
     return (mode << CTRL0_COMMAND_MODE_SHIFT) |
            (addr << CTRL0_ADDRESS_SHIFT) |
-           (count & CTRL0_XFER_COUNT_MASK) |
-           CTRL0_RUN;
+           (count & CTRL0_XFER_COUNT_MASK);
 }
 
 static unsigned int make_cmd(unsigned int command, unsigned int cmdwords,
@@ -107,7 +107,7 @@ static void run_dma(void) {
 
     APBH_CTRL0_CLR = (1U << 16) << GPMI_DMA_CH; /* reset channel */
     APBH_CH_NXTCMDAR(GPMI_DMA_CH) = (unsigned int)&descs[0];
-    APBH_CH_SEMA(GPMI_DMA_CH) = (4 << 16) | 4; /* increment phore by 4 */
+    APBH_CH_SEMA(GPMI_DMA_CH) = 4;
 
     /* Wait for channel to go idle */
     while (APBH_CH_SEMA(GPMI_DMA_CH) & 0xFF0000);
@@ -132,23 +132,25 @@ void main(void) {
     cmd_byte = NAND_CMD_READ_ID;
     addr_byte = 0x00;
 
-    /* Descriptor 0: send command byte via PIO */
+    /* Descriptor 0: send command byte from memory to GPMI */
     descs[0].next = (unsigned int)&descs[1];
-    descs[0].cmd = make_cmd(DMA_CMD_COMMAND_NO_DMA_XFER, 2, 0,
+    descs[0].cmd = make_cmd(DMA_CMD_COMMAND_DMA_READ, 3, 1,
                             DMA_CMD_SEMAPHORE | DMA_CMD_WAIT4ENDCMD |
                             DMA_CMD_CHAIN);
-    descs[0].bar = 0;
+    descs[0].bar = (unsigned int)&cmd_byte;
     descs[0].pio[0] = make_ctrl0(COMMAND_MODE_WRITE, ADDRESS_CLE, 1);
-    descs[0].pio[1] = cmd_byte;
+    descs[0].pio[1] = 0;
+    descs[0].pio[2] = 0;
 
-    /* Descriptor 1: send address byte via PIO */
+    /* Descriptor 1: send address byte from memory to GPMI */
     descs[1].next = (unsigned int)&descs[2];
-    descs[1].cmd = make_cmd(DMA_CMD_COMMAND_NO_DMA_XFER, 2, 0,
+    descs[1].cmd = make_cmd(DMA_CMD_COMMAND_DMA_READ, 3, 1,
                             DMA_CMD_SEMAPHORE | DMA_CMD_WAIT4ENDCMD |
                             DMA_CMD_CHAIN);
-    descs[1].bar = 0;
+    descs[1].bar = (unsigned int)&addr_byte;
     descs[1].pio[0] = make_ctrl0(COMMAND_MODE_WRITE, ADDRESS_ALE, 1);
-    descs[1].pio[1] = addr_byte;
+    descs[1].pio[1] = 0;
+    descs[1].pio[2] = 0;
 
     /* Descriptor 2: wait for ready */
     descs[2].next = (unsigned int)&descs[3];
@@ -158,7 +160,7 @@ void main(void) {
 
     /* Descriptor 3: read 5 ID bytes to id_buf */
     descs[3].next = 0;
-    descs[3].cmd = make_cmd(DMA_CMD_COMMAND_DMA_READ, 1, 5,
+    descs[3].cmd = make_cmd(DMA_CMD_COMMAND_DMA_WRITE, 1, 5,
                             DMA_CMD_SEMAPHORE | DMA_CMD_IRQONCMPLT);
     descs[3].bar = (unsigned int)id_buf;
     descs[3].pio[0] = make_ctrl0(COMMAND_MODE_READ, ADDRESS_DATA, 5);
