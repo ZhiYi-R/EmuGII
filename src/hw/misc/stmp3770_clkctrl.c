@@ -61,6 +61,7 @@
 
 /* HBUS register bits */
 #define HBUS_DIV_MASK           0x1F
+#define HBUS_BUSY               (1 << 29)
 #define HBUS_DIV_FRAC_EN        (1 << 5)
 #define HBUS_SLOW_DIV_MASK      (0x7 << 16)
 #define HBUS_AUTO_SLOW_MODE     (1 << 20)
@@ -88,12 +89,14 @@
 
 /* Peripheral divider register bits */
 #define PERCLK_CLKGATE          (1U << 31)
+#define PERCLK_BUSY             (1 << 29)
 #define PERCLK_DIV_MASK_15      0x00007FFFU
 #define PERCLK_DIV_MASK_10      0x000003FFU
 #define PERCLK_DIV_MASK_9       0x000001FFU
 #define PIX_RW_MASK             0x8000FFFFU
 #define SSP_RW_MASK             0x800003FFU
 #define GPMI_RW_MASK            0x800007FFU
+#define XBUS_BUSY               (1U << 31)
 #define XBUS_RW_MASK            0x000007FFU
 #define XTAL_RW_MASK            0xFC000000U
 #define XTAL_DIV_UART_FIXED     0x00000001U
@@ -194,6 +197,13 @@ static void stmp3770_clkctrl_write_cpu(uint32_t *target, uint32_t val,
                                              16, 0x3FF);
     stmp3770_clkctrl_restore_invalid_divider(target, old, CPU_DIV_CPU_MASK,
                                              0, 0x3FF);
+
+    if ((old & CPU_DIV_XTAL_MASK) != (*target & CPU_DIV_XTAL_MASK)) {
+        *target |= CPU_BUSY_REF_XTAL;
+    }
+    if ((old & CPU_DIV_CPU_MASK) != (*target & CPU_DIV_CPU_MASK)) {
+        *target |= CPU_BUSY_REF_CPU;
+    }
 }
 
 static void stmp3770_clkctrl_write_hbus(uint32_t *target, uint32_t val,
@@ -205,6 +215,10 @@ static void stmp3770_clkctrl_write_hbus(uint32_t *target, uint32_t val,
                                   is_set, is_clr, is_tog);
     stmp3770_clkctrl_restore_invalid_divider(target, old, HBUS_DIV_MASK,
                                              0, HBUS_DIV_MASK);
+
+    if ((old & HBUS_DIV_MASK) != (*target & HBUS_DIV_MASK)) {
+        *target |= HBUS_BUSY;
+    }
 }
 
 static void stmp3770_clkctrl_write_xbus(uint32_t *target, uint32_t val,
@@ -216,6 +230,10 @@ static void stmp3770_clkctrl_write_xbus(uint32_t *target, uint32_t val,
                                   is_set, is_clr, is_tog);
     stmp3770_clkctrl_restore_invalid_divider(target, old, PERCLK_DIV_MASK_10,
                                              0, PERCLK_DIV_MASK_10);
+
+    if ((old & PERCLK_DIV_MASK_10) != (*target & PERCLK_DIV_MASK_10)) {
+        *target |= XBUS_BUSY;
+    }
 }
 
 static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
@@ -242,6 +260,10 @@ static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
                                   is_set, is_clr, is_tog);
     stmp3770_clkctrl_restore_invalid_divider(target, current, div_mask,
                                              0, max_div);
+
+    if ((current & div_mask) != (*target & div_mask)) {
+        *target |= PERCLK_BUSY;
+    }
 }
 
 static void stmp3770_clkctrl_write_frac(uint32_t *target, uint32_t val,
@@ -296,15 +318,17 @@ static uint64_t stmp3770_clkctrl_read(void *opaque, hwaddr offset, unsigned size
 
     case REG_CPU:
         value = s->cpu;
-        /* BUSY bits are typically 0 in steady state */
+        s->cpu &= ~(CPU_BUSY_REF_XTAL | CPU_BUSY_REF_CPU);
         break;
 
     case REG_HBUS:
         value = s->hbus;
+        s->hbus &= ~HBUS_BUSY;
         break;
 
     case REG_XBUS:
         value = s->xbus;
+        s->xbus &= ~XBUS_BUSY;
         break;
 
     case REG_XTAL:
@@ -313,14 +337,17 @@ static uint64_t stmp3770_clkctrl_read(void *opaque, hwaddr offset, unsigned size
 
     case REG_PIX:
         value = s->pix;
+        s->pix &= ~PERCLK_BUSY;
         break;
 
     case REG_SSP:
         value = s->ssp;
+        s->ssp &= ~PERCLK_BUSY;
         break;
 
     case REG_GPMI:
         value = s->gpmi;
+        s->gpmi &= ~PERCLK_BUSY;
         break;
 
     case REG_SPDIF:

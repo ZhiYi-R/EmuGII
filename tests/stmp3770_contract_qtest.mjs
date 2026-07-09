@@ -552,6 +552,7 @@ async function testClkctrlGatedDividerContract() {
       );
 
       await machine.writel(addr, 0x00000028);
+      await machine.readl(addr);
       const retuned = await machine.readl(addr);
       assert.equal(
         retuned,
@@ -574,8 +575,11 @@ async function testClkctrlWritableFieldMasks() {
     await machine.writel(CLKCTRL_BASE + 0x0e0, 0xffffffff);
 
     const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
+    await machine.readl(CLKCTRL_BASE + 0x020);
     const cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    await machine.readl(CLKCTRL_BASE + 0x030);
     const hbus = await machine.readl(CLKCTRL_BASE + 0x030);
+    await machine.readl(CLKCTRL_BASE + 0x040);
     const xbus = await machine.readl(CLKCTRL_BASE + 0x040);
     const xtal = await machine.readl(CLKCTRL_BASE + 0x050);
     const spdif = await machine.readl(CLKCTRL_BASE + 0x090);
@@ -681,8 +685,9 @@ async function testClkctrlResetSelfClears() {
 }
 
 async function testClkctrlDividerRangeContract() {
-  await withMachine(async (machine) => {
-    await machine.writel(CLKCTRL_BASE + 0x020, 0x00030002);
+    await withMachine(async (machine) => {
+      await machine.writel(CLKCTRL_BASE + 0x020, 0x00030002);
+    await machine.readl(CLKCTRL_BASE + 0x020);
     let cpu = await machine.readl(CLKCTRL_BASE + 0x020);
     assert.equal(cpu, 0x00030002, `CLKCTRL CPU should accept valid DIV_XTAL/DIV_CPU values: got 0x${cpu.toString(16)}`);
 
@@ -695,6 +700,7 @@ async function testClkctrlDividerRangeContract() {
     assert.equal(cpu, 0x00030002, `CLKCTRL CPU should reject DIV_CPU=0 and preserve the previous valid divider: got 0x${cpu.toString(16)}`);
 
     await machine.writel(CLKCTRL_BASE + 0x030, 0x00000002);
+    await machine.readl(CLKCTRL_BASE + 0x030);
     let hbus = await machine.readl(CLKCTRL_BASE + 0x030);
     assert.equal(hbus, 0x00000002, `CLKCTRL HBUS should accept a valid divider: got 0x${hbus.toString(16)}`);
 
@@ -703,6 +709,7 @@ async function testClkctrlDividerRangeContract() {
     assert.equal(hbus, 0x00000002, `CLKCTRL HBUS should reject DIV=0 and preserve the previous valid divider: got 0x${hbus.toString(16)}`);
 
     await machine.writel(CLKCTRL_BASE + 0x040, 0x00000004);
+    await machine.readl(CLKCTRL_BASE + 0x040);
     let xbus = await machine.readl(CLKCTRL_BASE + 0x040);
     assert.equal(xbus, 0x00000004, `CLKCTRL XBUS should accept a valid divider: got 0x${xbus.toString(16)}`);
 
@@ -712,6 +719,7 @@ async function testClkctrlDividerRangeContract() {
 
     await machine.writel(CLKCTRL_BASE + 0x060, 0x00000028);
     await machine.writel(CLKCTRL_BASE + 0x060, 0x00000028);
+    await machine.readl(CLKCTRL_BASE + 0x060);
     let pix = await machine.readl(CLKCTRL_BASE + 0x060);
     assert.equal(pix, 0x00000028, `CLKCTRL PIX should accept a valid divider once ungated: got 0x${pix.toString(16)}`);
 
@@ -725,6 +733,7 @@ async function testClkctrlDividerRangeContract() {
 
     await machine.writel(CLKCTRL_BASE + 0x070, 0x00000028);
     await machine.writel(CLKCTRL_BASE + 0x070, 0x00000028);
+    await machine.readl(CLKCTRL_BASE + 0x070);
     let ssp = await machine.readl(CLKCTRL_BASE + 0x070);
     assert.equal(ssp, 0x00000028, `CLKCTRL SSP should accept a valid divider once ungated: got 0x${ssp.toString(16)}`);
 
@@ -734,12 +743,57 @@ async function testClkctrlDividerRangeContract() {
 
     await machine.writel(CLKCTRL_BASE + 0x080, 0x00000028);
     await machine.writel(CLKCTRL_BASE + 0x080, 0x00000028);
+    await machine.readl(CLKCTRL_BASE + 0x080);
     let gpmi = await machine.readl(CLKCTRL_BASE + 0x080);
     assert.equal(gpmi, 0x00000028, `CLKCTRL GPMI should accept a valid divider once ungated: got 0x${gpmi.toString(16)}`);
 
     await machine.writel(CLKCTRL_BASE + 0x080, 0x00000000);
     gpmi = await machine.readl(CLKCTRL_BASE + 0x080);
     assert.equal(gpmi, 0x00000028, `CLKCTRL GPMI should reject DIV=0 and preserve the previous valid divider: got 0x${gpmi.toString(16)}`);
+  });
+}
+
+async function testClkctrlBusyContract() {
+  await withMachine(async (machine) => {
+    const cpuReset = await machine.readl(CLKCTRL_BASE + 0x020);
+    assert.equal(cpuReset & 0x30000000, 0, `CLKCTRL CPU busy bits should reset low: got 0x${cpuReset.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x020, 0x00010002);
+    let cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    assert.equal((cpu >>> 28) & 1, 1, `CLKCTRL CPU should raise BUSY_REF_CPU when DIV_CPU changes: got 0x${cpu.toString(16)}`);
+    cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    assert.equal((cpu >>> 28) & 1, 0, `CLKCTRL CPU BUSY_REF_CPU should clear after the transfer completes: got 0x${cpu.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x020, 0x00020002);
+    cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    assert.equal((cpu >>> 29) & 1, 1, `CLKCTRL CPU should raise BUSY_REF_XTAL when DIV_XTAL changes: got 0x${cpu.toString(16)}`);
+    cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    assert.equal((cpu >>> 29) & 1, 0, `CLKCTRL CPU BUSY_REF_XTAL should clear after the transfer completes: got 0x${cpu.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x030, 0x00000002);
+    let hbus = await machine.readl(CLKCTRL_BASE + 0x030);
+    assert.equal((hbus >>> 29) & 1, 1, `CLKCTRL HBUS should raise BUSY when DIV changes: got 0x${hbus.toString(16)}`);
+    hbus = await machine.readl(CLKCTRL_BASE + 0x030);
+    assert.equal((hbus >>> 29) & 1, 0, `CLKCTRL HBUS BUSY should clear after the transfer completes: got 0x${hbus.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x040, 0x00000004);
+    let xbus = await machine.readl(CLKCTRL_BASE + 0x040);
+    assert.equal((xbus >>> 31) & 1, 1, `CLKCTRL XBUS should raise BUSY when DIV changes: got 0x${xbus.toString(16)}`);
+    xbus = await machine.readl(CLKCTRL_BASE + 0x040);
+    assert.equal((xbus >>> 31) & 1, 0, `CLKCTRL XBUS BUSY should clear after the transfer completes: got 0x${xbus.toString(16)}`);
+
+    for (const [name, addr] of [
+      ['PIX', CLKCTRL_BASE + 0x060],
+      ['SSP', CLKCTRL_BASE + 0x070],
+      ['GPMI', CLKCTRL_BASE + 0x080],
+    ]) {
+      await machine.writel(addr, 0x00000028);
+      await machine.writel(addr, 0x00000028);
+      let reg = await machine.readl(addr);
+      assert.equal((reg >>> 29) & 1, 1, `CLKCTRL ${name} should raise BUSY when DIV changes while ungated: got 0x${reg.toString(16)}`);
+      reg = await machine.readl(addr);
+      assert.equal((reg >>> 29) & 1, 0, `CLKCTRL ${name} BUSY should clear after the transfer completes: got 0x${reg.toString(16)}`);
+    }
   });
 }
 
@@ -852,6 +906,7 @@ const tests = [
   ['CLKCTRL PLLCTRL1 reserved contract', testClkctrlPllctrl1ReservedContract],
   ['CLKCTRL reset self-clear contract', testClkctrlResetSelfClears],
   ['CLKCTRL divider range contract', testClkctrlDividerRangeContract],
+  ['CLKCTRL busy contract', testClkctrlBusyContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];
