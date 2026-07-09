@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/misc/stmp3770_clkctrl.h"
+#include "system/runstate.h"
 
 /* Register offsets */
 #define REG_PLLCTRL0        0x000
@@ -128,7 +129,18 @@ struct STMP3770CLKCTRLState {
 
     /* Clock state */
     bool pll_powered;
+
+    STMP3770CLKCTRLDigResetFn dig_reset_cb;
+    void *dig_reset_opaque;
 };
+
+void stmp3770_clkctrl_set_dig_reset_callback(STMP3770CLKCTRLState *s,
+                                             STMP3770CLKCTRLDigResetFn cb,
+                                             void *opaque)
+{
+    s->dig_reset_cb = cb;
+    s->dig_reset_opaque = opaque;
+}
 
 static uint32_t stmp3770_clkctrl_apply_sct(uint32_t current, uint32_t val,
                                            bool is_set, bool is_clr, bool is_tog)
@@ -380,13 +392,20 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
 
     case REG_RESET:
         target = &s->reset;
-        /* Handle soft reset if needed */
-        if (val & (1 << 0)) {
-            /* CHIP_RESET bit */
-            qemu_log_mask(LOG_UNIMP, "%s: chip reset requested\n", __func__);
-        }
         stmp3770_clkctrl_write_masked(target, val, RESET_RW_MASK,
                                       is_set, is_clr, is_tog);
+        if (s->reset & 0x1) {
+            if (s->dig_reset_cb) {
+                s->dig_reset_cb(s->dig_reset_opaque);
+            } else {
+                qemu_log_mask(LOG_UNIMP, "%s: digital reset requested without callback\n",
+                              __func__);
+            }
+        }
+        if (s->reset & 0x2) {
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        }
+        s->reset = 0;
         return;
 
     case REG_VERSION:

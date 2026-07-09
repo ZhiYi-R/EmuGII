@@ -646,6 +646,40 @@ async function testClkctrlPllctrl1ReservedContract() {
   });
 }
 
+async function testClkctrlResetSelfClears() {
+  await withMachine(async (machine) => {
+    await machine.writel(POWER_BASE + 0x0e0, 0x3e770001);
+    const powerResetBeforeDig = await machine.readl(POWER_BASE + 0x0e0);
+    assert.equal(
+      powerResetBeforeDig,
+      0x00000001,
+      `POWER RESET should accept the unlocked write before DIG reset: got 0x${powerResetBeforeDig.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0f0, 0x00000001);
+    let reset = await machine.readl(CLKCTRL_BASE + 0x0f0);
+    assert.equal(
+      reset,
+      0x00000000,
+      `CLKCTRL RESET.DIG should self-clear after the reset cycle completes: got 0x${reset.toString(16)}`,
+    );
+    const powerResetAfterDig = await machine.readl(POWER_BASE + 0x0e0);
+    assert.equal(
+      powerResetAfterDig,
+      0x00000001,
+      `CLKCTRL RESET.DIG should not reset the POWER module state: got 0x${powerResetAfterDig.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0f0, 0x00000002);
+    reset = await machine.readl(CLKCTRL_BASE + 0x0f0);
+    assert.equal(
+      reset,
+      0x00000000,
+      `CLKCTRL RESET.CHIP should self-clear after the reset cycle completes: got 0x${reset.toString(16)}`,
+    );
+  });
+}
+
 async function testOcotpBankOpenContract() {
   await withMachine(async (machine) => {
     await machine.writel(OCOTP_BASE + 0x000, 0x3e770000);
@@ -753,6 +787,7 @@ const tests = [
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],
   ['CLKCTRL FRAC stable contract', testClkctrlFracStableContract],
   ['CLKCTRL PLLCTRL1 reserved contract', testClkctrlPllctrl1ReservedContract],
+  ['CLKCTRL reset self-clear contract', testClkctrlResetSelfClears],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];

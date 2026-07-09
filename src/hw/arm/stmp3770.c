@@ -25,6 +25,7 @@
 #include "system/system.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "hw/qdev-core.h"
 #include "target/arm/cpu-qom.h"
 #include "qemu/module.h"
 
@@ -111,6 +112,35 @@ static void stmp3770_reset(DeviceState *dev)
 
     memset(s->dflpt_mpte, 0, sizeof(s->dflpt_mpte));
     s->dflpt_pte_2048 = DFLPT_PTE2048_FIXED_BITS | (0x3U << 10);
+}
+
+static void stmp3770_dig_reset(void *opaque)
+{
+    STMP3770State *s = opaque;
+
+    device_cold_reset(DEVICE(s->icoll));
+    device_cold_reset(DEVICE(s->clkctrl));
+    device_cold_reset(DEVICE(s->digctl));
+    device_cold_reset(DEVICE(s->pinctrl));
+    device_cold_reset(DEVICE(s->timer));
+    device_cold_reset(DEVICE(s->ocotp));
+    device_cold_reset(DEVICE(s->apbh_dma));
+    device_cold_reset(DEVICE(s->apbx_dma));
+    device_cold_reset(DEVICE(s->gpmi));
+    device_cold_reset(DEVICE(s->bch));
+    device_cold_reset(DEVICE(s->i2c));
+    device_cold_reset(DEVICE(s->lcdif));
+    device_cold_reset(DEVICE(s->audio_dac));
+    device_cold_reset(DEVICE(s->audio_adc));
+    device_cold_reset(DEVICE(s->pwm));
+    device_cold_reset(DEVICE(s->lradc));
+    device_cold_reset(DEVICE(s->usbphy));
+    device_cold_reset(DEVICE(s->usb));
+    device_cold_reset(DEVICE(s->ssp[0]));
+    device_cold_reset(DEVICE(s->ssp[1]));
+    device_cold_reset(DEVICE(s->uart[0]));
+    device_cold_reset(DEVICE(s->uart[1]));
+    device_cold_reset(DEVICE(s));
 }
 
 static void stmp3770_init(Object *obj)
@@ -275,6 +305,7 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(s->clkctrl), errp)) {
         return;
     }
+    stmp3770_clkctrl_set_dig_reset_callback(s->clkctrl, stmp3770_dig_reset, s);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->clkctrl), 0, STMP3770_CLKCTRL_ADDR);
 
     /* Realize power supply controller (POWER) */

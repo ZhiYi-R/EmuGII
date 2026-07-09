@@ -18,4 +18,10 @@
 #define TYPE_STMP3770_CLKCTRL "stmp3770-clkctrl"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770CLKCTRLState, STMP3770_CLKCTRL)
 
+typedef void (*STMP3770CLKCTRLDigResetFn)(void *opaque);
+
+void stmp3770_clkctrl_set_dig_reset_callback(STMP3770CLKCTRLState *s,
+                                             STMP3770CLKCTRLDigResetFn cb,
+                                             void *opaque);
+
 #endif /* HW_MISC_STMP3770_CLKCTRL_H */
