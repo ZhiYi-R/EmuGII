@@ -103,7 +103,9 @@ static void stmp3770_rtc_update_irq(STMP3770RTCState *s)
                  (s->ctrl & CTRL_ALARM_IRQ_EN);
     bool msec = (s->ctrl & CTRL_ONEMSEC_IRQ) &&
                 (s->ctrl & CTRL_ONEMSEC_IRQ_EN);
-    qemu_set_irq(s->irq, alarm || msec);
+
+    qemu_set_irq(s->alarm_irq, alarm);
+    qemu_set_irq(s->onemsec_irq, msec);
 }
 
 static void stmp3770_rtc_check_alarm(STMP3770RTCState *s)
@@ -376,6 +378,7 @@ static void stmp3770_rtc_reset(DeviceState *dev)
     s->persistent[0] = 0x100; /* MSEC_RES = 1 ms */
     s->debug = 0;
     s->version = 0x02000000; /* RTC Block v2.0 */
+    stmp3770_rtc_update_irq(s);
 }
 
 static void stmp3770_rtc_init(Object *obj)
@@ -386,7 +389,8 @@ static void stmp3770_rtc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &stmp3770_rtc_ops, s,
         TYPE_STMP3770_RTC, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
-    sysbus_init_irq(sbd, &s->irq);
+    sysbus_init_irq(sbd, &s->alarm_irq);
+    sysbus_init_irq(sbd, &s->onemsec_irq);
 
     s->tick = ptimer_init(stmp3770_rtc_tick, s, PTIMER_POLICY_LEGACY);
     ptimer_transaction_begin(s->tick);

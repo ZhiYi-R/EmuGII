@@ -248,9 +248,11 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->rtc), 0, STMP3770_RTC_ADDR);
 
-    /* RTC shares one IRQ line for alarm and 1 ms interrupts */
+    /* RTC exposes distinct ICOLL sources for alarm and 1 ms tick interrupts */
     sysbus_connect_irq(SYS_BUS_DEVICE(s->rtc), 0,
                        qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_RTC_ALARM));
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->rtc), 1,
+                       qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_RTC_1MSEC));
 
     /* Realize APBH DMA */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->apbh_dma), errp)) {

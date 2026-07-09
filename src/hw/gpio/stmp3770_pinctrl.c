@@ -122,7 +122,7 @@ static const uint32_t bank_pin_mask[STMP3770_PINCTRL_NUM_BANKS] = {
     0x3FFFFFFF,  /* Bank 0: pins 0-29 */
     0x1FFFFFFF,  /* Bank 1: pins 0-28 */
     0xFFFFFFFF,  /* Bank 2: pins 0-31 */
-    0x003FFFFF,  /* Bank 3: pins 0-21 */
+    0x00000000,  /* Bank 3: no GPIO functionality on STMP3770 */
 };
 
 #define HP39GII_KEY_COL_BANK 1
@@ -278,7 +278,7 @@ static void stmp3770_pinctrl_reset(DeviceState *dev)
     int i;
 
     s->ctrl = CTRL_SFTRST | CTRL_CLKGATE |
-              CTRL_PRESENT0 | CTRL_PRESENT1 | CTRL_PRESENT2 | CTRL_PRESENT3;
+              CTRL_PRESENT0 | CTRL_PRESENT1 | CTRL_PRESENT2;
 
     for (i = 0; i < ARRAY_SIZE(s->muxsel); i++) {
         s->muxsel[i] = 0;

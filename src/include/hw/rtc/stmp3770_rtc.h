@@ -26,7 +26,8 @@ struct STMP3770RTCState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    qemu_irq irq;
+    qemu_irq alarm_irq;
+    qemu_irq onemsec_irq;
 
     /* Registers */
     uint32_t ctrl;

@@ -66,14 +66,26 @@
 #define CTRL0_COUNT_MASK 0xFFFF
 
 /* CTRL1 bits */
-#define CTRL1_VSYNC_EDGE_IRQ        (1U << 0)
-#define CTRL1_CUR_FRAME_DONE_IRQ    (1U << 1)
-#define CTRL1_UNDERFLOW_IRQ         (1U << 2)
+#define CTRL1_OVERFLOW_IRQ_EN       (1U << 15)
+#define CTRL1_UNDERFLOW_IRQ_EN      (1U << 14)
+#define CTRL1_CUR_FRAME_DONE_IRQ_EN (1U << 13)
+#define CTRL1_VSYNC_EDGE_IRQ_EN     (1U << 12)
+#define CTRL1_OVERFLOW_IRQ          (1U << 11)
+#define CTRL1_UNDERFLOW_IRQ         (1U << 10)
+#define CTRL1_CUR_FRAME_DONE_IRQ    (1U << 9)
+#define CTRL1_VSYNC_EDGE_IRQ        (1U << 8)
+
+#define CTRL1_IRQ_EN_MASK (CTRL1_OVERFLOW_IRQ_EN | CTRL1_UNDERFLOW_IRQ_EN | \
+                           CTRL1_CUR_FRAME_DONE_IRQ_EN | \
+                           CTRL1_VSYNC_EDGE_IRQ_EN)
+#define CTRL1_IRQ_MASK    (CTRL1_OVERFLOW_IRQ | CTRL1_UNDERFLOW_IRQ | \
+                           CTRL1_CUR_FRAME_DONE_IRQ | CTRL1_VSYNC_EDGE_IRQ)
 
 /* IRQ bits */
 #define IRQ_VSYNC           (1U << 0)
 #define IRQ_CUR_FRAME_DONE  (1U << 1)
 #define IRQ_UNDERFLOW       (1U << 2)
+#define IRQ_OVERFLOW        (1U << 3)
 
 /* STAT bits */
 #define STAT_PRESENT        (1U << 31)
@@ -129,6 +141,66 @@ static void lcdif_update_irq(STMP3770LCDIFState *s)
 {
     bool pending = (s->irq & s->irq_en) != 0;
     qemu_set_irq(s->irq_out, pending);
+}
+
+static uint32_t lcdif_ctrl1_to_irq_en(uint32_t ctrl1)
+{
+    uint32_t irq_en = 0;
+
+    if (ctrl1 & CTRL1_VSYNC_EDGE_IRQ_EN) {
+        irq_en |= IRQ_VSYNC;
+    }
+    if (ctrl1 & CTRL1_CUR_FRAME_DONE_IRQ_EN) {
+        irq_en |= IRQ_CUR_FRAME_DONE;
+    }
+    if (ctrl1 & CTRL1_UNDERFLOW_IRQ_EN) {
+        irq_en |= IRQ_UNDERFLOW;
+    }
+    if (ctrl1 & CTRL1_OVERFLOW_IRQ_EN) {
+        irq_en |= IRQ_OVERFLOW;
+    }
+
+    return irq_en;
+}
+
+static uint32_t lcdif_irq_to_ctrl1(uint32_t irq)
+{
+    uint32_t ctrl1 = 0;
+
+    if (irq & IRQ_VSYNC) {
+        ctrl1 |= CTRL1_VSYNC_EDGE_IRQ;
+    }
+    if (irq & IRQ_CUR_FRAME_DONE) {
+        ctrl1 |= CTRL1_CUR_FRAME_DONE_IRQ;
+    }
+    if (irq & IRQ_UNDERFLOW) {
+        ctrl1 |= CTRL1_UNDERFLOW_IRQ;
+    }
+    if (irq & IRQ_OVERFLOW) {
+        ctrl1 |= CTRL1_OVERFLOW_IRQ;
+    }
+
+    return ctrl1;
+}
+
+static uint32_t lcdif_ctrl1_status_to_irq(uint32_t ctrl1)
+{
+    uint32_t irq = 0;
+
+    if (ctrl1 & CTRL1_VSYNC_EDGE_IRQ) {
+        irq |= IRQ_VSYNC;
+    }
+    if (ctrl1 & CTRL1_CUR_FRAME_DONE_IRQ) {
+        irq |= IRQ_CUR_FRAME_DONE;
+    }
+    if (ctrl1 & CTRL1_UNDERFLOW_IRQ) {
+        irq |= IRQ_UNDERFLOW;
+    }
+    if (ctrl1 & CTRL1_OVERFLOW_IRQ) {
+        irq |= IRQ_OVERFLOW;
+    }
+
+    return irq;
 }
 
 static void lcdif_panel_seek_start(STMP3770LCDIFState *s)
@@ -1057,9 +1129,7 @@ static void lcdif_refresh(void *opaque)
 
     if (lcdif_enabled(s)) {
         s->irq |= IRQ_VSYNC;
-        if (s->irq_en & IRQ_VSYNC) {
-            lcdif_update_irq(s);
-        }
+        lcdif_update_irq(s);
     }
 
     timer_mod(s->refresh_timer,
@@ -1100,7 +1170,7 @@ static uint64_t lcdif_read(void *opaque, hwaddr offset, unsigned size)
     case REG_CTRL0:
         return s->ctrl0;
     case REG_CTRL1:
-        return s->ctrl1;
+        return (s->ctrl1 & ~CTRL1_IRQ_MASK) | lcdif_irq_to_ctrl1(s->irq);
     case REG_TRANSFER_COUNT:
         return s->timing[0];
     case REG_CUR_BUF:
@@ -1170,6 +1240,18 @@ static void lcdif_write(void *opaque, hwaddr offset,
         break;
     case REG_CTRL1:
         lcdif_apply_sct(&s->ctrl1, (uint32_t)value, sct);
+        if (sct == 0) {
+            s->irq = lcdif_ctrl1_status_to_irq(s->ctrl1);
+        } else if (sct == 1) {
+            s->irq |= lcdif_ctrl1_status_to_irq((uint32_t)value);
+        } else if (sct == 2) {
+            s->irq &= ~lcdif_ctrl1_status_to_irq((uint32_t)value);
+        } else {
+            s->irq ^= lcdif_ctrl1_status_to_irq((uint32_t)value);
+        }
+        s->ctrl1 = (s->ctrl1 & ~CTRL1_IRQ_MASK) | lcdif_irq_to_ctrl1(s->irq);
+        s->irq_en = lcdif_ctrl1_to_irq_en(s->ctrl1);
+        lcdif_update_irq(s);
         break;
     case REG_TRANSFER_COUNT:
         s->timing[0] = (uint32_t)value;
