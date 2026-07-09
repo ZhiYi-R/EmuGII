@@ -66,10 +66,13 @@
 
 /* FRAC register - Phase Fractional Dividers */
 #define FRAC_CLKGATECPU         (1 << 7)
+#define FRAC_CPU_STABLE         (1 << 6)
 #define FRAC_CPUFRAC_MASK       0x3F
-#define FRAC_CLKGATEIO          (1 << 15)
-#define FRAC_IOFRAC_MASK        (0x3F << 8)
+#define FRAC_CLKGATEIO          (1U << 31)
+#define FRAC_IO_STABLE          (1 << 30)
+#define FRAC_IOFRAC_MASK        (0x3F << 24)
 #define FRAC_CLKGATEPIX         (1 << 23)
+#define FRAC_PIX_STABLE         (1 << 22)
 #define FRAC_PIXFRAC_MASK       (0x3F << 16)
 #define FRAC_RW_MASK            0xBFBF00BFU
 
@@ -176,6 +179,25 @@ static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
 
     stmp3770_clkctrl_write_masked(target, val, writable_mask,
                                   is_set, is_clr, is_tog);
+}
+
+static void stmp3770_clkctrl_write_frac(uint32_t *target, uint32_t val,
+                                        bool is_set, bool is_clr, bool is_tog)
+{
+    uint32_t old = *target;
+
+    stmp3770_clkctrl_write_masked(target, val, FRAC_RW_MASK,
+                                  is_set, is_clr, is_tog);
+
+    if ((old & FRAC_CPUFRAC_MASK) != (*target & FRAC_CPUFRAC_MASK)) {
+        *target ^= FRAC_CPU_STABLE;
+    }
+    if ((old & FRAC_PIXFRAC_MASK) != (*target & FRAC_PIXFRAC_MASK)) {
+        *target ^= FRAC_PIX_STABLE;
+    }
+    if ((old & FRAC_IOFRAC_MASK) != (*target & FRAC_IOFRAC_MASK)) {
+        *target ^= FRAC_IO_STABLE;
+    }
 }
 
 /* Helper: Calculate actual clock frequency (for future use) */
@@ -351,8 +373,7 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
 
     case REG_FRAC:
         target = &s->frac;
-        stmp3770_clkctrl_write_masked(target, val, FRAC_RW_MASK,
-                                      is_set, is_clr, is_tog);
+        stmp3770_clkctrl_write_frac(target, val, is_set, is_clr, is_tog);
         return;
 
     case REG_CLKSEQ:

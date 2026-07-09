@@ -588,8 +588,38 @@ async function testClkctrlWritableFieldMasks() {
     assert.equal(xbus, 0x000007ff, `CLKCTRL XBUS should only expose DIV_FRAC_EN/DIV: got 0x${xbus.toString(16)}`);
     assert.equal(xtal, 0xfc000001, `CLKCTRL XTAL should keep DIV_UART fixed at 1 and ignore reserved bits: got 0x${xtal.toString(16)}`);
     assert.equal(spdif, 0x80000000, `CLKCTRL SPDIF should only expose CLKGATE: got 0x${spdif.toString(16)}`);
-    assert.equal(frac, 0xa3a300a3, `CLKCTRL FRAC should ignore STABLE/reserved bits on write: got 0x${frac.toString(16)}`);
+    assert.equal(frac, 0xe3e300e3, `CLKCTRL FRAC should ignore software writes to STABLE/reserved bits while preserving stable toggles from divider changes: got 0x${frac.toString(16)}`);
     assert.equal(clkseq, 0x000000ba, `CLKCTRL CLKSEQ should keep BYPASS_SAIF cleared after software writes: got 0x${clkseq.toString(16)}`);
+  });
+}
+
+async function testClkctrlFracStableContract() {
+  await withMachine(async (machine) => {
+    let frac = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    assert.equal((frac >> 30) & 1, 0, `CLKCTRL FRAC IO_STABLE should reset low: got 0x${frac.toString(16)}`);
+    assert.equal((frac >> 22) & 1, 0, `CLKCTRL FRAC PIX_STABLE should reset low: got 0x${frac.toString(16)}`);
+    assert.equal((frac >> 6) & 1, 0, `CLKCTRL FRAC CPU_STABLE should reset low: got 0x${frac.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x0d0, 0x92920093);
+    let updated = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    assert.equal(updated & 0x3f, 0x13, `CLKCTRL FRAC CPUFRAC should accept the new divider: got 0x${updated.toString(16)}`);
+    assert.equal((updated >> 6) & 1, 1, `CLKCTRL FRAC CPU_STABLE should invert when CPUFRAC changes: got 0x${updated.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x0d0, 0x92930093);
+    frac = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    assert.equal((frac >> 16) & 0x3f, 0x13, `CLKCTRL FRAC PIXFRAC should accept the new divider: got 0x${frac.toString(16)}`);
+    assert.equal((frac >> 22) & 1, 1, `CLKCTRL FRAC PIX_STABLE should invert when PIXFRAC changes: got 0x${frac.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x0d0, 0x93930093);
+    frac = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    assert.equal((frac >> 24) & 0x3f, 0x13, `CLKCTRL FRAC IOFRAC should accept the new divider: got 0x${frac.toString(16)}`);
+    assert.equal((frac >> 30) & 1, 1, `CLKCTRL FRAC IO_STABLE should invert when IOFRAC changes: got 0x${frac.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x0d8, 0x00800080);
+    updated = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    assert.equal(updated & 0x00800080, 0, `CLKCTRL FRAC gate clear should ungate PIX/CPU clocks: got 0x${updated.toString(16)}`);
+    assert.equal((updated >> 22) & 1, 1, `CLKCTRL FRAC PIX_STABLE should not invert on CLKGATE changes alone: got 0x${updated.toString(16)}`);
+    assert.equal((updated >> 6) & 1, 1, `CLKCTRL FRAC CPU_STABLE should not invert on CLKGATE changes alone: got 0x${updated.toString(16)}`);
   });
 }
 
@@ -698,6 +728,7 @@ const tests = [
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],
+  ['CLKCTRL FRAC stable contract', testClkctrlFracStableContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];
