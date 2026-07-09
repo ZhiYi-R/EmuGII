@@ -14,6 +14,7 @@ const qemuBinary = process.env.EMUGII_QEMU_BINARY ?? path.join(
 );
 
 const ICOLL_BASE = 0x80000000;
+const CLKCTRL_BASE = 0x80040000;
 const DIGCTL_BASE = 0x8001c000;
 const PINCTRL_BASE = 0x80018000;
 const DFLPT_BASE = 0x800c0000;
@@ -488,6 +489,40 @@ async function testDigctlCtrlBehaviorContract() {
   });
 }
 
+async function testClkctrlResetContract() {
+  await withMachine(async (machine) => {
+    const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
+    const pllctrl1 = await machine.readl(CLKCTRL_BASE + 0x010);
+    const cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    const hbus = await machine.readl(CLKCTRL_BASE + 0x030);
+    const xbus = await machine.readl(CLKCTRL_BASE + 0x040);
+    const xtal = await machine.readl(CLKCTRL_BASE + 0x050);
+    const pix = await machine.readl(CLKCTRL_BASE + 0x060);
+    const ssp = await machine.readl(CLKCTRL_BASE + 0x070);
+    const gpmi = await machine.readl(CLKCTRL_BASE + 0x080);
+    const spdif = await machine.readl(CLKCTRL_BASE + 0x090);
+    const frac = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    const clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    const reset = await machine.readl(CLKCTRL_BASE + 0x0f0);
+    const version = await machine.readl(CLKCTRL_BASE + 0x100);
+
+    assert.equal(pllctrl0, 0x00000000, `CLKCTRL PLLCTRL0 reset mismatch: got 0x${pllctrl0.toString(16)}`);
+    assert.equal(pllctrl1, 0x00000000, `CLKCTRL PLLCTRL1 reset mismatch: got 0x${pllctrl1.toString(16)}`);
+    assert.equal(cpu, 0x00010001, `CLKCTRL CPU reset mismatch: got 0x${cpu.toString(16)}`);
+    assert.equal(hbus, 0x00000001, `CLKCTRL HBUS reset mismatch: got 0x${hbus.toString(16)}`);
+    assert.equal(xbus, 0x00000001, `CLKCTRL XBUS reset mismatch: got 0x${xbus.toString(16)}`);
+    assert.equal(xtal, 0x70000001, `CLKCTRL XTAL reset mismatch: got 0x${xtal.toString(16)}`);
+    assert.equal(pix, 0x80000001, `CLKCTRL PIX reset mismatch: got 0x${pix.toString(16)}`);
+    assert.equal(ssp, 0x80000001, `CLKCTRL SSP reset mismatch: got 0x${ssp.toString(16)}`);
+    assert.equal(gpmi, 0x80000001, `CLKCTRL GPMI reset mismatch: got 0x${gpmi.toString(16)}`);
+    assert.equal(spdif, 0x80000000, `CLKCTRL SPDIF reset mismatch: got 0x${spdif.toString(16)}`);
+    assert.equal(frac, 0x92920092, `CLKCTRL FRAC reset mismatch: got 0x${frac.toString(16)}`);
+    assert.equal(clkseq, 0x000000bb, `CLKCTRL CLKSEQ reset mismatch: got 0x${clkseq.toString(16)}`);
+    assert.equal(reset, 0x00000000, `CLKCTRL RESET reset mismatch: got 0x${reset.toString(16)}`);
+    assert.equal(version, 0x02010000, `CLKCTRL VERSION mismatch: got 0x${version.toString(16)}`);
+  });
+}
+
 async function testOcotpBankOpenContract() {
   await withMachine(async (machine) => {
     await machine.writel(OCOTP_BASE + 0x000, 0x3e770000);
@@ -590,6 +625,7 @@ const tests = [
   ['DIGCTL scratch and microseconds contract', testDigctlScratchAndMicrosecondsContract],
   ['DIGCTL undocumented alias decode', testDigctlUndocumentedAliasDecode],
   ['DIGCTL ctrl behavior contract', testDigctlCtrlBehaviorContract],
+  ['CLKCTRL reset contract', testClkctrlResetContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];

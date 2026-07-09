@@ -311,41 +311,27 @@ static void stmp3770_clkctrl_reset(DeviceState *dev)
 {
     STMP3770CLKCTRLState *s = STMP3770_CLKCTRL(dev);
 
-    /*
-     * Reset values based on ExistOS BSP analysis and real STMP3770 behavior.
-     * CPU starts at 24MHz XTAL, firmware enables PLL and switches to high-freq.
-     */
-
     /* PLL disabled at reset */
     s->pllctrl0 = 0;                    /* POWER=0, PLL off */
     s->pllctrl1 = 0;
 
-    /* CPU clock from 24MHz XTAL bypass */
+    /* CPU/HBUS/XBUS dividers reset to divide-by-1 with CPU on XTAL bypass */
     s->cpu = 0x00010001;                /* DIV_CPU=1, DIV_CPU_FRAC=1 */
-    s->hbus = 0x00000003;               /* DIV=3 → 24MHz/3=8MHz HBUS */
+    s->hbus = 0x00000001;               /* DIV=1 */
     s->xbus = 0x00000001;               /* DIV=1 */
-    s->xtal = 0;
+    s->xtal = 0x70000001;               /* FILT/PWM/DRI gated, DIV_UART=1 */
 
-    /* Peripheral clocks */
-    s->pix = 0x00000001;                /* DIV=1, will use bypass or PLL/DIV */
-    s->ssp = 0x00000001;                /* DIV=1 */
-    s->gpmi = 0x00000001;               /* DIV=1 (ExistOS sets to 2 → 240MHz) */
-    s->spdif = 0;
+    /* Peripheral dividers reset gated with divide-by-1 */
+    s->pix = 0x80000001;
+    s->ssp = 0x80000001;
+    s->gpmi = 0x80000001;
+    s->spdif = 0x80000000;
 
-    /* Phase Fractional Dividers (PFD)
-     * Bits 7: CLKGATECPU=1 (CPU clock gated until firmware ungates)
-     * Bits 0-5: CPUFRAC=18 (default, 480*18/18=480MHz when enabled)
-     * Similar for IO and PIX domains
-     */
-    s->frac = 0x92929292;               /* CPU/IO/PIX all gated, frac=18/18/18 */
+    /* Fractional dividers reset gated with FRAC=0x12 and stable bits cleared */
+    s->frac = 0x92920092;
 
-    /* Clock sequencer: all clocks bypass to XTAL
-     * Bit 7: BYPASS_CPU=1 (use 24MHz XTAL, not PLL)
-     * Bit 5: BYPASS_SSP=1
-     * Bit 4: BYPASS_GPMI=1
-     * Bit 1: BYPASS_PIX=1
-     */
-    s->clkseq = 0x000000B2;             /* Bypass CPU/SSP/GPMI/PIX to XTAL */
+    /* Clock sequencer reset keeps all supported domains on XTAL bypass */
+    s->clkseq = 0x000000BB;
     s->reset = 0;
 
     /* Clock state */
