@@ -240,13 +240,53 @@ static void digctl_microseconds_set(STMP3770DIGCTLState *s, uint32_t value)
     s->microseconds_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+static bool digctl_has_sct_alias(hwaddr reg)
+{
+    switch (reg) {
+    case REG_CTRL:
+    case REG_STATUS:
+    case REG_HCLKCOUNT:
+    case REG_RAMCTRL:
+    case REG_RAMREPAIR:
+    case REG_ROMCTRL:
+    case REG_SJTAGDBG:
+    case REG_MICROSECONDS:
+    case REG_OCRAM_BIST_CSR:
+    case REG_OCRAM_STATUS0:
+    case REG_OCRAM_STATUS1:
+    case REG_OCRAM_STATUS2:
+    case REG_OCRAM_STATUS3:
+    case REG_OCRAM_STATUS4:
+    case REG_OCRAM_STATUS5:
+    case REG_OCRAM_STATUS6:
+    case REG_OCRAM_STATUS7:
+    case REG_OCRAM_STATUS8:
+    case REG_OCRAM_STATUS9:
+    case REG_OCRAM_STATUS10:
+    case REG_OCRAM_STATUS11:
+    case REG_OCRAM_STATUS12:
+    case REG_OCRAM_STATUS13:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint64_t stmp3770_digctl_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770DIGCTLState *s = STMP3770_DIGCTL(opaque);
     uint32_t value = 0;
+    hwaddr reg = offset & ~0xFULL;
+    hwaddr alias = offset & 0xFULL;
 
-    /* SET/CLR/TOG variants read identically to the base register */
-    offset &= ~0xFULL;
+    if (alias != 0 && !digctl_has_sct_alias(reg)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad offset 0x%" HWADDR_PRIx "\n", __func__, offset);
+        return 0;
+    }
+
+    /* Supported SET/CLR/TOG variants read identically to the base register */
+    offset = reg;
 
     switch (offset) {
     case REG_CTRL:
@@ -383,8 +423,15 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
     uint32_t *target = NULL;
     uint32_t writable_mask = 0xFFFFFFFFU;
     uint32_t old_ctrl = 0;
+    hwaddr reg = offset & ~0xFULL;
 
-    offset &= ~0xFULL;
+    if ((is_set || is_clr || is_tog) && !digctl_has_sct_alias(reg)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                     "%s: bad offset 0x%" HWADDR_PRIx "\n", __func__, offset);
+        return;
+    }
+
+    offset = reg;
 
     switch (offset) {
     case REG_CTRL:

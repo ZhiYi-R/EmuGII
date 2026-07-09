@@ -406,23 +406,37 @@ async function testDigctlScratchAndMicrosecondsContract() {
   });
 }
 
-async function testDigctlMpteLocatorSetClrTog() {
+async function testDigctlUndocumentedAliasDecode() {
   await withMachine(async (machine) => {
     await machine.writel(DIGCTL_BASE + 0x0400, 0x00000055);
-    let mpte0Loc = await machine.readl(DIGCTL_BASE + 0x0400);
-    assert.equal(mpte0Loc, 0x00000055, `DIGCTL MPTE0_LOC base write should set LOC directly: got 0x${mpte0Loc.toString(16)}`);
+    await machine.writel(DIGCTL_BASE + 0x0290, 0x89abcdef);
+    await machine.writel(DIGCTL_BASE + 0x02b0, 0x00000321);
+    await machine.writel(DIGCTL_BASE + 0x0330, 0x01020304);
 
+    const scratch0AliasRead = await machine.readl(DIGCTL_BASE + 0x0294);
+    const armcacheAliasRead = await machine.readl(DIGCTL_BASE + 0x02b4);
+    const ahbStatsAliasRead = await machine.readl(DIGCTL_BASE + 0x0334);
+    const mpte0AliasRead = await machine.readl(DIGCTL_BASE + 0x0404);
+
+    assert.equal(scratch0AliasRead, 0, `DIGCTL SCRATCH0 undocumented +0x4 alias should decode as hole: got 0x${scratch0AliasRead.toString(16)}`);
+    assert.equal(armcacheAliasRead, 0, `DIGCTL ARMCACHE undocumented +0x4 alias should decode as hole: got 0x${armcacheAliasRead.toString(16)}`);
+    assert.equal(ahbStatsAliasRead, 0, `DIGCTL AHB_STATS_SELECT undocumented +0x4 alias should decode as hole: got 0x${ahbStatsAliasRead.toString(16)}`);
+    assert.equal(mpte0AliasRead, 0, `DIGCTL MPTE0_LOC undocumented +0x4 alias should decode as hole: got 0x${mpte0AliasRead.toString(16)}`);
+
+    await machine.writel(DIGCTL_BASE + 0x0294, 0x13572468);
+    await machine.writel(DIGCTL_BASE + 0x02b4, 0xffffffff);
+    await machine.writel(DIGCTL_BASE + 0x0334, 0xffffffff);
     await machine.writel(DIGCTL_BASE + 0x0404, 0x00000a00);
-    mpte0Loc = await machine.readl(DIGCTL_BASE + 0x0400);
-    assert.equal(mpte0Loc, 0x00000a55, `DIGCTL MPTE0_LOC SET alias should OR into the 12-bit locator: got 0x${mpte0Loc.toString(16)}`);
 
-    await machine.writel(DIGCTL_BASE + 0x0408, 0x00000050);
-    mpte0Loc = await machine.readl(DIGCTL_BASE + 0x0400);
-    assert.equal(mpte0Loc, 0x00000a05, `DIGCTL MPTE0_LOC CLR alias should clear selected locator bits: got 0x${mpte0Loc.toString(16)}`);
+    const scratch0 = await machine.readl(DIGCTL_BASE + 0x0290);
+    const armcache = await machine.readl(DIGCTL_BASE + 0x02b0);
+    const ahbStatsSelect = await machine.readl(DIGCTL_BASE + 0x0330);
+    const mpte0Loc = await machine.readl(DIGCTL_BASE + 0x0400);
 
-    await machine.writel(DIGCTL_BASE + 0x040c, 0x0000000f);
-    mpte0Loc = await machine.readl(DIGCTL_BASE + 0x0400);
-    assert.equal(mpte0Loc, 0x00000a0a, `DIGCTL MPTE0_LOC TOG alias should toggle selected locator bits: got 0x${mpte0Loc.toString(16)}`);
+    assert.equal(scratch0, 0x89abcdef, `DIGCTL SCRATCH0 base register should ignore undocumented alias writes: got 0x${scratch0.toString(16)}`);
+    assert.equal(armcache, 0x00000321, `DIGCTL ARMCACHE base register should ignore undocumented alias writes: got 0x${armcache.toString(16)}`);
+    assert.equal(ahbStatsSelect, 0x01020304, `DIGCTL AHB_STATS_SELECT base register should ignore undocumented alias writes: got 0x${ahbStatsSelect.toString(16)}`);
+    assert.equal(mpte0Loc, 0x00000055, `DIGCTL MPTE0_LOC base register should ignore undocumented alias writes: got 0x${mpte0Loc.toString(16)}`);
   });
 }
 
@@ -526,7 +540,7 @@ const tests = [
   ['DFLPT MPTE locator remap', testDflptMpteTracksLocator],
   ['DIGCTL writable field masks', testDigctlWritableFieldMasks],
   ['DIGCTL scratch and microseconds contract', testDigctlScratchAndMicrosecondsContract],
-  ['DIGCTL MPTE locator SET/CLR/TOG', testDigctlMpteLocatorSetClrTog],
+  ['DIGCTL undocumented alias decode', testDigctlUndocumentedAliasDecode],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];
