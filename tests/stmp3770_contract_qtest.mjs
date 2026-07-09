@@ -523,6 +523,45 @@ async function testClkctrlResetContract() {
   });
 }
 
+async function testClkctrlGatedDividerContract() {
+  await withMachine(async (machine) => {
+    const dividerRegs = [
+      ['PIX', CLKCTRL_BASE + 0x060],
+      ['SSP', CLKCTRL_BASE + 0x070],
+      ['GPMI', CLKCTRL_BASE + 0x080],
+    ];
+
+    for (const [name, addr] of dividerRegs) {
+      const reset = await machine.readl(addr);
+      assert.equal(reset, 0x80000001, `CLKCTRL ${name} should reset gated with DIV=1: got 0x${reset.toString(16)}`);
+
+      await machine.writel(addr, 0x80000028);
+      const whileGated = await machine.readl(addr);
+      assert.equal(
+        whileGated,
+        0x80000001,
+        `CLKCTRL ${name} should ignore DIV writes while CLKGATE=1: got 0x${whileGated.toString(16)}`,
+      );
+
+      await machine.writel(addr, 0x00000028);
+      const ungatedNoRetune = await machine.readl(addr);
+      assert.equal(
+        ungatedNoRetune,
+        0x00000001,
+        `CLKCTRL ${name} should not retune DIV in the same write that ungates the clock: got 0x${ungatedNoRetune.toString(16)}`,
+      );
+
+      await machine.writel(addr, 0x00000028);
+      const retuned = await machine.readl(addr);
+      assert.equal(
+        retuned,
+        0x00000028,
+        `CLKCTRL ${name} should accept a new DIV only after the clock is already ungated: got 0x${retuned.toString(16)}`,
+      );
+    }
+  });
+}
+
 async function testOcotpBankOpenContract() {
   await withMachine(async (machine) => {
     await machine.writel(OCOTP_BASE + 0x000, 0x3e770000);
@@ -626,6 +665,7 @@ const tests = [
   ['DIGCTL undocumented alias decode', testDigctlUndocumentedAliasDecode],
   ['DIGCTL ctrl behavior contract', testDigctlCtrlBehaviorContract],
   ['CLKCTRL reset contract', testClkctrlResetContract],
+  ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];

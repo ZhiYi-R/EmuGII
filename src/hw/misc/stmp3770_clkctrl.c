@@ -75,6 +75,12 @@
 #define CLKSEQ_BYPASS_GPMI      (1 << 4)
 #define CLKSEQ_BYPASS_PIX       (1 << 1)
 
+/* Peripheral divider register bits */
+#define PERCLK_CLKGATE          (1U << 31)
+#define PERCLK_DIV_MASK_15      0x00007FFFU
+#define PERCLK_DIV_MASK_10      0x000003FFU
+#define PERCLK_DIV_MASK_9       0x000001FFU
+
 /* Version register */
 #define VERSION_MAJOR           0x02
 #define VERSION_MINOR           0x01
@@ -106,6 +112,34 @@ struct STMP3770CLKCTRLState {
     bool pll_powered;
     bool pll_locked;
 };
+
+static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
+                                          uint32_t div_mask,
+                                          bool is_set, bool is_clr, bool is_tog)
+{
+    uint32_t current = *target;
+    bool gate_changes = false;
+
+    if (is_set || is_clr || is_tog) {
+        gate_changes = val & PERCLK_CLKGATE;
+    } else {
+        gate_changes = ((current ^ val) & PERCLK_CLKGATE) != 0;
+    }
+
+    if (gate_changes || (current & PERCLK_CLKGATE)) {
+        val = (val & ~div_mask) | (current & div_mask);
+    }
+
+    if (is_set) {
+        *target |= val;
+    } else if (is_clr) {
+        *target &= ~val;
+    } else if (is_tog) {
+        *target ^= val;
+    } else {
+        *target = val;
+    }
+}
 
 /* Helper: Calculate actual clock frequency (for future use) */
 static uint32_t stmp3770_clkctrl_get_cpu_freq(STMP3770CLKCTRLState *s)
@@ -247,15 +281,21 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
 
     case REG_PIX:
         target = &s->pix;
-        break;
+        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_15,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_SSP:
         target = &s->ssp;
-        break;
+        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_9,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_GPMI:
         target = &s->gpmi;
-        break;
+        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_10,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_SPDIF:
         target = &s->spdif;
