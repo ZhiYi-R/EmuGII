@@ -48,18 +48,21 @@
 /* PLLCTRL0 bits */
 #define PLLCTRL0_POWER          (1 << 16)
 #define PLLCTRL0_EN_USB_CLKS    (1 << 18)
+#define PLLCTRL0_RW_MASK        0x33350000U
 
 /* CPU register bits */
 #define CPU_DIV_CPU_MASK        0x3F
 #define CPU_DIV_CPU_FRAC_EN     (1 << 18)
 #define CPU_BUSY_REF_CPU        (1 << 28)
 #define CPU_BUSY_REF_XTAL       (1 << 29)
+#define CPU_RW_MASK             0x07FF17FFU
 
 /* HBUS register bits */
 #define HBUS_DIV_MASK           0x1F
 #define HBUS_DIV_FRAC_EN        (1 << 5)
 #define HBUS_SLOW_DIV_MASK      (0x7 << 16)
 #define HBUS_AUTO_SLOW_MODE     (1 << 20)
+#define HBUS_RW_MASK            0x07F7003FU
 
 /* FRAC register - Phase Fractional Dividers */
 #define FRAC_CLKGATECPU         (1 << 7)
@@ -68,18 +71,30 @@
 #define FRAC_IOFRAC_MASK        (0x3F << 8)
 #define FRAC_CLKGATEPIX         (1 << 23)
 #define FRAC_PIXFRAC_MASK       (0x3F << 16)
+#define FRAC_RW_MASK            0xBFBF00BFU
 
 /* CLKSEQ register bits */
 #define CLKSEQ_BYPASS_CPU       (1 << 7)
 #define CLKSEQ_BYPASS_SSP       (1 << 5)
 #define CLKSEQ_BYPASS_GPMI      (1 << 4)
 #define CLKSEQ_BYPASS_PIX       (1 << 1)
+#define CLKSEQ_BYPASS_SAIF      (1 << 0)
+#define CLKSEQ_RW_MASK          0x000000BBU
 
 /* Peripheral divider register bits */
 #define PERCLK_CLKGATE          (1U << 31)
 #define PERCLK_DIV_MASK_15      0x00007FFFU
 #define PERCLK_DIV_MASK_10      0x000003FFU
 #define PERCLK_DIV_MASK_9       0x000001FFU
+#define PIX_RW_MASK             0x8000FFFFU
+#define SSP_RW_MASK             0x800003FFU
+#define GPMI_RW_MASK            0x800007FFU
+#define XBUS_RW_MASK            0x000007FFU
+#define XTAL_RW_MASK            0xFC000000U
+#define XTAL_DIV_UART_FIXED     0x00000001U
+#define SPDIF_RW_MASK           0x80000000U
+#define PLLCTRL1_RW_MASK        0x40000000U
+#define RESET_RW_MASK           0x00000003U
 
 /* Version register */
 #define VERSION_MAJOR           0x02
@@ -113,11 +128,40 @@ struct STMP3770CLKCTRLState {
     bool pll_locked;
 };
 
+static uint32_t stmp3770_clkctrl_apply_sct(uint32_t current, uint32_t val,
+                                           bool is_set, bool is_clr, bool is_tog)
+{
+    if (is_set) {
+        return current | val;
+    }
+    if (is_clr) {
+        return current & ~val;
+    }
+    if (is_tog) {
+        return current ^ val;
+    }
+    return val;
+}
+
+static void stmp3770_clkctrl_write_masked(uint32_t *target, uint32_t val,
+                                          uint32_t writable_mask,
+                                          bool is_set, bool is_clr, bool is_tog)
+{
+    uint32_t current = *target & writable_mask;
+    uint32_t next = stmp3770_clkctrl_apply_sct(current, val & writable_mask,
+                                               is_set, is_clr, is_tog) &
+                    writable_mask;
+
+    *target = (*target & ~writable_mask) | next;
+}
+
 static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
+                                          uint32_t writable_mask,
                                           uint32_t div_mask,
                                           bool is_set, bool is_clr, bool is_tog)
 {
     uint32_t current = *target;
+    uint32_t current_visible = current & writable_mask;
     bool gate_changes = false;
 
     if (is_set || is_clr || is_tog) {
@@ -127,18 +171,11 @@ static void stmp3770_clkctrl_write_perclk(uint32_t *target, uint32_t val,
     }
 
     if (gate_changes || (current & PERCLK_CLKGATE)) {
-        val = (val & ~div_mask) | (current & div_mask);
+        val = (val & ~div_mask) | (current_visible & div_mask);
     }
 
-    if (is_set) {
-        *target |= val;
-    } else if (is_clr) {
-        *target &= ~val;
-    } else if (is_tog) {
-        *target ^= val;
-    } else {
-        *target = val;
-    }
+    stmp3770_clkctrl_write_masked(target, val, writable_mask,
+                                  is_set, is_clr, is_tog);
 }
 
 /* Helper: Calculate actual clock frequency (for future use) */
@@ -248,66 +285,82 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
     switch (offset) {
     case REG_PLLCTRL0:
         target = &s->pllctrl0;
-        /* Check if PLL is being powered on */
-        if (!is_clr && (val & PLLCTRL0_POWER)) {
-            s->pll_powered = true;
-            /* Simulate instant lock (real HW needs ~10us) */
-            s->pll_locked = true;
-        } else if (is_clr && (val & PLLCTRL0_POWER)) {
-            s->pll_powered = false;
-            s->pll_locked = false;
-        }
-        break;
+        stmp3770_clkctrl_write_masked(target, val, PLLCTRL0_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        s->pll_powered = (s->pllctrl0 & PLLCTRL0_POWER) != 0;
+        s->pll_locked = s->pll_powered;
+        return;
 
     case REG_PLLCTRL1:
         target = &s->pllctrl1;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, PLLCTRL1_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_CPU:
         target = &s->cpu;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, CPU_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_HBUS:
         target = &s->hbus;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, HBUS_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_XBUS:
         target = &s->xbus;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, XBUS_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_XTAL:
         target = &s->xtal;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, XTAL_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        s->xtal = (s->xtal & XTAL_RW_MASK) | XTAL_DIV_UART_FIXED;
+        return;
 
     case REG_PIX:
         target = &s->pix;
-        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_15,
+        stmp3770_clkctrl_write_perclk(target, val, PIX_RW_MASK,
+                                      PERCLK_DIV_MASK_15,
                                       is_set, is_clr, is_tog);
         return;
 
     case REG_SSP:
         target = &s->ssp;
-        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_9,
+        stmp3770_clkctrl_write_perclk(target, val, SSP_RW_MASK,
+                                      PERCLK_DIV_MASK_9,
                                       is_set, is_clr, is_tog);
         return;
 
     case REG_GPMI:
         target = &s->gpmi;
-        stmp3770_clkctrl_write_perclk(target, val, PERCLK_DIV_MASK_10,
+        stmp3770_clkctrl_write_perclk(target, val, GPMI_RW_MASK,
+                                      PERCLK_DIV_MASK_10,
                                       is_set, is_clr, is_tog);
         return;
 
     case REG_SPDIF:
         target = &s->spdif;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, SPDIF_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_FRAC:
         target = &s->frac;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, FRAC_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_CLKSEQ:
         target = &s->clkseq;
-        break;
+        stmp3770_clkctrl_write_masked(target, val, CLKSEQ_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        s->clkseq &= ~CLKSEQ_BYPASS_SAIF;
+        return;
 
     case REG_RESET:
         target = &s->reset;
@@ -316,7 +369,9 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
             /* CHIP_RESET bit */
             qemu_log_mask(LOG_UNIMP, "%s: chip reset requested\n", __func__);
         }
-        break;
+        stmp3770_clkctrl_write_masked(target, val, RESET_RW_MASK,
+                                      is_set, is_clr, is_tog);
+        return;
 
     case REG_VERSION:
         /* Read-only, ignore writes */
@@ -328,17 +383,6 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
         return;
     }
 
-    if (target) {
-        if (is_set) {
-            *target |= val;
-        } else if (is_clr) {
-            *target &= ~val;
-        } else if (is_tog) {
-            *target ^= val;
-        } else {
-            *target = val;
-        }
-    }
 }
 
 static const MemoryRegionOps stmp3770_clkctrl_ops = {

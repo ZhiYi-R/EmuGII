@@ -562,6 +562,37 @@ async function testClkctrlGatedDividerContract() {
   });
 }
 
+async function testClkctrlWritableFieldMasks() {
+  await withMachine(async (machine) => {
+    await machine.writel(CLKCTRL_BASE + 0x000, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x020, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x030, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x040, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x050, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x090, 0xffffffff);
+    await machine.writel(CLKCTRL_BASE + 0x0d0, 0xe3e3ffe3);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0xffffffff);
+
+    const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
+    const cpu = await machine.readl(CLKCTRL_BASE + 0x020);
+    const hbus = await machine.readl(CLKCTRL_BASE + 0x030);
+    const xbus = await machine.readl(CLKCTRL_BASE + 0x040);
+    const xtal = await machine.readl(CLKCTRL_BASE + 0x050);
+    const spdif = await machine.readl(CLKCTRL_BASE + 0x090);
+    const frac = await machine.readl(CLKCTRL_BASE + 0x0d0);
+    const clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+
+    assert.equal(pllctrl0, 0x33350000, `CLKCTRL PLLCTRL0 should only expose documented writable fields: got 0x${pllctrl0.toString(16)}`);
+    assert.equal(cpu, 0x07ff17ff, `CLKCTRL CPU should ignore busy/reserved bits on write: got 0x${cpu.toString(16)}`);
+    assert.equal(hbus, 0x07f7003f, `CLKCTRL HBUS should ignore reserved/busy bits on write: got 0x${hbus.toString(16)}`);
+    assert.equal(xbus, 0x000007ff, `CLKCTRL XBUS should only expose DIV_FRAC_EN/DIV: got 0x${xbus.toString(16)}`);
+    assert.equal(xtal, 0xfc000001, `CLKCTRL XTAL should keep DIV_UART fixed at 1 and ignore reserved bits: got 0x${xtal.toString(16)}`);
+    assert.equal(spdif, 0x80000000, `CLKCTRL SPDIF should only expose CLKGATE: got 0x${spdif.toString(16)}`);
+    assert.equal(frac, 0xa3a300a3, `CLKCTRL FRAC should ignore STABLE/reserved bits on write: got 0x${frac.toString(16)}`);
+    assert.equal(clkseq, 0x000000ba, `CLKCTRL CLKSEQ should keep BYPASS_SAIF cleared after software writes: got 0x${clkseq.toString(16)}`);
+  });
+}
+
 async function testOcotpBankOpenContract() {
   await withMachine(async (machine) => {
     await machine.writel(OCOTP_BASE + 0x000, 0x3e770000);
@@ -666,6 +697,7 @@ const tests = [
   ['DIGCTL ctrl behavior contract', testDigctlCtrlBehaviorContract],
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
+  ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];
