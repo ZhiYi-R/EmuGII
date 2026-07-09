@@ -85,6 +85,7 @@
 #define CLKSEQ_BYPASS_CPU       (1 << 7)
 #define CLKSEQ_BYPASS_SSP       (1 << 5)
 #define CLKSEQ_BYPASS_GPMI      (1 << 4)
+#define CLKSEQ_BYPASS_IR        (1 << 3)
 #define CLKSEQ_BYPASS_PIX       (1 << 1)
 #define CLKSEQ_BYPASS_SAIF      (1 << 0)
 #define CLKSEQ_RW_MASK          0x000000BBU
@@ -303,6 +304,60 @@ static void stmp3770_clkctrl_write_frac(uint32_t *target, uint32_t val,
     }
 }
 
+static bool stmp3770_clkctrl_clkseq_switch_blocked(STMP3770CLKCTRLState *s,
+                                                   uint32_t bit)
+{
+    switch (bit) {
+    case CLKSEQ_BYPASS_CPU:
+        return (s->frac & FRAC_CLKGATECPU) != 0;
+    case CLKSEQ_BYPASS_SSP:
+        return (s->frac & FRAC_CLKGATEIO) != 0 || (s->ssp & PERCLK_CLKGATE) != 0;
+    case CLKSEQ_BYPASS_GPMI:
+        return (s->frac & FRAC_CLKGATEIO) != 0 || (s->gpmi & PERCLK_CLKGATE) != 0;
+    case CLKSEQ_BYPASS_IR:
+        return (s->frac & FRAC_CLKGATEIO) != 0;
+    case CLKSEQ_BYPASS_PIX:
+        return (s->frac & FRAC_CLKGATEPIX) != 0 || (s->pix & PERCLK_CLKGATE) != 0;
+    default:
+        return false;
+    }
+}
+
+static void stmp3770_clkctrl_write_clkseq(STMP3770CLKCTRLState *s, uint32_t val,
+                                          bool is_set, bool is_clr, bool is_tog)
+{
+    uint32_t old = s->clkseq;
+    uint32_t next;
+    uint32_t changed;
+    uint32_t blocked = 0;
+    const uint32_t bypass_bits[] = {
+        CLKSEQ_BYPASS_CPU,
+        CLKSEQ_BYPASS_SSP,
+        CLKSEQ_BYPASS_GPMI,
+        CLKSEQ_BYPASS_IR,
+        CLKSEQ_BYPASS_PIX,
+    };
+    size_t i;
+
+    stmp3770_clkctrl_write_masked(&s->clkseq, val, CLKSEQ_RW_MASK,
+                                  is_set, is_clr, is_tog);
+    s->clkseq &= ~CLKSEQ_BYPASS_SAIF;
+
+    next = s->clkseq;
+    changed = (old ^ next) & CLKSEQ_RW_MASK;
+
+    for (i = 0; i < ARRAY_SIZE(bypass_bits); i++) {
+        uint32_t bit = bypass_bits[i];
+
+        if ((changed & bit) && stmp3770_clkctrl_clkseq_switch_blocked(s, bit)) {
+            blocked |= bit;
+        }
+    }
+
+    s->clkseq = (next & ~blocked) | (old & blocked);
+    s->clkseq &= ~CLKSEQ_BYPASS_SAIF;
+}
+
 /* Helper: Calculate actual clock frequency (for future use) */
 static uint32_t stmp3770_clkctrl_get_cpu_freq(STMP3770CLKCTRLState *s)
 {
@@ -481,10 +536,7 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
         return;
 
     case REG_CLKSEQ:
-        target = &s->clkseq;
-        stmp3770_clkctrl_write_masked(target, val, CLKSEQ_RW_MASK,
-                                      is_set, is_clr, is_tog);
-        s->clkseq &= ~CLKSEQ_BYPASS_SAIF;
+        stmp3770_clkctrl_write_clkseq(s, val, is_set, is_clr, is_tog);
         return;
 
     case REG_RESET:

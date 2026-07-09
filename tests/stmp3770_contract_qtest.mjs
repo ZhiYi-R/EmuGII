@@ -840,6 +840,120 @@ async function testClkctrlFracRangeContract() {
   });
 }
 
+async function testClkctrlClkseqGateContract() {
+  await withMachine(async (machine) => {
+    const clkseqReset = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(clkseqReset, 0x000000bb, `CLKCTRL CLKSEQ should reset with all documented bypass bits set: got 0x${clkseqReset.toString(16)}`);
+
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x0000003b);
+    let clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000ba,
+      `CLKCTRL CLKSEQ should ignore CPU bypass switching while FRAC.CLKGATECPU keeps ref_cpu gated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0d8, 0x00000080);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x0000003a);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x0000003a,
+      `CLKCTRL CLKSEQ should allow CPU bypass switching once ref_cpu is ungated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0d4, 0x00000080);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000ba);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x0000003a,
+      `CLKCTRL CLKSEQ should ignore CPU bypass switching back to XTAL while FRAC.CLKGATECPU is asserted: got 0x${clkseq.toString(16)}`,
+    );
+  });
+
+  await withMachine(async (machine) => {
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000b3);
+    let clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000ba,
+      `CLKCTRL CLKSEQ should ignore IR bypass switching while FRAC.CLKGATEIO keeps ref_io gated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0d8, 0x80000000);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000b2);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000b2,
+      `CLKCTRL CLKSEQ should allow IR bypass switching once ref_io is ungated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x00000092);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000b2,
+      `CLKCTRL CLKSEQ should ignore SSP bypass switching while SSP.CLKGATE is still asserted: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x070, 0x00000028);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x00000092);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x00000092,
+      `CLKCTRL CLKSEQ should allow SSP bypass switching once ref_io and SSP are both ungated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x00000082);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x00000092,
+      `CLKCTRL CLKSEQ should ignore GPMI bypass switching while GPMI.CLKGATE is still asserted: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x080, 0x00000028);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x00000082);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x00000082,
+      `CLKCTRL CLKSEQ should allow GPMI bypass switching once ref_io and GPMI are both ungated: got 0x${clkseq.toString(16)}`,
+    );
+  });
+
+  await withMachine(async (machine) => {
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000b9);
+    let clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000ba,
+      `CLKCTRL CLKSEQ should ignore PIX bypass switching while FRAC.CLKGATEPIX keeps ref_pix gated: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0d8, 0x00800000);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000b8);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000ba,
+      `CLKCTRL CLKSEQ should ignore PIX bypass switching while PIX.CLKGATE is still asserted: got 0x${clkseq.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x060, 0x00000028);
+    await machine.writel(CLKCTRL_BASE + 0x0e0, 0x000000b8);
+    clkseq = await machine.readl(CLKCTRL_BASE + 0x0e0);
+    assert.equal(
+      clkseq,
+      0x000000b8,
+      `CLKCTRL CLKSEQ should allow PIX bypass switching once ref_pix and PIX are both ungated: got 0x${clkseq.toString(16)}`,
+    );
+  });
+}
+
 async function testOcotpBankOpenContract() {
   await withMachine(async (machine) => {
     await machine.writel(OCOTP_BASE + 0x000, 0x3e770000);
@@ -951,6 +1065,7 @@ const tests = [
   ['CLKCTRL divider range contract', testClkctrlDividerRangeContract],
   ['CLKCTRL busy contract', testClkctrlBusyContract],
   ['CLKCTRL FRAC range contract', testClkctrlFracRangeContract],
+  ['CLKCTRL CLKSEQ gate contract', testClkctrlClkseqGateContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
 ];
