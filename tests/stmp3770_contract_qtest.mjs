@@ -2037,6 +2037,13 @@ async function testSspDataEmptyReadContract() {
 
 async function testGpmiTiming2Contract() {
   await withMachine(async (machine) => {
+    await machine.writel(GPMI_BASE + 0x080, 0xffffffff);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x080),
+      0xffff0000,
+      'GPMI TIMING1 must retain only DEVICE_BUSY_TIMEOUT and read its lower reserved field as zero',
+    );
+
     assert.equal(
       await machine.readl(GPMI_BASE + 0x090),
       0x09020101,
@@ -2489,6 +2496,17 @@ async function testGpmiDataFifoContract() {
       (await machine.readl(GPMI_BASE + 0x0b0)) & 0x30,
       0x10,
       'GPMI STAT must report a full FIFO after 32 queued 16-bit bus cycles',
+    );
+
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    for (let word = 0; word < 32; word += 1) {
+      await machine.writew(GPMI_BASE + 0x0a0, word);
+    }
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 23));
+    assert.equal(
+      (await machine.readl(GPMI_BASE + 0x0b0)) & 0x30,
+      0x20,
+      'GPMI XFER_COUNT=0 must consume the available 64K-word transfer stream rather than zero words',
     );
   });
 }

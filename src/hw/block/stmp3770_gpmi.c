@@ -818,6 +818,10 @@ static void gpmi_execute_command(STMP3770GPMIState *s)
                            s->active_dma_channel : cs;
     uint32_t count = s->ctrl0 & GPMI_CTRL0_XFER_COUNT_MASK;
 
+    if (count == 0) {
+        count = 1U << 16;
+    }
+
     if (!gpmi_enabled(s)) {
         return;
     }
@@ -1043,7 +1047,7 @@ static void gpmi_write(void *opaque, hwaddr offset,
         s->timing0 = (uint32_t)value;
         break;
     case GPMI_TIMING1:
-        s->timing1 = (uint32_t)value;
+        s->timing1 = (uint32_t)value & 0xFFFF0000U;
         break;
     case GPMI_TIMING2:
         if (offset == GPMI_TIMING2) {
