@@ -9,6 +9,7 @@ import subprocess
 from build_helpers import (
     collect_release_files,
     find_executable,
+    input_fingerprint,
     parse_objdump_dll_names,
     prepend_path_entries,
     resolve_bash,
@@ -203,8 +204,9 @@ def apply_patches(target, source, env):
         shutil.copy2(src_path, dst_path)
         print(f"  已复制: {dst_file}")
 
+    marker_fingerprint = input_fingerprint([str(node) for node in source])
     with open(str(target[0]), 'w') as f:
-        f.write("Patched\n")
+        f.write(f"Patched {marker_fingerprint}\n")
 
     return None
 
@@ -497,6 +499,7 @@ stmp3770_qtest = env.Command(
     [built_qemu, os.path.join(TESTS_DIR, 'stmp3770_contract_qtest.mjs')],
     run_stmp3770_qtest
 )
+AlwaysBuild(stmp3770_qtest)
 
 # 默认目标
 Default(packaged_qemu)

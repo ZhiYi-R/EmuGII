@@ -668,6 +668,7 @@ void stmp3770_digctl_dig_reset(STMP3770DIGCTLState *s)
 {
     uint32_t por_only_ctrl = s->ctrl & CTRL_DEBUG_DISABLE;
 
+    /* RESET.DIG resets all DIGCTL state except the POR-only debug fuse. */
     stmp3770_digctl_reset(DEVICE(s));
     s->ctrl |= por_only_ctrl;
 }

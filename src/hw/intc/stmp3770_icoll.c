@@ -24,6 +24,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/intc/stmp3770_icoll.h"
 
 /* Register offsets */
@@ -50,6 +51,13 @@
 #define REG_PRIORITY14      0x140
 #define REG_PRIORITY15      0x150
 #define REG_VBASE           0x160
+#define REG_DEBUG           0x170
+#define REG_DEBUGRD0        0x180
+#define REG_DEBUGRD1        0x190
+#define REG_DEBUGFLAG       0x1A0
+#define REG_DEBUGRDREQ0     0x1B0
+#define REG_DEBUGRDREQ1     0x1C0
+#define REG_VERSION         0x1D0
 
 /* Register SET/CLR/TOG offsets */
 #define REG_SET             0x4
@@ -66,6 +74,24 @@
 #define CTRL_ARM_RSE_MODE       (1U << 18)
 #define CTRL_FIQ_FINAL_ENABLE   (1U << 17)
 #define CTRL_IRQ_FINAL_ENABLE   (1U << 16)
+#define CTRL_FIQ_ENABLE_MASK    0x000000FFU
+#define CTRL_RW_MASK            0xC0FF00FFU
+
+#define PRIORITY_RW_MASK        0x0F0F0F0FU
+#define VBASE_RW_MASK           0xFFFFFFFCU
+#define ICOLL_VERSION           0x02000000U
+#define ICOLL_DEBUGRD0          0xECA94567U
+#define ICOLL_DEBUGRD1          0x1356DA98U
+
+#define DEBUG_VECTOR_FSM_PENDING      0x004U
+#define DEBUG_VECTOR_FSM_ISR_RUNNING  0x020U
+
+/* APBH is synchronous with HCLK; cold reset leaves HCLK at 24 MHz. */
+#define ICOLL_RESET_CLOCK_HZ           24000000ULL
+#define ICOLL_SFTRST_CLOCKS            4ULL
+#define ICOLL_SFTRST_DELAY_NS          \
+    ((ICOLL_SFTRST_CLOCKS * NANOSECONDS_PER_SECOND + \
+      ICOLL_RESET_CLOCK_HZ - 1) / ICOLL_RESET_CLOCK_HZ)
 
 /* STAT register bits */
 #define STAT_VECTOR_NUMBER_MASK 0x3F
@@ -82,64 +108,297 @@ struct STMP3770ICOLLState {
     /* Registers */
     uint32_t ctrl;
     uint32_t vbase;
-    uint32_t vector_pitch;
-
     /* Priority registers - one per 4 interrupt sources */
     /* Each priority reg contains: ENABLE[3:0], PRIORITY[3:0] for 4 sources */
     uint32_t priority[16];      /* PRIORITY0-15, covers all 64 sources */
 
     /* Raw interrupt status */
     uint64_t raw_status;        /* Bits 0-63: raw interrupt inputs */
+    uint64_t request_holding;   /* Snapshot sampled by the normal IRQ FSM */
 
     /* In-service tracking for nested interrupts */
-    uint32_t level_active[4];   /* Active interrupts per level */
+    uint32_t level_active[4];   /* In-service source number plus one */
     uint32_t current_level;     /* Current service level */
 
     /* FIQ enable for sources 28-35 */
     uint8_t fiq_enable;         /* 8 bits for sources 28-35 */
+    uint32_t debugflag;
 
     /* Highest priority pending IRQ vector number */
     uint32_t vector;
+    bool vector_pending;
+
+    QEMUTimer *sftrst_timer;
 };
+
+static void stmp3770_icoll_reset(DeviceState *dev);
+static void stmp3770_icoll_update(STMP3770ICOLLState *s);
+
+static void stmp3770_icoll_finish_soft_reset(void *opaque)
+{
+    STMP3770ICOLLState *s = STMP3770_ICOLL(opaque);
+
+    stmp3770_icoll_reset(DEVICE(s));
+    stmp3770_icoll_update(s);
+}
+
+static int stmp3770_icoll_highest_active_level(const STMP3770ICOLLState *s)
+{
+    int level;
+
+    for (level = 3; level >= 0; level--) {
+        if (s->level_active[level]) {
+            return level;
+        }
+    }
+
+    return -1;
+}
+
+static uint64_t stmp3770_icoll_live_requests(const STMP3770ICOLLState *s)
+{
+    uint64_t requests = s->raw_status;
+    int source;
+
+    for (source = 0; source < 64; source++) {
+        uint32_t priority = s->priority[source / 4];
+        uint32_t field = (source % 4) * 8;
+
+        if ((priority >> (field + 3)) & 1) {
+            requests |= 1ULL << source;
+        }
+    }
+
+    return requests;
+}
+
+static uint64_t stmp3770_icoll_debug_requests(const STMP3770ICOLLState *s)
+{
+    if (s->ctrl & CTRL_BYPASS_FSM) {
+        return stmp3770_icoll_live_requests(s);
+    }
+
+    return s->request_holding;
+}
+
+static bool stmp3770_icoll_source_routes_to_fiq(const STMP3770ICOLLState *s,
+                                                 int source)
+{
+    return source >= 28 && source <= 35 &&
+           ((s->fiq_enable >> (source - 28)) & 1);
+}
+
+static bool stmp3770_icoll_fiq_pending(const STMP3770ICOLLState *s)
+{
+    uint64_t requests = stmp3770_icoll_live_requests(s);
+    int source;
+
+    for (source = 28; source <= 35; source++) {
+        if (stmp3770_icoll_source_routes_to_fiq(s, source) &&
+            (requests & (1ULL << source))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static uint32_t stmp3770_icoll_debug(const STMP3770ICOLLState *s)
+{
+    uint64_t requests = stmp3770_icoll_debug_requests(s);
+    uint32_t inservice = 0;
+    uint32_t requests_by_level = 0;
+    uint32_t level_requests = 0;
+    uint32_t vector_fsm = 0;
+    int source;
+
+    for (int level = 0; level < 4; level++) {
+        if (s->level_active[level]) {
+            inservice |= 1U << level;
+        }
+    }
+
+    for (source = 0; source < 64; source++) {
+        uint32_t priority = s->priority[source / 4];
+        uint32_t field = (source % 4) * 8;
+        uint32_t level = (priority >> field) & 0x3;
+        bool enabled = (priority >> (field + 2)) & 1;
+
+        if ((requests & (1ULL << source)) && enabled &&
+            !stmp3770_icoll_source_routes_to_fiq(s, source)) {
+            requests_by_level |= 1U << level;
+        }
+    }
+
+    if (s->vector_pending) {
+        uint32_t priority = s->priority[s->vector / 4];
+        uint32_t field = (s->vector % 4) * 8;
+
+        level_requests = 1U << ((priority >> field) & 0x3);
+        vector_fsm = DEBUG_VECTOR_FSM_PENDING;
+    } else if (stmp3770_icoll_highest_active_level(s) >= 0) {
+        vector_fsm = DEBUG_VECTOR_FSM_ISR_RUNNING;
+    }
+
+    return (inservice << 28) |
+           (level_requests << 24) |
+           (requests_by_level << 20) |
+           ((s->ctrl & CTRL_FIQ_FINAL_ENABLE &&
+             stmp3770_icoll_fiq_pending(s)) ? (1U << 17) : 0) |
+           ((s->ctrl & CTRL_IRQ_FINAL_ENABLE && s->vector_pending) ?
+            (1U << 16) : 0) |
+           vector_fsm;
+}
+
+static void stmp3770_icoll_enter_service(STMP3770ICOLLState *s)
+{
+    uint32_t source = s->vector;
+    uint32_t priority = s->priority[source / 4];
+    uint32_t level = (priority >> ((source % 4) * 8)) & 0x3;
+
+    if (!s->vector_pending) {
+        return;
+    }
+
+    s->level_active[level] = source + 1;
+    s->current_level = level;
+    s->vector_pending = false;
+}
+
+static void stmp3770_icoll_write_ctrl(STMP3770ICOLLState *s, uint32_t val,
+                                      bool is_set, bool is_clr, bool is_tog)
+{
+    uint32_t old_ctrl = s->ctrl;
+    uint32_t next_ctrl;
+    bool old_sftrst;
+    bool next_sftrst;
+
+    if (is_set) {
+        next_ctrl = old_ctrl | val;
+    } else if (is_clr) {
+        next_ctrl = old_ctrl & ~val;
+    } else if (is_tog) {
+        next_ctrl = old_ctrl ^ val;
+    } else {
+        next_ctrl = val;
+    }
+    next_ctrl &= CTRL_RW_MASK;
+
+    old_sftrst = old_ctrl & CTRL_SFTRST;
+    next_sftrst = next_ctrl & CTRL_SFTRST;
+    s->ctrl = next_ctrl;
+    s->fiq_enable = s->ctrl & CTRL_FIQ_ENABLE_MASK;
+
+    if (!(old_ctrl & CTRL_BYPASS_FSM) &&
+        (s->ctrl & CTRL_BYPASS_FSM)) {
+        s->vector_pending = false;
+    }
+
+    if (!next_sftrst) {
+        timer_del(s->sftrst_timer);
+        return;
+    }
+
+    /* The manual specifies that a simultaneous gate makes SFTRST ineffective. */
+    if (s->ctrl & CTRL_CLKGATE) {
+        timer_del(s->sftrst_timer);
+        return;
+    }
+
+    if (!old_sftrst) {
+        timer_mod(s->sftrst_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  ICOLL_SFTRST_DELAY_NS);
+    }
+}
 
 static void stmp3770_icoll_update(STMP3770ICOLLState *s)
 {
-    int i, level;
-    uint32_t pending_irq = 0;
-    uint32_t pending_fiq = 0;
-    uint32_t vector = 0;
+    int i;
+    int active_level;
+    int selected_level = -1;
+    uint32_t selected_vector = 0;
+    bool has_candidate = false;
+    bool pending_fiq = false;
     bool irq_enabled = s->ctrl & CTRL_IRQ_FINAL_ENABLE;
     bool fiq_enabled = s->ctrl & CTRL_FIQ_FINAL_ENABLE;
+    uint64_t requests = stmp3770_icoll_live_requests(s);
+
+    if (s->ctrl & (CTRL_SFTRST | CTRL_CLKGATE)) {
+        s->vector = 0;
+        qemu_set_irq(s->irq, 0);
+        qemu_set_irq(s->fiq, 0);
+        return;
+    }
+
+    if (s->ctrl & CTRL_BYPASS_FSM) {
+        s->request_holding = requests;
+        s->vector_pending = false;
+        for (i = 0; i < 64; i++) {
+            if ((requests & (1ULL << i)) &&
+                !stmp3770_icoll_source_routes_to_fiq(s, i)) {
+                s->vector = i;
+                qemu_set_irq(s->irq, 0);
+                qemu_set_irq(s->fiq, fiq_enabled &&
+                             stmp3770_icoll_fiq_pending(s));
+                return;
+            }
+        }
+
+        s->vector = 0;
+        qemu_set_irq(s->irq, 0);
+        qemu_set_irq(s->fiq, fiq_enabled && stmp3770_icoll_fiq_pending(s));
+        return;
+    }
+
+    if (!s->vector_pending) {
+        s->request_holding = requests;
+    }
+    requests = s->request_holding;
+
+    active_level = stmp3770_icoll_highest_active_level(s);
+    s->current_level = active_level >= 0 ? active_level : 0;
 
     /* Check each interrupt source */
     for (i = 0; i < 64; i++) {
-        bool active = (s->raw_status >> i) & 1;
+        bool active = (requests >> i) & 1;
         int pri_reg = i / 4;
         int pri_bit = (i % 4) * 8;
         uint32_t pri_val = s->priority[pri_reg];
         bool enabled = (pri_val >> (pri_bit + 2)) & 1;
+        int level = (pri_val >> pri_bit) & 0x3;
+
+        if (stmp3770_icoll_source_routes_to_fiq(s, i)) {
+            pending_fiq |= active;
+            continue;
+        }
 
         if (!active || !enabled) {
             continue;
         }
 
-        /* Check if this source is routed to FIQ (only sources 28-35) */
-        if (i >= 28 && i <= 35 && ((s->fiq_enable >> (i - 28)) & 1)) {
-            pending_fiq = 1;
+        if (s->vector_pending ||
+            (active_level >= 0 &&
+             ((s->ctrl & CTRL_NO_NESTING) || level <= active_level))) {
             continue;
         }
 
-        /* This is an IRQ source */
-        if (!pending_irq) {
-            vector = i;
+        /* Higher level wins; source number resolves ties within one level. */
+        if (!has_candidate || level > selected_level) {
+            selected_vector = i;
+            selected_level = level;
         }
-        pending_irq = 1;
+        has_candidate = true;
     }
 
-    s->vector = vector;
+    if (!s->vector_pending && has_candidate) {
+        s->vector = selected_vector;
+        s->vector_pending = true;
+    } else if (!s->vector_pending && active_level < 0) {
+        s->vector = 0;
+    }
 
     /* Update IRQ/FIQ outputs */
-    qemu_set_irq(s->irq, irq_enabled && pending_irq);
+    qemu_set_irq(s->irq, irq_enabled && s->vector_pending);
     qemu_set_irq(s->fiq, fiq_enabled && pending_fiq);
 }
 
@@ -164,6 +423,14 @@ static uint64_t icoll_read_subword(uint32_t value, hwaddr offset, unsigned size)
     return (value >> shift) & mask;
 }
 
+static uint32_t stmp3770_icoll_vector_pitch(const STMP3770ICOLLState *s)
+{
+    uint32_t field = (s->ctrl & CTRL_VECTOR_PITCH_MASK) >>
+                     CTRL_VECTOR_PITCH_SHIFT;
+
+    return field <= 1 ? 4 : field * 4;
+}
+
 static uint64_t stmp3770_icoll_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770ICOLLState *s = STMP3770_ICOLL(opaque);
@@ -172,17 +439,10 @@ static uint64_t stmp3770_icoll_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (base) {
     case REG_VECTOR:
-        {
-            /*
-             * Return the vector address for the highest priority pending
-             * interrupt.  The lower bits encode the vector number scaled by
-             * the configured pitch; the firmware extracts IRQVECTOR from bits
-             * 2+ (pitch is normally 4 bytes/entry, so vector = raw / 4).
-             */
-            uint32_t pitch_field = (s->ctrl & CTRL_VECTOR_PITCH_MASK) >>
-                                   CTRL_VECTOR_PITCH_SHIFT;
-            uint32_t pitch = (pitch_field + 1) * 4;
-            value = s->vbase + s->vector * pitch;
+        value = s->vbase + s->vector * stmp3770_icoll_vector_pitch(s);
+        if (s->ctrl & CTRL_ARM_RSE_MODE) {
+            stmp3770_icoll_enter_service(s);
+            stmp3770_icoll_update(s);
         }
         break;
 
@@ -192,6 +452,10 @@ static uint64_t stmp3770_icoll_read(void *opaque, hwaddr offset, unsigned size)
 
     case REG_VBASE:
         value = s->vbase;
+        break;
+
+    case REG_STAT:
+        value = s->vector & STAT_VECTOR_NUMBER_MASK;
         break;
 
     case REG_RAW0:
@@ -204,6 +468,34 @@ static uint64_t stmp3770_icoll_read(void *opaque, hwaddr offset, unsigned size)
 
     case REG_PRIORITY0 ... REG_PRIORITY15:
         value = s->priority[(base - REG_PRIORITY0) / 0x10];
+        break;
+
+    case REG_DEBUG:
+        value = stmp3770_icoll_debug(s);
+        break;
+
+    case REG_DEBUGRD0:
+        value = ICOLL_DEBUGRD0;
+        break;
+
+    case REG_DEBUGRD1:
+        value = ICOLL_DEBUGRD1;
+        break;
+
+    case REG_DEBUGFLAG:
+        value = s->debugflag;
+        break;
+
+    case REG_DEBUGRDREQ0:
+        value = (uint32_t)stmp3770_icoll_debug_requests(s);
+        break;
+
+    case REG_DEBUGRDREQ1:
+        value = (uint32_t)(stmp3770_icoll_debug_requests(s) >> 32);
+        break;
+
+    case REG_VERSION:
+        value = ICOLL_VERSION;
         break;
 
     default:
@@ -242,6 +534,9 @@ static void stmp3770_icoll_write(void *opaque, hwaddr offset,
         case REG_PRIORITY0 ... REG_PRIORITY15:
             target = &s->priority[(base_offset - REG_PRIORITY0) / 0x10];
             break;
+        case REG_DEBUGFLAG:
+            target = &s->debugflag;
+            break;
         default:
             qemu_log_mask(LOG_GUEST_ERROR,
                          "%s: sub-word write to unsupported offset 0x%" HWADDR_PRIx "\n",
@@ -253,6 +548,19 @@ static void stmp3770_icoll_write(void *opaque, hwaddr offset,
             *target = (*target & ~mask) | ((value << shift) & mask);
         }
 
+        if (base_offset == REG_CTRL) {
+            s->ctrl &= CTRL_RW_MASK;
+            s->fiq_enable = s->ctrl & CTRL_FIQ_ENABLE_MASK;
+        } else if (base_offset == REG_VBASE) {
+            s->vbase &= VBASE_RW_MASK;
+        } else if (base_offset >= REG_PRIORITY0 &&
+                   base_offset <= REG_PRIORITY15) {
+            s->priority[(base_offset - REG_PRIORITY0) / 0x10] &=
+                PRIORITY_RW_MASK;
+        } else if (base_offset == REG_DEBUGFLAG) {
+            s->debugflag &= 0xFFFF;
+        }
+
         stmp3770_icoll_update(s);
         return;
     }
@@ -262,21 +570,35 @@ static void stmp3770_icoll_write(void *opaque, hwaddr offset,
     offset = base_offset;
 
     switch (offset) {
+    case REG_VECTOR:
+        stmp3770_icoll_enter_service(s);
+        stmp3770_icoll_update(s);
+        return;
+
     case REG_CTRL:
-        target = &s->ctrl;
-        break;
+        stmp3770_icoll_write_ctrl(s, val, is_set, is_clr, is_tog);
+        stmp3770_icoll_update(s);
+        return;
 
     case REG_VBASE:
         target = &s->vbase;
         break;
 
     case REG_LEVELACK:
-        /* Acknowledge interrupt level */
-        /* Writing (1 << level) acknowledges that level */
-        break;
+        for (int level = 0; level < 4; level++) {
+            if (val & (1U << level)) {
+                s->level_active[level] = 0;
+            }
+        }
+        stmp3770_icoll_update(s);
+        return;
 
     case REG_PRIORITY0 ... REG_PRIORITY15:
         target = &s->priority[(offset - REG_PRIORITY0) / 0x10];
+        break;
+
+    case REG_DEBUGFLAG:
+        target = &s->debugflag;
         break;
 
     default:
@@ -297,13 +619,12 @@ static void stmp3770_icoll_write(void *opaque, hwaddr offset,
         }
     }
 
-    /* Hardware ties CLKGATE to SFTRST on the control register */
-    if (offset == REG_CTRL) {
-        if (s->ctrl & CTRL_SFTRST) {
-            s->ctrl |= CTRL_CLKGATE;
-        } else {
-            s->ctrl &= ~CTRL_CLKGATE;
-        }
+    if (offset == REG_VBASE) {
+        s->vbase &= VBASE_RW_MASK;
+    } else if (offset >= REG_PRIORITY0 && offset <= REG_PRIORITY15) {
+        s->priority[(offset - REG_PRIORITY0) / 0x10] &= PRIORITY_RW_MASK;
+    } else if (offset == REG_DEBUGFLAG) {
+        s->debugflag &= 0xFFFF;
     }
 
     stmp3770_icoll_update(s);
@@ -320,12 +641,18 @@ static void stmp3770_icoll_reset(DeviceState *dev)
     STMP3770ICOLLState *s = STMP3770_ICOLL(dev);
     int i;
 
-    s->ctrl = CTRL_CLKGATE | CTRL_SFTRST;
+    s->ctrl = CTRL_CLKGATE | CTRL_SFTRST |
+              CTRL_FIQ_FINAL_ENABLE | CTRL_IRQ_FINAL_ENABLE;
     s->vbase = 0;
     s->vector = 0;
+    s->vector_pending = false;
     s->raw_status = 0;
+    s->request_holding = 0;
     s->current_level = 0;
     s->fiq_enable = 0;
+    s->debugflag = 0;
+
+    timer_del(s->sftrst_timer);
 
     for (i = 0; i < 16; i++) {
         s->priority[i] = 0;
@@ -349,23 +676,37 @@ static void stmp3770_icoll_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
 
+    s->sftrst_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   stmp3770_icoll_finish_soft_reset, s);
+
     /* 64 IRQ inputs from peripherals */
     qdev_init_gpio_in(DEVICE(obj), stmp3770_icoll_set_irq, 64);
 }
 
+static void stmp3770_icoll_finalize(Object *obj)
+{
+    STMP3770ICOLLState *s = STMP3770_ICOLL(obj);
+
+    timer_free(s->sftrst_timer);
+}
+
 static const VMStateDescription vmstate_stmp3770_icoll = {
     .name = TYPE_STMP3770_ICOLL,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770ICOLLState),
         VMSTATE_UINT32(vbase, STMP3770ICOLLState),
         VMSTATE_UINT32(vector, STMP3770ICOLLState),
+        VMSTATE_BOOL(vector_pending, STMP3770ICOLLState),
         VMSTATE_UINT32_ARRAY(priority, STMP3770ICOLLState, 16),
         VMSTATE_UINT64(raw_status, STMP3770ICOLLState),
+        VMSTATE_UINT64(request_holding, STMP3770ICOLLState),
         VMSTATE_UINT32_ARRAY(level_active, STMP3770ICOLLState, 4),
         VMSTATE_UINT32(current_level, STMP3770ICOLLState),
         VMSTATE_UINT8(fiq_enable, STMP3770ICOLLState),
+        VMSTATE_UINT32(debugflag, STMP3770ICOLLState),
+        VMSTATE_TIMER_PTR(sftrst_timer, STMP3770ICOLLState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -383,6 +724,7 @@ static const TypeInfo stmp3770_icoll_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770ICOLLState),
     .instance_init = stmp3770_icoll_init,
+    .instance_finalize = stmp3770_icoll_finalize,
     .class_init    = stmp3770_icoll_class_init,
 };
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from build_helpers import (
     collect_release_files,
     find_executable,
+    input_fingerprint,
     parse_objdump_dll_names,
     prepend_path_entries,
     resolve_bash,
@@ -18,6 +19,42 @@ from build_helpers import (
 
 
 class BuildHelperTests(unittest.TestCase):
+    def test_qtest_alias_is_always_built(self):
+        sconstruct = Path(__file__).resolve().parents[1] / "SConstruct"
+
+        self.assertIn(
+            "AlwaysBuild(stmp3770_qtest)",
+            sconstruct.read_text(encoding="utf-8"),
+            "scons qtest must execute the contract suite on every explicit invocation",
+        )
+
+    def test_input_fingerprint_changes_when_a_tracked_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = Path(tmp) / "src"
+            source_dir.mkdir()
+            source = source_dir / "peripheral.c"
+            source.write_text("first\n", encoding="utf-8")
+
+            before = input_fingerprint([source_dir])
+
+            source.write_text("second\n", encoding="utf-8")
+            after = input_fingerprint([source_dir])
+
+            self.assertNotEqual(before, after)
+
+    def test_input_fingerprint_is_independent_of_input_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.c"
+            second = root / "second.c"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
+
+            self.assertEqual(
+                input_fingerprint([first, second]),
+                input_fingerprint([second, first]),
+            )
+
     def test_env_override_selects_bash_without_hardcoded_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             bash = Path(tmp) / ("bash.exe" if os.name == "nt" else "bash")
@@ -59,6 +96,24 @@ class BuildHelperTests(unittest.TestCase):
                 )
 
                 self.assertEqual(Path(resolved).resolve(), good_bash.resolve())
+
+    def test_path_lookup_prefers_bash_with_mingw_compiler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git_bash = root / "Git" / "bin" / ("bash.exe" if os.name == "nt" else "bash")
+            msys_bash = root / "msys64" / "usr" / "bin" / ("bash.exe" if os.name == "nt" else "bash")
+            git_bash.parent.mkdir(parents=True)
+            msys_bash.parent.mkdir(parents=True)
+            git_bash.write_text("", encoding="utf-8")
+            msys_bash.write_text("", encoding="utf-8")
+
+            resolved = resolve_bash(
+                {"PATH": os.pathsep.join([str(git_bash.parent), str(msys_bash.parent)])},
+                is_compatible=lambda path: True,
+                has_mingw_compiler=lambda path: Path(path).resolve() == msys_bash.resolve(),
+            )
+
+            self.assertEqual(Path(resolved).resolve(), msys_bash.resolve())
 
     def test_path_lookup_can_derive_git_bash_from_git_cmd_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

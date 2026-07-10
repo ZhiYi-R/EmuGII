@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import shutil
@@ -65,6 +66,34 @@ def parse_objdump_dll_names(output):
         if match:
             names.append(match.group(1))
     return names
+
+
+def input_fingerprint(paths):
+    """Return a stable content fingerprint for files and directory trees."""
+    files = {}
+
+    for entry in paths:
+        path = Path(os.fspath(entry))
+        if path.is_file():
+            candidates = [path]
+        elif path.is_dir():
+            candidates = (child for child in path.rglob("*") if child.is_file())
+        else:
+            continue
+
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            files.setdefault(os.path.normcase(str(resolved)), resolved)
+
+    digest = hashlib.sha256()
+    for key in sorted(files):
+        path = files[key]
+        digest.update(path.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+
+    return digest.hexdigest()
 
 
 def _find_in_path(name, path_env):
@@ -301,12 +330,24 @@ def _check_compatible_bash(bash, is_compatible):
     raise FileNotFoundError(f"bash is not MSYS2/MINGW compatible: {bash}")
 
 
-def resolve_bash(env=None, is_compatible=None):
+def _has_mingw_compiler(bash):
+    names = ("gcc.exe", "gcc") if os.name == "nt" else ("gcc",)
+
+    return any(
+        (Path(directory) / name).is_file()
+        for directory in runtime_path_entries_for_bash(bash)
+        for name in names
+    )
+
+
+def resolve_bash(env=None, is_compatible=None, has_mingw_compiler=None):
     """Resolve the shell used for the QEMU POSIX build steps."""
     if env is None:
         env = os.environ
     if is_compatible is None:
         is_compatible = _is_msys_compatible_bash
+    if has_mingw_compiler is None:
+        has_mingw_compiler = _has_mingw_compiler
 
     for name in ("EMUGII_BASH", "MSYS2_BASH"):
         value = env.get(name)
@@ -316,9 +357,16 @@ def resolve_bash(env=None, is_compatible=None):
                 raise FileNotFoundError(f"{name} points to a missing bash: {value}")
             return _check_compatible_bash(str(bash), is_compatible)
 
+    fallback = None
     for bash in _path_bash_candidates(env.get("PATH")):
         if is_compatible(bash):
-            return bash
+            if has_mingw_compiler(bash):
+                return bash
+            if fallback is None:
+                fallback = bash
+
+    if fallback:
+        return fallback
 
     raise FileNotFoundError(
         "MSYS2/MINGW bash was not found. Add it to PATH or set EMUGII_BASH."

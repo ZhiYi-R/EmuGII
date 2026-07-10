@@ -251,6 +251,339 @@ async function testPinctrlBank3Absent() {
   });
 }
 
+async function testIcollCoreContract() {
+  await withMachine(async (machine) => {
+    const ctrlReset = await machine.readl(ICOLL_BASE + 0x020);
+    const version = await machine.readl(ICOLL_BASE + 0x1d0);
+    const debugRead0 = await machine.readl(ICOLL_BASE + 0x180);
+    const debugRead1 = await machine.readl(ICOLL_BASE + 0x190);
+
+    assert.equal(
+      ctrlReset,
+      0xc0030000,
+      `ICOLL CTRL reset mismatch: got 0x${ctrlReset.toString(16)}`,
+    );
+    assert.equal(version, 0x02000000, `ICOLL VERSION mismatch: got 0x${version.toString(16)}`);
+    assert.equal(debugRead0, 0xeca94567, `ICOLL DEBUGRD0 mismatch: got 0x${debugRead0.toString(16)}`);
+    assert.equal(debugRead1, 0x1356da98, `ICOLL DEBUGRD1 mismatch: got 0x${debugRead1.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x160, 0xffffffff);
+    await machine.writel(ICOLL_BASE + 0x060, 0xffffffff);
+
+    const vbase = await machine.readl(ICOLL_BASE + 0x160);
+    const priority0 = await machine.readl(ICOLL_BASE + 0x060);
+
+    assert.equal(vbase, 0xfffffffc, `ICOLL VBASE must keep word alignment: got 0x${vbase.toString(16)}`);
+    assert.equal(
+      priority0,
+      0x0f0f0f0f,
+      `ICOLL PRIORITY0 must hide reserved nibbles: got 0x${priority0.toString(16)}`,
+    );
+
+    await machine.writel(ICOLL_BASE + 0x060, 0);
+    await machine.writel(ICOLL_BASE + 0x000, 0);
+    await machine.writel(ICOLL_BASE + 0x010, 0x00000008);
+
+    await machine.writel(ICOLL_BASE + 0x160, 0x00001000);
+    await machine.writel(ICOLL_BASE + 0x060, 0x00000f00);
+
+    const vector = await machine.readl(ICOLL_BASE + 0x000);
+    const stat = await machine.readl(ICOLL_BASE + 0x030);
+
+    assert.equal(
+      vector,
+      0x00001004,
+      `ICOLL must select the highest-priority SOFTIRQ source: got 0x${vector.toString(16)}`,
+    );
+    assert.equal(stat & 0x3f, 1, `ICOLL STAT must report selected source 1: got 0x${stat.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x024, 0x00200000);
+    const pitchOneVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      pitchOneVector,
+      0x00001004,
+      `ICOLL VECTOR_PITCH=1 must remain a 4-byte stride: got 0x${pitchOneVector.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollVectorAcknowledgeContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x160, 0x00002000);
+    await machine.writel(ICOLL_BASE + 0x060, 0x00000f0c);
+
+    const highVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(highVector, 0x00002004, `ICOLL should select level 3 source first: got 0x${highVector.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x000, 0);
+    await machine.writel(ICOLL_BASE + 0x068, 0x00000800);
+
+    const beforeAcknowledge = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      beforeAcknowledge,
+      0x00002004,
+      `ICOLL VECTOR must remain on the in-service level until LEVELACK: got 0x${beforeAcknowledge.toString(16)}`,
+    );
+
+    await machine.writel(ICOLL_BASE + 0x010, 0x00000008);
+    const afterAcknowledge = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      afterAcknowledge,
+      0x00002000,
+      `ICOLL LEVELACK bit 3 must release level 3 for level 0: got 0x${afterAcknowledge.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollArmRseModeContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x024, 0x00040000);
+    await machine.writel(ICOLL_BASE + 0x160, 0x00003000);
+    await machine.writel(ICOLL_BASE + 0x060, 0x00000f0c);
+
+    const highVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(highVector, 0x00003004, `ICOLL should select level 3 source first: got 0x${highVector.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x068, 0x00000800);
+    const beforeAcknowledge = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      beforeAcknowledge,
+      0x00003004,
+      `ICOLL ARM_RSE_MODE read must enter service before LEVELACK: got 0x${beforeAcknowledge.toString(16)}`,
+    );
+
+    await machine.writel(ICOLL_BASE + 0x010, 0x00000008);
+    const afterAcknowledge = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      afterAcknowledge,
+      0x00003000,
+      `ICOLL ARM_RSE_MODE must let LEVELACK release the read vector: got 0x${afterAcknowledge.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollNoNestingContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x024, 0x00080000);
+    await machine.writel(ICOLL_BASE + 0x160, 0x00004000);
+    await machine.writel(ICOLL_BASE + 0x060, 0x0000000c);
+
+    const lowVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(lowVector, 0x00004000, `ICOLL should select level 0 source first: got 0x${lowVector.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x000, 0);
+    await machine.writel(ICOLL_BASE + 0x064, 0x00000f00);
+
+    const whileInService = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      whileInService,
+      0x00004000,
+      `ICOLL NO_NESTING must block higher priority preemption: got 0x${whileInService.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollDebugFlagContract() {
+  await withMachine(async (machine) => {
+    const reset = await machine.readl(ICOLL_BASE + 0x1a0);
+    assert.equal(reset, 0, `ICOLL DEBUGFLAG should reset to 0: got 0x${reset.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x1a0, 0xffffffff);
+    const written = await machine.readl(ICOLL_BASE + 0x1a0);
+    assert.equal(written, 0x0000ffff, `ICOLL DEBUGFLAG must expose only bits 15:0: got 0x${written.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x1a8, 0x000000f0);
+    const cleared = await machine.readl(ICOLL_BASE + 0x1a0);
+    assert.equal(cleared, 0x0000ff0f, `ICOLL DEBUGFLAG_CLR should clear selected flags: got 0x${cleared.toString(16)}`);
+
+    await machine.writel(ICOLL_BASE + 0x1ac, 0x0000000f);
+    const toggled = await machine.readl(ICOLL_BASE + 0x1a0);
+    assert.equal(toggled, 0x0000ff00, `ICOLL DEBUGFLAG_TOG should toggle selected flags: got 0x${toggled.toString(16)}`);
+  });
+}
+
+async function testIcollDebugStateContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x024, 0x00000001);
+    await machine.writel(ICOLL_BASE + 0x0d0, 0x00000008);
+
+    const debug = await machine.readl(ICOLL_BASE + 0x170);
+    const requestLow = await machine.readl(ICOLL_BASE + 0x1b0);
+
+    assert.equal(
+      debug & (1 << 16),
+      0,
+      `ICOLL DEBUG.IRQ must remain low for a source routed to FIQ: debug=0x${debug.toString(16)}`,
+    );
+    assert.notEqual(
+      debug & (1 << 17),
+      0,
+      `ICOLL DEBUG.FIQ must reflect the asserted CPU FIQ output: debug=0x${debug.toString(16)}`,
+    );
+    assert.notEqual(
+      requestLow & (1 << 28),
+      0,
+      `ICOLL DBGREQUEST0 must expose software request 28: request=0x${requestLow.toString(16)}`,
+    );
+
+    await machine.writel(ICOLL_BASE + 0x170, 0xffffffff);
+    await machine.writel(ICOLL_BASE + 0x1b0, 0xffffffff);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x170),
+      debug,
+      'ICOLL DEBUG must be read-only',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1b0),
+      requestLow,
+      'ICOLL DBGREQUEST0 must be read-only',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x028, 0x00020000);
+    const debugWithFinalFiqDisabled = await machine.readl(ICOLL_BASE + 0x170);
+    assert.equal(
+      debugWithFinalFiqDisabled & (1 << 17),
+      0,
+      `ICOLL DEBUG.FIQ must follow FIQ_FINAL_ENABLE: debug=0x${debugWithFinalFiqDisabled.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollSoftResetContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x1a0, 0x0000005a);
+
+    await machine.writel(ICOLL_BASE + 0x024, 0xc0000000);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1a0),
+      0x0000005a,
+      'ICOLL simultaneous SFTRST and CLKGATE must leave state unchanged',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x024, 0x80000000);
+    const ctrlBeforeResetCompletes = await machine.readl(ICOLL_BASE + 0x020);
+    assert.notEqual(
+      ctrlBeforeResetCompletes & 0x80000000,
+      0,
+      `ICOLL SFTRST must remain asserted while reset is pending: ctrl=0x${ctrlBeforeResetCompletes.toString(16)}`,
+    );
+    assert.equal(
+      ctrlBeforeResetCompletes & 0x40000000,
+      0,
+      `ICOLL CLKGATE must not assert before the reset delay elapses: ctrl=0x${ctrlBeforeResetCompletes.toString(16)}`,
+    );
+
+    await machine.clockStep(125);
+    assert.equal(
+      (await machine.readl(ICOLL_BASE + 0x020)) & 0x40000000,
+      0,
+      'ICOLL CLKGATE must remain low before four reset clocks',
+    );
+
+    await machine.clockStep(42);
+    const ctrlAfterResetCompletes = await machine.readl(ICOLL_BASE + 0x020);
+    assert.notEqual(
+      ctrlAfterResetCompletes & 0x40000000,
+      0,
+      `ICOLL CLKGATE must assert when soft reset completes: ctrl=0x${ctrlAfterResetCompletes.toString(16)}`,
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1a0),
+      0,
+      'ICOLL soft reset must clear DEBUGFLAG state',
+    );
+  });
+}
+
+async function testIcollBypassFsmContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x024, 0x00100000);
+    await machine.writel(ICOLL_BASE + 0x160, 0x00005000);
+    await machine.writel(ICOLL_BASE + 0x060, 0x00000800);
+
+    const firstVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      firstVector,
+      0x00005004,
+      `ICOLL BYPASS_FSM should initially expose source 1: got 0x${firstVector.toString(16)}`,
+    );
+
+    await machine.writel(ICOLL_BASE + 0x060, 0x00000008);
+    const bypassVector = await machine.readl(ICOLL_BASE + 0x000);
+    assert.equal(
+      bypassVector,
+      0x00005000,
+      `ICOLL BYPASS_FSM must continuously update the vector without VECTOR acknowledgement: got 0x${bypassVector.toString(16)}`,
+    );
+
+    const debug = await machine.readl(ICOLL_BASE + 0x170);
+    assert.equal(
+      debug & 0x3ff,
+      0,
+      `ICOLL BYPASS_FSM must bypass the vector request FSM: debug=0x${debug.toString(16)}`,
+    );
+  });
+}
+
+async function testIcollRequestHoldingContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(ICOLL_BASE + 0x028, 0xc0000000);
+    await machine.writel(ICOLL_BASE + 0x160, 0x00006000);
+
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x040),
+      0,
+      'ICOLL RAW0 should reset low before exercising its read-only aliases',
+    );
+    await machine.writel(ICOLL_BASE + 0x040, 0xffffffff);
+    await machine.writel(ICOLL_BASE + 0x044, 0xffffffff);
+    await machine.writel(ICOLL_BASE + 0x048, 0xffffffff);
+    await machine.writel(ICOLL_BASE + 0x04c, 0xffffffff);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x040),
+      0,
+      'ICOLL RAW0 and its aliases must not manufacture raw interrupt inputs',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x060, 0x0000000c);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1b0),
+      0x00000001,
+      'ICOLL DBGREQUEST0 should capture the first software request',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x068, 0x00000008);
+    await machine.writel(ICOLL_BASE + 0x064, 0x00000c00);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1b0),
+      0x00000001,
+      'ICOLL DBGREQUEST0 must retain the closed holding-register snapshot until VECTOR acknowledgement',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x000, 0);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x1b0),
+      0x00000002,
+      'ICOLL VECTOR acknowledgement must reopen the holding register for current requests',
+    );
+
+    await machine.writel(ICOLL_BASE + 0x010, 0x00000001);
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x000),
+      0x00006004,
+      'ICOLL must service the newly sampled request after LEVELACK releases the prior level',
+    );
+  });
+}
+
 async function testPowerVersionAndResetContract() {
   await withMachine(async (machine) => {
     const version = await machine.readl(POWER_BASE + 0x110);
@@ -493,6 +826,77 @@ async function testDigctlCtrlBehaviorContract() {
       entropyLatched2,
       entropyLatched1,
       `DIGCTL CTRL.LATCH_ENTROPY should re-latch on repeated set writes: first=0x${entropyLatched1.toString(16)} second=0x${entropyLatched2.toString(16)}`,
+    );
+  });
+}
+
+async function testDigctlWriteonceResetsWithDigReset() {
+  await withMachine(async (machine) => {
+    const writeonceReset = await machine.readl(DIGCTL_BASE + 0x060);
+    const statusReset = await machine.readl(DIGCTL_BASE + 0x010);
+
+    assert.equal(
+      writeonceReset,
+      0xa5a5a5a5,
+      `DIGCTL WRITEONCE should reset to its documented seed: got 0x${writeonceReset.toString(16)}`,
+    );
+    assert.equal(
+      statusReset & 0x1,
+      0,
+      `DIGCTL STATUS.WRITTEN should reset low: got 0x${statusReset.toString(16)}`,
+    );
+
+    await machine.writel(DIGCTL_BASE + 0x060, 0x12345678);
+    const writeonceWritten = await machine.readl(DIGCTL_BASE + 0x060);
+    const statusAfterWrite = await machine.readl(DIGCTL_BASE + 0x010);
+
+    assert.equal(
+      writeonceWritten,
+      0x12345678,
+      `DIGCTL WRITEONCE should accept the first write: got 0x${writeonceWritten.toString(16)}`,
+    );
+    assert.notEqual(
+      statusAfterWrite & 0x1,
+      0,
+      `DIGCTL STATUS.WRITTEN should set after a successful WRITEONCE write: got 0x${statusAfterWrite.toString(16)}`,
+    );
+
+    await machine.writel(DIGCTL_BASE + 0x060, 0x87654321);
+    const writeonceLocked = await machine.readl(DIGCTL_BASE + 0x060);
+    const statusAfterSecondWrite = await machine.readl(DIGCTL_BASE + 0x010);
+
+    assert.equal(
+      writeonceLocked,
+      0x12345678,
+      `DIGCTL WRITEONCE should ignore later writes until chip-wide reset: got 0x${writeonceLocked.toString(16)}`,
+    );
+    assert.notEqual(
+      statusAfterSecondWrite & 0x1,
+      0,
+      `DIGCTL STATUS.WRITTEN should remain set after ignored WRITEONCE writes: got 0x${statusAfterSecondWrite.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x0f0, 0x00000001);
+    const writeonceAfterDigReset = await machine.readl(DIGCTL_BASE + 0x060);
+    const statusAfterDigReset = await machine.readl(DIGCTL_BASE + 0x010);
+
+    assert.equal(
+      writeonceAfterDigReset,
+      0xa5a5a5a5,
+      `DIGCTL WRITEONCE should reset with RESET.DIG: got 0x${writeonceAfterDigReset.toString(16)}`,
+    );
+    assert.equal(
+      statusAfterDigReset & 0x1,
+      0,
+      `DIGCTL STATUS.WRITTEN should clear with RESET.DIG: got 0x${statusAfterDigReset.toString(16)}`,
+    );
+
+    await machine.writel(DIGCTL_BASE + 0x060, 0x87654321);
+    const writeonceAfterDigResetWrite = await machine.readl(DIGCTL_BASE + 0x060);
+    assert.equal(
+      writeonceAfterDigResetWrite,
+      0x87654321,
+      `DIGCTL WRITEONCE should accept a first write after RESET.DIG: got 0x${writeonceAfterDigResetWrite.toString(16)}`,
     );
   });
 }
@@ -1056,6 +1460,15 @@ const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
+  ['ICOLL core contract', testIcollCoreContract],
+  ['ICOLL vector acknowledge contract', testIcollVectorAcknowledgeContract],
+  ['ICOLL ARM_RSE mode contract', testIcollArmRseModeContract],
+  ['ICOLL no nesting contract', testIcollNoNestingContract],
+  ['ICOLL debug flag contract', testIcollDebugFlagContract],
+  ['ICOLL debug state contract', testIcollDebugStateContract],
+  ['ICOLL soft reset contract', testIcollSoftResetContract],
+  ['ICOLL bypass FSM contract', testIcollBypassFsmContract],
+  ['ICOLL request holding contract', testIcollRequestHoldingContract],
   ['POWER version and reset contract', testPowerVersionAndResetContract],
   ['POWER reset values', testPowerResetValues],
   ['DFLPT PTE_2048 contract', testDflptPte2048Contract],
@@ -1064,6 +1477,7 @@ const tests = [
   ['DIGCTL scratch and microseconds contract', testDigctlScratchAndMicrosecondsContract],
   ['DIGCTL undocumented alias decode', testDigctlUndocumentedAliasDecode],
   ['DIGCTL ctrl behavior contract', testDigctlCtrlBehaviorContract],
+  ['DIGCTL writeonce resets with dig reset', testDigctlWriteonceResetsWithDigReset],
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],
