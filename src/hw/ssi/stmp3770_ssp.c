@@ -187,6 +187,9 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
                       HWADDR_FMT_plx "\n", offset);
         return;
     }
+    if (reg != SSP_CTRL0 && (s->ctrl0 & SSP_CTRL0_SFTRST)) {
+        return;
+    }
 
     switch (reg) {
     case SSP_CTRL0:

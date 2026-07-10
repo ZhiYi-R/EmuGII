@@ -1799,6 +1799,7 @@ async function testSspRegisterLayoutAndResetContract() {
       );
     }
 
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
     await machine.writel(SSP1_BASE + 0x010, 0x00123456);
     await machine.writel(SSP1_BASE + 0x020, 0x89abcdef);
     await machine.writel(SSP1_BASE + 0x030, 0x10203040);
@@ -1838,8 +1839,37 @@ async function testSspSoftResetAndClockGateContract() {
   });
 }
 
+async function testSspSoftResetHoldContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+    await machine.writel(SSP1_BASE + 0x060, 0x13579bdf);
+    await machine.writel(SSP1_BASE + 0x010, 0x00123456);
+
+    await machine.writel(SSP1_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x000),
+      0xc0000001,
+      'SSP SFTRST must hold the module in its documented reset state',
+    );
+
+    await machine.writel(SSP1_BASE + 0x060, 0xffffffff);
+    await machine.writel(SSP1_BASE + 0x010, 0x001fffff);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x060),
+      0x00200080,
+      'SSP configuration writes must not escape a held SFTRST',
+    );
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x010),
+      0,
+      'SSP CMD0 must remain reset while SFTRST is held',
+    );
+  });
+}
+
 async function testSspCtrl1WritableMaskContract() {
   await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
     await machine.writel(SSP1_BASE + 0x068, 0xffffffff);
     assert.equal(await machine.readl(SSP1_BASE + 0x060), 0, 'SSP CTRL1_CLR must clear all documented writable fields');
 
@@ -1861,6 +1891,7 @@ async function testSspCtrl1WritableMaskContract() {
 
 async function testSspSctAndCmd0ReservedContract() {
   await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
     await machine.writel(SSP1_BASE + 0x010, 0xffe12345);
     assert.equal(
       await machine.readl(SSP1_BASE + 0x010),
@@ -1920,6 +1951,7 @@ async function testSspErrorIrqPairingContract() {
       [15, 14, 'FIFO overrun'],
     ];
 
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
     await machine.writel(SSP1_BASE + 0x068, 0xffffffff);
     for (const [statusBit, enableBit, name] of errorPairs) {
       const statusMask = 2 ** statusBit;
@@ -3796,6 +3828,7 @@ const tests = [
   ['USBCTRL GPTIMER contract', testUsbGptimerContract],
   ['SSP register layout and reset contract', testSspRegisterLayoutAndResetContract],
   ['SSP soft reset and clock gate contract', testSspSoftResetAndClockGateContract],
+  ['SSP soft reset hold contract', testSspSoftResetHoldContract],
   ['SSP CTRL1 writable mask contract', testSspCtrl1WritableMaskContract],
   ['SSP SCT and CMD0 reserved contract', testSspSctAndCmd0ReservedContract],
   ['SSP error IRQ pairing contract', testSspErrorIrqPairingContract],
