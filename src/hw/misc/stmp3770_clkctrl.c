@@ -54,7 +54,7 @@
 /* CPU register bits */
 #define CPU_DIV_CPU_MASK        0x3FF
 #define CPU_DIV_XTAL_MASK       (0x3FF << 16)
-#define CPU_DIV_CPU_FRAC_EN     (1 << 18)
+#define CPU_DIV_CPU_FRAC_EN     (1 << 10)
 #define CPU_DIV_XTAL_FRAC_EN    (1 << 26)
 #define CPU_BUSY_REF_CPU        (1 << 28)
 #define CPU_BUSY_REF_XTAL       (1 << 29)

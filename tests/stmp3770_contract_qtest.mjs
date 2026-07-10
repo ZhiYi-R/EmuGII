@@ -923,6 +923,22 @@ async function testDigctlHclkCountContract() {
       12,
       `DIGCTL HCLKCOUNT must follow HBUS.DIV=2: start=0x${hclkBeforeDivide.toString(16)}, end=0x${hclkAt12Mhz.toString(16)}`,
     );
+
+    await machine.writel(CLKCTRL_BASE + 0x030, 0x00000001);
+    await machine.writel(CLKCTRL_BASE + 0x0d8, 0x00000080);
+    await machine.writel(CLKCTRL_BASE + 0x004, 0x00010000);
+    await machine.writel(CLKCTRL_BASE + 0x0e8, 0x00000080);
+    await machine.writel(CLKCTRL_BASE + 0x020, 0x00000600);
+
+    const hclkBeforeCpuFractionalDivide = await machine.readl(DIGCTL_BASE + 0x020);
+    await machine.clockStep(1_000);
+    const hclkAt240Mhz = await machine.readl(DIGCTL_BASE + 0x020);
+
+    assert.equal(
+      (hclkAt240Mhz - hclkBeforeCpuFractionalDivide) >>> 0,
+      240,
+      `DIGCTL HCLKCOUNT must honor CPU.DIV_CPU_FRAC_EN at bit 10: start=0x${hclkBeforeCpuFractionalDivide.toString(16)}, end=0x${hclkAt240Mhz.toString(16)}`,
+    );
   });
 }
 
