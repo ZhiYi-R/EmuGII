@@ -34,8 +34,11 @@ static inline bool stmp3770_i2c_enabled(STMP3770I2CState *s)
     return (s->ctrl0 & (I2C_CTRL0_SFTRST | I2C_CTRL0_CLKGATE)) == 0;
 }
 
-static void stmp3770_i2c_apply_sct(uint32_t *reg, uint32_t value, int sct)
+static void stmp3770_i2c_apply_sct(uint32_t *reg, uint32_t value, int sct,
+                                    uint32_t writable_mask)
 {
+    value &= writable_mask;
+
     switch (sct) {
     case SCT_SET:
         *reg |= value;
@@ -47,15 +50,19 @@ static void stmp3770_i2c_apply_sct(uint32_t *reg, uint32_t value, int sct)
         *reg ^= value;
         break;
     default:
-        *reg = value;
+        *reg = (*reg & ~writable_mask) | value;
         break;
     }
 }
 
 static void stmp3770_i2c_update_irq(STMP3770I2CState *s)
 {
-    bool pending = (s->ctrl1 & I2C_CTRL1_NO_SLAVE_ACK_IRQ) != 0;
-    qemu_set_irq(s->irq_error, pending);
+    uint32_t pending = (s->ctrl1 & I2C_CTRL1_STATUS_MASK) &
+                       ((s->ctrl1 & I2C_CTRL1_ENABLE_MASK) >> 8);
+
+    /* I2C DMA completion is owned by APBX channel 3, not this device. */
+    qemu_set_irq(s->irq_dma, 0);
+    qemu_set_irq(s->irq_error, pending != 0);
 }
 
 static void stmp3770_i2c_reset(DeviceState *dev)
@@ -63,10 +70,10 @@ static void stmp3770_i2c_reset(DeviceState *dev)
     STMP3770I2CState *s = STMP3770_I2C(dev);
 
     s->ctrl0 = I2C_CTRL0_SFTRST | I2C_CTRL0_CLKGATE;
-    s->ctrl1 = 0;
-    s->timing0 = 0;
-    s->timing1 = 0;
-    s->timing2 = 0;
+    s->ctrl1 = 0x00860000;
+    s->timing0 = 0x00780030;
+    s->timing1 = 0x00800030;
+    s->timing2 = 0x00300030;
     s->data = 0;
     s->debug0 = 0;
     s->debug1 = 0;
@@ -85,24 +92,50 @@ static uint64_t stmp3770_i2c_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
 
-    switch (offset & ~0xFULL) {
+    switch (offset) {
     case I2C_CTRL0:
+    case I2C_CTRL0 + SCT_SET:
+    case I2C_CTRL0 + SCT_CLR:
+    case I2C_CTRL0 + SCT_TOG:
         return s->ctrl0;
-    case I2C_CTRL1:
-        return s->ctrl1;
     case I2C_TIMING0:
+    case I2C_TIMING0 + SCT_SET:
+    case I2C_TIMING0 + SCT_CLR:
+    case I2C_TIMING0 + SCT_TOG:
         return s->timing0;
     case I2C_TIMING1:
+    case I2C_TIMING1 + SCT_SET:
+    case I2C_TIMING1 + SCT_CLR:
+    case I2C_TIMING1 + SCT_TOG:
         return s->timing1;
     case I2C_TIMING2:
+    case I2C_TIMING2 + SCT_SET:
+    case I2C_TIMING2 + SCT_CLR:
+    case I2C_TIMING2 + SCT_TOG:
         return s->timing2;
+    case I2C_CTRL1:
+    case I2C_CTRL1 + SCT_SET:
+    case I2C_CTRL1 + SCT_CLR:
+    case I2C_CTRL1 + SCT_TOG:
+        return s->ctrl1;
+    case I2C_STAT: {
+        uint32_t pending = (s->ctrl1 & I2C_CTRL1_STATUS_MASK) &
+                           ((s->ctrl1 & I2C_CTRL1_ENABLE_MASK) >> 8);
+
+        return 0xC0000000 | (pending ? (1U << 29) : 0) | pending;
+    }
     case I2C_DATA:
         return s->data;
     case I2C_DEBUG0:
-        /* Bus is always free/idle in this stub */
-        return 0;
+    case I2C_DEBUG0 + SCT_SET:
+    case I2C_DEBUG0 + SCT_CLR:
+    case I2C_DEBUG0 + SCT_TOG:
+        return 0x00100000 | s->debug0;
     case I2C_DEBUG1:
-        return s->debug1;
+    case I2C_DEBUG1 + SCT_SET:
+    case I2C_DEBUG1 + SCT_CLR:
+    case I2C_DEBUG1 + SCT_TOG:
+        return 0xC0000000 | s->debug1;
     case I2C_VERSION:
         return I2C_VERSION_VALUE;
     default:
@@ -126,11 +159,10 @@ static void stmp3770_i2c_write(void *opaque, hwaddr offset,
         return;
     }
 
-    offset &= ~0xFULL;
-
-    switch (offset) {
+    switch (offset & ~0xFULL) {
     case I2C_CTRL0:
-        stmp3770_i2c_apply_sct(&s->ctrl0, (uint32_t)value, sct);
+        stmp3770_i2c_apply_sct(&s->ctrl0, (uint32_t)value, sct,
+                                I2C_CTRL0_RW_MASK);
         if (s->ctrl0 & I2C_CTRL0_SFTRST) {
             stmp3770_i2c_reset(DEVICE(s));
         }
@@ -140,25 +172,35 @@ static void stmp3770_i2c_write(void *opaque, hwaddr offset,
             s->ctrl1 |= I2C_CTRL1_DATA_ENGINE_CMPLT_IRQ;
         }
         break;
-    case I2C_CTRL1:
-        stmp3770_i2c_apply_sct(&s->ctrl1, (uint32_t)value, sct);
-        stmp3770_i2c_update_irq(s);
-        break;
     case I2C_TIMING0:
-        stmp3770_i2c_apply_sct(&s->timing0, (uint32_t)value, sct);
+        stmp3770_i2c_apply_sct(&s->timing0, (uint32_t)value, sct,
+                                0x03FF03FF);
         break;
     case I2C_TIMING1:
-        stmp3770_i2c_apply_sct(&s->timing1, (uint32_t)value, sct);
+        stmp3770_i2c_apply_sct(&s->timing1, (uint32_t)value, sct,
+                                0x03FF03FF);
         break;
     case I2C_TIMING2:
-        stmp3770_i2c_apply_sct(&s->timing2, (uint32_t)value, sct);
+        stmp3770_i2c_apply_sct(&s->timing2, (uint32_t)value, sct,
+                                0x03FF03FF);
+        break;
+    case I2C_CTRL1:
+        stmp3770_i2c_apply_sct(&s->ctrl1, (uint32_t)value, sct,
+                                I2C_CTRL1_RW_MASK);
+        stmp3770_i2c_update_irq(s);
         break;
     case I2C_DATA:
-        s->data = (uint32_t)value;
+        if (sct == 0) {
+            s->data = (uint32_t)value;
+        }
         break;
     case I2C_DEBUG0:
+        stmp3770_i2c_apply_sct(&s->debug0, (uint32_t)value, sct,
+                                0x1C000800);
+        break;
     case I2C_DEBUG1:
-        /* Read-only */
+        stmp3770_i2c_apply_sct(&s->debug1, (uint32_t)value, sct,
+                                0x0000073F);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,

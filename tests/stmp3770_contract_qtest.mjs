@@ -24,6 +24,7 @@ const POWER_BASE = 0x80044000;
 const RTC_BASE = 0x8005c000;
 const PWM_BASE = 0x80064000;
 const TIMROT_BASE = 0x80068000;
+const I2C_BASE = 0x80058000;
 
 class QTestMachine {
   constructor(port) {
@@ -426,6 +427,138 @@ async function testPwmRegisterContract() {
       await machine.readl(PWM_BASE + 0x100),
       0,
       'PWM must not expose the obsolete synthetic PERIOD register map',
+    );
+  });
+}
+
+async function testI2cRegisterContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x000),
+      0xc0000000,
+      'I2C CTRL0 must reset with SFTRST and CLKGATE asserted',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x010),
+      0x00780030,
+      'I2C TIMING0 must occupy 0x10 and expose its documented reset value',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x020),
+      0x00800030,
+      'I2C TIMING1 must occupy 0x20 and expose its documented reset value',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x030),
+      0x00300030,
+      'I2C TIMING2 must occupy 0x30 and expose its documented reset value',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x040),
+      0x00860000,
+      'I2C CTRL1 must occupy 0x40 and reset with slave address byte 0x86',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x050),
+      0xc0000000,
+      'I2C STAT must expose fixed master and slave presence bits',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x070),
+      0x00100000,
+      'I2C DEBUG0 must expose the documented reset DMA state',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x080),
+      0xc0000000,
+      'I2C DEBUG1 must expose idle-high pad inputs after reset',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x090),
+      0x01010000,
+      'I2C VERSION must be v1.1 at its documented offset',
+    );
+
+    for (const offset of [0x010, 0x020, 0x030]) {
+      await machine.writel(I2C_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(I2C_BASE + offset),
+        0x03ff03ff,
+        `I2C timing register at 0x${offset.toString(16)} must ignore reserved bits`,
+      );
+    }
+
+    await machine.writel(I2C_BASE + 0x040, 0xffffffff);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x040),
+      0x01ffffff,
+      'I2C CTRL1 must retain only documented status, enable, and slave-address fields',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x050),
+      0xe00000ff,
+      'I2C STAT must summarize all enabled CTRL1 interrupt requests and reject writes',
+    );
+    const raw0 = await machine.readl(ICOLL_BASE + 0x040);
+    assert.notEqual(
+      raw0 & (1 << 27),
+      0,
+      'enabled I2C controller status must assert the I2C error/line-condition source',
+    );
+    assert.equal(
+      raw0 & (1 << 26),
+      0,
+      'I2C controller status must not assert the APBX-owned I2C DMA source',
+    );
+    await machine.writel(I2C_BASE + 0x050, 0);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x050),
+      0xe00000ff,
+      'I2C STAT must be read-only',
+    );
+
+    await machine.writel(I2C_BASE + 0x060, 0x11223344);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x060),
+      0x11223344,
+      'I2C DATA must remain read/write at its documented base address',
+    );
+    await machine.writel(I2C_BASE + 0x064, 0x55667788);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x060),
+      0x11223344,
+      'I2C DATA must not decode undocumented SCT aliases',
+    );
+
+    await machine.writel(I2C_BASE + 0x070, 0xffffffff);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x070),
+      0x1c100800,
+      'I2C DEBUG0 must retain only TESTMODE and documented test fields',
+    );
+    await machine.writel(I2C_BASE + 0x080, 0xffffffff);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x080),
+      0xc000073f,
+      'I2C DEBUG1 must preserve input and reserved fields while retaining controls',
+    );
+    await machine.writel(I2C_BASE + 0x090, 0);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x090),
+      0x01010000,
+      'I2C VERSION must be read-only',
+    );
+
+    await machine.writel(I2C_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x000),
+      0xc0000000,
+      'I2C SFTRST must reset the block and automatically gate its clock',
+    );
+    assert.equal(
+      await machine.readl(I2C_BASE + 0x040),
+      0x00860000,
+      'I2C SFTRST must restore CTRL1 reset state',
     );
   });
 }
@@ -1765,6 +1898,7 @@ const tests = [
   ['RTC watchdog debug contract', testRtcWatchdogDebugContract],
   ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
+  ['I2C register contract', testI2cRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],
