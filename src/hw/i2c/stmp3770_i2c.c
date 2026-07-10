@@ -60,8 +60,6 @@ static void stmp3770_i2c_update_irq(STMP3770I2CState *s)
     uint32_t pending = (s->ctrl1 & I2C_CTRL1_STATUS_MASK) &
                        ((s->ctrl1 & I2C_CTRL1_ENABLE_MASK) >> 8);
 
-    /* I2C DMA completion is owned by APBX channel 3, not this device. */
-    qemu_set_irq(s->irq_dma, 0);
     qemu_set_irq(s->irq_error, pending != 0);
 }
 
@@ -228,7 +226,6 @@ static void stmp3770_i2c_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &stmp3770_i2c_ops, s,
                           TYPE_STMP3770_I2C, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
-    sysbus_init_irq(sbd, &s->irq_dma);
     sysbus_init_irq(sbd, &s->irq_error);
 }
 

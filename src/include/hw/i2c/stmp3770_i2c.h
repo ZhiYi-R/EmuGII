@@ -71,7 +71,6 @@ struct STMP3770I2CState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    qemu_irq irq_dma;
     qemu_irq irq_error;
 
     uint32_t ctrl0;

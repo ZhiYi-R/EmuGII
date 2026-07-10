@@ -443,8 +443,6 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(s->i2c), 0, STMP3770_I2C_ADDR);
 
     sysbus_connect_irq(SYS_BUS_DEVICE(s->i2c), 0,
-                       qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_I2C_DMA));
-    sysbus_connect_irq(SYS_BUS_DEVICE(s->i2c), 1,
                        qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_I2C_ERROR));
 
     /* Realize LCDIF */

@@ -29,6 +29,7 @@ const USBPHY_BASE = 0x8007c000;
 const USB_BASE = 0x80080000;
 const LRADC_BASE = 0x80050000;
 const I2C_BASE = 0x80058000;
+const APBX_BASE = 0x80024000;
 const APPUART_BASE = 0x8006c000;
 const DBGUART_BASE = 0x80070000;
 
@@ -1000,6 +1001,35 @@ async function testI2cRegisterContract() {
       await machine.readl(I2C_BASE + 0x040),
       0x00860000,
       'I2C SFTRST must restore CTRL1 reset state',
+    );
+  });
+}
+
+async function testI2cDmaIrqOwnershipContract() {
+  await withMachine(async (machine) => {
+    const descriptor = 0x00000400;
+    const channel3Nxtcmdar = APBX_BASE + 0x1a0;
+    const channel3Sema = APBX_BASE + 0x1d0;
+
+    await machine.writel(APBX_BASE + 0x008, 0xc0000000);
+    await machine.writel(APBX_BASE + 0x014, 1 << 11);
+    await machine.writel(descriptor + 0x00, 0);
+    await machine.writel(descriptor + 0x04, (1 << 6) | (1 << 3));
+    await machine.writel(descriptor + 0x08, 0);
+    await machine.writel(descriptor + 0x0c, 0);
+    await machine.writel(channel3Nxtcmdar, descriptor);
+    await machine.writel(channel3Sema, 1);
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 26),
+      0,
+      'APBX channel 3 completion must assert the Table 38 I2C DMA source',
+    );
+
+    await machine.writel(I2C_BASE + 0x040, 0);
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 26),
+      0,
+      'I2C device status writes must not clear the APBX-owned I2C DMA source',
     );
   });
 }
@@ -3383,6 +3413,7 @@ const tests = [
   ['PWM MATT contract', testPwmMattContract],
   ['PWM2 analog enable contract', testPwm2AnalogEnableContract],
   ['I2C register contract', testI2cRegisterContract],
+  ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],
   ['Debug UART register contract', testDebugUartRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
