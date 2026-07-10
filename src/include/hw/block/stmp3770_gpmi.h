@@ -95,7 +95,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BCHState, STMP3770_BCH)
 #define GPMI_STAT_DEV_ERROR_MASK   0xF
 
 /* ECCCTRL bits */
-#define GPMI_ECCCTRL_HANDLE_MASK    (0xFFFFU << 16)
+#define GPMI_ECCCTRL_HANDLE_SHIFT   16
+#define GPMI_ECCCTRL_HANDLE_MASK    (0xFFFFU << GPMI_ECCCTRL_HANDLE_SHIFT)
 #define GPMI_ECCCTRL_ECC_CMD_SHIFT 13
 #define GPMI_ECCCTRL_ECC_CMD_MASK  0x3
 #define GPMI_ECCCTRL_ENABLE_ECC    (1U << 12)
@@ -118,13 +119,35 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BCHState, STMP3770_BCH)
 #define BCH_CTRL        0x00
 #define BCH_STATUS0     0x10
 #define BCH_STATUS1     0x20
+#define BCH_DEBUG0      0x30
+#define BCH_DBGKESREAD  0x40
+#define BCH_DBGCSFEREAD 0x50
+#define BCH_DBGSYNDGENREAD 0x60
+#define BCH_DBGAHBMREAD 0x70
+#define BCH_BLOCKNAME   0x80
+#define BCH_VERSION     0xA0
 
 /* BCH CTRL bits */
 #define BCH_CTRL_SFTRST         (1U << 31)
 #define BCH_CTRL_CLKGATE        (1U << 30)
 #define BCH_CTRL_AHBM_SFTRST    (1U << 29)
+#define BCH_CTRL_THROTTLE_MASK  (0xFU << 24)
+#define BCH_CTRL_DEBUG_STALL_IRQ_EN (1U << 10)
+#define BCH_CTRL_DEBUG_WRITE_IRQ_EN (1U << 9)
 #define BCH_CTRL_COMPLETE_IRQ   (1U << 0)
 #define BCH_CTRL_COMPLETE_IRQ_EN (1U << 8)
+#define BCH_CTRL_BM_ERROR_IRQ      (1U << 3)
+#define BCH_CTRL_DEBUG_STALL_IRQ   (1U << 2)
+#define BCH_CTRL_DEBUG_WRITE_IRQ   (1U << 1)
+#define BCH_CTRL_IRQ_STATUS_MASK 0xFU
+#define BCH_CTRL_CONFIG_MASK (BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE | \
+                             BCH_CTRL_AHBM_SFTRST | BCH_CTRL_THROTTLE_MASK | \
+                             BCH_CTRL_DEBUG_STALL_IRQ_EN | \
+                             BCH_CTRL_DEBUG_WRITE_IRQ_EN | \
+                             BCH_CTRL_COMPLETE_IRQ_EN)
+#define BCH_DEBUG0_WRITABLE_MASK 0x01FFFF3FU
+#define BCH_BLOCKNAME_VALUE 0x38434345U
+#define BCH_VERSION_VALUE   0x01000000U
 
 /* BCH STATUS0 bits */
 #define BCH_STATUS0_ALLONES       (1U << 4)
@@ -135,6 +158,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BCHState, STMP3770_BCH)
 #define BCH_STATUS0_STATUS_AUX_MASK  0xF
 #define BCH_STATUS0_HANDLE_SHIFT     16
 #define BCH_STATUS0_HANDLE_MASK      0xFFFF
+#define BCH_STATUS0_PRESENT_MASK     (0xFU << 12)
+#define BCH_STATUS0_RESET_VALUE      (BCH_STATUS0_PRESENT_MASK | \
+                                      (0xCU << BCH_STATUS0_STATUS_AUX_SHIFT) | \
+                                      BCH_STATUS0_ALLONES)
+#define BCH_STATUS1_NOT_CHECKED      0xCCCCCCCCU
 
 /* NAND command bytes */
 #define NAND_CMD_READ_1ST   0x00
@@ -245,6 +273,7 @@ struct STMP3770BCHState {
     uint32_t ctrl;
     uint32_t status0;
     uint32_t status1;
+    uint32_t debug0;
 };
 
 /* GPMI API for SoC integration */

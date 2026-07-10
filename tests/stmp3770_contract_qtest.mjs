@@ -28,6 +28,7 @@ const TIMROT_BASE = 0x80068000;
 const USBPHY_BASE = 0x8007c000;
 const USB_BASE = 0x80080000;
 const LRADC_BASE = 0x80050000;
+const BCH_BASE = 0x80008000;
 const GPMI_BASE = 0x8000c000;
 const I2C_BASE = 0x80058000;
 const SSP1_BASE = 0x80010000;
@@ -2158,6 +2159,162 @@ async function testGpmiEccRegisterContract() {
   });
 }
 
+async function testEcc8CompletionResultContract() {
+  await withMachine(async (machine) => {
+    const payload = SRAM_BASE + 0x1000;
+    const auxiliary = SRAM_BASE + 0x2000;
+
+    await machine.writel(BCH_BASE + 0x000, 0);
+    await machine.writel(GPMI_BASE + 0x000, 0);
+
+    await machine.writel(payload, 0x11111111);
+    await machine.writel(payload + 0x200, 0x22222222);
+    await machine.writel(auxiliary, 0x33333333);
+    await machine.writel(GPMI_BASE + 0x040, payload);
+    await machine.writel(GPMI_BASE + 0x050, auxiliary);
+    await machine.writel(GPMI_BASE + 0x020, 0x00001002);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | 1);
+    assert.equal(
+      await machine.readl(payload),
+      0x11111111,
+      'ECC8 must not write unselected payload buffer 0',
+    );
+    assert.equal(
+      await machine.readl(payload + 0x200),
+      0xffffffff,
+      'ECC8 must transfer the selected payload buffer 1',
+    );
+    assert.equal(
+      await machine.readl(auxiliary),
+      0x33333333,
+      'ECC8 must not write the auxiliary buffer unless BUFFER_MASK.AUXILIARY is set',
+    );
+    await machine.writel(BCH_BASE + 0x008, 1);
+
+    await machine.writel(GPMI_BASE + 0x020, 0x1234110f);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | (2 << 20) | 1);
+    const firstStatus0 = await machine.readl(BCH_BASE + 0x010);
+    assert.equal(firstStatus0 >>> 16, 0x1234, 'ECC8 STATUS0 must retain the GPMI ECC handle');
+    assert.equal(firstStatus0 & 0x3, 2, 'ECC8 STATUS0 must report the completing chip select');
+    assert.equal((firstStatus0 >>> 8) & 0xf, 0, 'ECC8 STATUS0 must report a checked auxiliary block');
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x020),
+      0xcccc0000,
+      'ECC8 STATUS1 must mark unrequested payload blocks as not checked',
+    );
+
+    await machine.writel(GPMI_BASE + 0x020, 0xbeef110f);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | (1 << 20) | 1);
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x010),
+      firstStatus0,
+      'ECC8 must retain unread completion results until COMPLETE_IRQ is cleared',
+    );
+
+    await machine.writel(BCH_BASE + 0x008, 1);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | (1 << 20) | 1);
+    const secondStatus0 = await machine.readl(BCH_BASE + 0x010);
+    assert.equal(secondStatus0 >>> 16, 0xbeef, 'ECC8 must accept a new result after COMPLETE_IRQ is cleared');
+    assert.equal(secondStatus0 & 0x3, 1, 'ECC8 must report the new completing chip select');
+  });
+}
+
+async function testEcc8RegisterContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x000),
+      0xe0000000,
+      'ECC8 CTRL must reset with SFTRST, CLKGATE, and AHBM_SFTRST asserted',
+    );
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x010),
+      0x0000fc10,
+      'ECC8 STATUS0 must reset with all four capabilities, NOT_CHECKED auxiliary status, and ALLONES',
+    );
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x020),
+      0xcccccccc,
+      'ECC8 STATUS1 must reset with every payload marked NOT_CHECKED',
+    );
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x080),
+      0x38434345,
+      'ECC8 BLOCKNAME must expose the fixed ASCII ECC8 identifier',
+    );
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x0a0),
+      0x01000000,
+      'ECC8 VERSION must expose the documented v1.0 value',
+    );
+    for (const offset of [0x040, 0x050, 0x060, 0x070]) {
+      assert.equal(
+        await machine.readl(BCH_BASE + offset),
+        0,
+        `ECC8 debug read register 0x${offset.toString(16)} must reset to zero`,
+      );
+    }
+
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    await machine.writel(GPMI_BASE + 0x020, 0x0000110f);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | 1);
+    assert.equal((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 must not complete while SFTRST is asserted');
+    await machine.writel(BCH_BASE + 0x008, 0x80000000);
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | 1);
+    assert.equal((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 must not complete while CLKGATE or AHBM_SFTRST is asserted');
+    await machine.writel(BCH_BASE + 0x008, (1 << 30) | (1 << 29));
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | 1);
+    assert.notEqual((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 must complete after SFTRST, CLKGATE, and AHBM_SFTRST are all clear');
+    await machine.writel(BCH_BASE + 0x008, 1);
+
+    await machine.writel(BCH_BASE + 0x000, 0xffffffff);
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x000),
+      0xef000700,
+      'ECC8 CTRL base write must retain documented configuration fields but not manufacture IRQ status',
+    );
+    await machine.writel(BCH_BASE + 0x008, 0x80000000);
+    assert.equal(
+      (await machine.readl(BCH_BASE + 0x000)) & (1 << 30),
+      1 << 30,
+      'ECC8 CLKGATE must remain asserted until explicitly cleared after SFTRST release',
+    );
+    await machine.writel(BCH_BASE + 0x008, 0xe0000000);
+
+    await machine.writel(GPMI_BASE + 0x000, (1 << 29) | (1 << 24) | 1);
+    const completedStatus = await machine.readl(BCH_BASE + 0x010);
+    assert.notEqual(completedStatus, 0x00001c01, 'ECC8 completion must update STATUS0');
+    assert.notEqual((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 completion must set COMPLETE_IRQ');
+    await machine.writel(BCH_BASE + 0x010, 0xffffffff);
+    assert.equal(await machine.readl(BCH_BASE + 0x010), completedStatus, 'ECC8 STATUS0 must be read-only');
+    await machine.writel(BCH_BASE + 0x014, 0xffffffff);
+    assert.equal(await machine.readl(BCH_BASE + 0x010), completedStatus, 'ECC8 STATUS0 must reject undocumented aliases');
+    await machine.writel(BCH_BASE + 0x000, 1);
+    assert.notEqual((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 base CTRL write must not clear COMPLETE_IRQ');
+    await machine.writel(BCH_BASE + 0x008, 1);
+    assert.equal((await machine.readl(BCH_BASE + 0x000)) & 1, 0, 'ECC8 CTRL_CLR must clear COMPLETE_IRQ');
+
+    await machine.writel(BCH_BASE + 0x030, 0x01ffff3f);
+    await machine.writel(BCH_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x010),
+      0x0000fc10,
+      'ECC8 SFTRST must restore STATUS0 defaults',
+    );
+    assert.equal(
+      await machine.readl(BCH_BASE + 0x020),
+      0xcccccccc,
+      'ECC8 SFTRST must restore STATUS1 defaults',
+    );
+    assert.equal(await machine.readl(BCH_BASE + 0x030), 0, 'ECC8 SFTRST must reset DEBUG0');
+
+    for (const offset of [0x080, 0x084, 0x088, 0x08c, 0x0a0, 0x0a4, 0x0a8, 0x0ac]) {
+      await machine.writel(BCH_BASE + offset, 0xffffffff);
+    }
+    assert.equal(await machine.readl(BCH_BASE + 0x080), 0x38434345, 'ECC8 BLOCKNAME must remain read-only');
+    assert.equal(await machine.readl(BCH_BASE + 0x0a0), 0x01000000, 'ECC8 VERSION must remain read-only');
+  });
+}
+
 async function testGpmiDataFifoContract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x000, 0);
@@ -4060,6 +4217,8 @@ const tests = [
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
   ['GPMI ECC register contract', testGpmiEccRegisterContract],
+  ['ECC8 completion result contract', testEcc8CompletionResultContract],
+  ['ECC8 register contract', testEcc8RegisterContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],

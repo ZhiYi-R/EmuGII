@@ -60,24 +60,6 @@ static void gpmi_apply_sct(uint32_t *reg, uint32_t value, int sct)
     }
 }
 
-static void bch_apply_sct(uint32_t *reg, uint32_t value, int sct)
-{
-    switch (sct) {
-    case 0:
-        *reg = value;
-        break;
-    case 1:
-        *reg |= value;
-        break;
-    case 2:
-        *reg &= ~value;
-        break;
-    case 3:
-        *reg ^= value;
-        break;
-    }
-}
-
 static void gpmi_update_irq(STMP3770GPMIState *s)
 {
     bool pending = false;
@@ -198,8 +180,13 @@ static void gpmi_write_ctrl1(STMP3770GPMIState *s, uint32_t value, int sct)
 
 static void bch_update_irq(STMP3770BCHState *s)
 {
-    bool pending = (s->ctrl & BCH_CTRL_COMPLETE_IRQ) &&
-                   (s->ctrl & BCH_CTRL_COMPLETE_IRQ_EN);
+    bool pending = ((s->ctrl & BCH_CTRL_COMPLETE_IRQ) &&
+                    (s->ctrl & BCH_CTRL_COMPLETE_IRQ_EN)) ||
+                   ((s->ctrl & BCH_CTRL_DEBUG_STALL_IRQ) &&
+                    (s->ctrl & BCH_CTRL_DEBUG_STALL_IRQ_EN)) ||
+                   ((s->ctrl & BCH_CTRL_DEBUG_WRITE_IRQ) &&
+                    (s->ctrl & BCH_CTRL_DEBUG_WRITE_IRQ_EN)) ||
+                   (s->ctrl & BCH_CTRL_BM_ERROR_IRQ);
     qemu_set_irq(s->irq, pending);
 }
 
@@ -234,17 +221,27 @@ static void gpmi_log_progress(STMP3770GPMIState *s, const char *op,
 static void gpmi_bch_complete_read(STMP3770GPMIState *s)
 {
     STMP3770BCHState *bch = s->bch;
+    uint32_t buffer_mask;
+    uint32_t status0;
+    uint32_t status1 = BCH_STATUS1_NOT_CHECKED;
+    unsigned int cs;
+    unsigned int block;
 
-    if (!bch) {
+    if (!bch || (bch->ctrl & (BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE |
+                              BCH_CTRL_AHBM_SFTRST | BCH_CTRL_COMPLETE_IRQ))) {
         return;
     }
 
-    if (s->payload) {
-        address_space_write(&address_space_memory, s->payload,
-                            MEMTXATTRS_UNSPECIFIED,
-                            s->page_buf, s->page_size);
+    buffer_mask = s->eccctrl & GPMI_ECCCTRL_BUFFER_MASK_MASK;
+    for (block = 0; block < 8; block++) {
+        if ((buffer_mask & (1U << block)) && s->payload) {
+            address_space_write(&address_space_memory,
+                                s->payload + block * 512,
+                                MEMTXATTRS_UNSPECIFIED,
+                                s->page_buf + block * 512, 512);
+        }
     }
-    if (s->auxiliary) {
+    if ((buffer_mask & (1U << 8)) && s->auxiliary) {
         uint8_t aux_meta[19];
         memset(aux_meta, 0xFF, sizeof(aux_meta));
         if (s->page_buf_size > s->page_size) {
@@ -264,9 +261,24 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
         }
     }
 
-    /* Report successful completion */
-    bch->status0 = BCH_STATUS0_COMPLETED_CE;
-    bch->status1 = 0x00000000;   /* all payloads: zero corrections */
+    cs = (s->ctrl0 >> GPMI_CTRL0_CS_SHIFT) & GPMI_CTRL0_CS_MASK;
+    status0 = BCH_STATUS0_PRESENT_MASK |
+              ((s->eccctrl >> GPMI_ECCCTRL_HANDLE_SHIFT) &
+               BCH_STATUS0_HANDLE_MASK) << BCH_STATUS0_HANDLE_SHIFT |
+              cs;
+    if (buffer_mask & (1U << 8)) {
+        status0 |= 0U << BCH_STATUS0_STATUS_AUX_SHIFT;
+    } else {
+        status0 |= 0xCU << BCH_STATUS0_STATUS_AUX_SHIFT;
+    }
+    for (block = 0; block < 8; block++) {
+        if (buffer_mask & (1U << block)) {
+            status1 &= ~(0xFU << (block * 4));
+        }
+    }
+
+    bch->status0 = status0;
+    bch->status1 = status1;
     bch->ctrl |= BCH_CTRL_COMPLETE_IRQ;
     bch_update_irq(bch);
 
@@ -1418,6 +1430,17 @@ static uint64_t bch_read(void *opaque, hwaddr offset, unsigned size)
         return s->status0;
     case BCH_STATUS1:
         return s->status1;
+    case BCH_DEBUG0:
+        return s->debug0;
+    case BCH_DBGKESREAD:
+    case BCH_DBGCSFEREAD:
+    case BCH_DBGSYNDGENREAD:
+    case BCH_DBGAHBMREAD:
+        return 0;
+    case BCH_BLOCKNAME:
+        return BCH_BLOCKNAME_VALUE;
+    case BCH_VERSION:
+        return BCH_VERSION_VALUE;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-bch: read from unimplemented offset "
@@ -1441,26 +1464,46 @@ static void bch_write(void *opaque, hwaddr offset,
 
     switch (base) {
     case BCH_CTRL:
-        bch_apply_sct(&s->ctrl, (uint32_t)value, sct);
-        /* Hardware ties CLKGATE to SFTRST */
+        switch (sct) {
+        case 0:
+            s->ctrl = (s->ctrl & BCH_CTRL_IRQ_STATUS_MASK) |
+                      ((uint32_t)value & BCH_CTRL_CONFIG_MASK);
+            break;
+        case 1:
+            s->ctrl |= (uint32_t)value & BCH_CTRL_CONFIG_MASK;
+            break;
+        case 2:
+            s->ctrl &= ~((uint32_t)value &
+                         (BCH_CTRL_CONFIG_MASK | BCH_CTRL_IRQ_STATUS_MASK));
+            break;
+        case 3:
+            s->ctrl ^= (uint32_t)value & BCH_CTRL_CONFIG_MASK;
+            break;
+        }
         if (s->ctrl & BCH_CTRL_SFTRST) {
             s->ctrl |= BCH_CTRL_CLKGATE;
-            s->status0 = 0x00001C01;
-            s->status1 = 0xCCCCCCCC;
-        } else {
-            s->ctrl &= ~BCH_CTRL_CLKGATE;
+            s->ctrl &= ~BCH_CTRL_IRQ_STATUS_MASK;
+            s->status0 = BCH_STATUS0_RESET_VALUE;
+            s->status1 = BCH_STATUS1_NOT_CHECKED;
+            s->debug0 = 0;
         }
         bch_update_irq(s);
         break;
-    case BCH_STATUS0:
-        /* Write-1-to-clear bits (works for base and CLR alias) */
-        s->status0 &= ~((uint32_t)value & (BCH_STATUS0_ALLONES |
-                                            BCH_STATUS0_CORRECTED |
-                                            BCH_STATUS0_UNCORRECTABLE |
-                                            BCH_STATUS0_COMPLETED_CE));
-        break;
-    case BCH_STATUS1:
-        /* Read-only */
+    case BCH_DEBUG0:
+        switch (sct) {
+        case 0:
+            s->debug0 = (uint32_t)value & BCH_DEBUG0_WRITABLE_MASK;
+            break;
+        case 1:
+            s->debug0 |= (uint32_t)value & BCH_DEBUG0_WRITABLE_MASK;
+            break;
+        case 2:
+            s->debug0 &= ~((uint32_t)value & BCH_DEBUG0_WRITABLE_MASK);
+            break;
+        case 3:
+            s->debug0 ^= (uint32_t)value & BCH_DEBUG0_WRITABLE_MASK;
+            break;
+        }
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1484,9 +1527,10 @@ static void bch_reset(DeviceState *dev)
 {
     STMP3770BCHState *s = STMP3770_BCH(dev);
 
-    s->ctrl = BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE;
-    s->status0 = 0x00001C01;
-    s->status1 = 0xCCCCCCCC;
+    s->ctrl = BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE | BCH_CTRL_AHBM_SFTRST;
+    s->status0 = BCH_STATUS0_RESET_VALUE;
+    s->status1 = BCH_STATUS1_NOT_CHECKED;
+    s->debug0 = 0;
     qemu_set_irq(s->irq, false);
 }
 
@@ -1501,14 +1545,24 @@ static void bch_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
 }
 
+static int bch_post_load(void *opaque, int version_id)
+{
+    STMP3770BCHState *s = STMP3770_BCH(opaque);
+
+    bch_update_irq(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_bch = {
     .name = "stmp3770-bch",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = bch_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770BCHState),
         VMSTATE_UINT32(status0, STMP3770BCHState),
         VMSTATE_UINT32(status1, STMP3770BCHState),
+        VMSTATE_UINT32_V(debug0, STMP3770BCHState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
