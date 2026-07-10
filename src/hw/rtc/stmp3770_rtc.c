@@ -26,6 +26,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "system/runstate.h"
 
 /* Register offsets */
@@ -74,6 +75,9 @@
 #define STAT_NEW_REGS_SHIFT         8
 #define STAT_NEW_REGS_MASK          0xFF
 
+#define RTC_COPY_REG_COUNT          8
+#define RTC_COPY_INTERVAL_NS        375000
+
 /* PERSISTENT0 bits */
 #define PERSISTENT0_ALARM_WAKE      (1U << 7)
 #define PERSISTENT0_XTAL32_FREQ     (1U << 6)
@@ -88,6 +92,89 @@
 static inline bool stmp3770_rtc_enabled(STMP3770RTCState *s)
 {
     return (s->ctrl & (CTRL_SFTRST | CTRL_CLKGATE)) == 0;
+}
+
+static uint32_t *stmp3770_rtc_shadow_reg(STMP3770RTCState *s, unsigned reg)
+{
+    if (reg < STMP3770_RTC_NUM_PERSISTENT) {
+        return &s->persistent[reg];
+    }
+    if (reg == 6) {
+        return &s->alarm;
+    }
+
+    g_assert(reg == 7);
+    return &s->seconds;
+}
+
+static uint32_t *stmp3770_rtc_analog_reg(STMP3770RTCState *s, unsigned reg)
+{
+    if (reg < STMP3770_RTC_NUM_PERSISTENT) {
+        return &s->analog_persistent[reg];
+    }
+    if (reg == 6) {
+        return &s->analog_alarm;
+    }
+
+    g_assert(reg == 7);
+    return &s->analog_seconds;
+}
+
+static void stmp3770_rtc_rearm_copy_timer(STMP3770RTCState *s)
+{
+    if (s->copy_to_shadow || s->copy_to_analog) {
+        timer_mod(s->copy_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  RTC_COPY_INTERVAL_NS);
+    } else {
+        timer_del(s->copy_timer);
+    }
+}
+
+static void stmp3770_rtc_queue_shadow_refresh(STMP3770RTCState *s)
+{
+    s->stat |= STAT_STALE_REGS_MASK << STAT_STALE_REGS_SHIFT;
+    s->copy_to_shadow = STAT_STALE_REGS_MASK;
+    stmp3770_rtc_rearm_copy_timer(s);
+}
+
+static void stmp3770_rtc_queue_shadow_write(STMP3770RTCState *s,
+                                             unsigned reg)
+{
+    uint32_t bit = 1U << reg;
+
+    s->stat |= bit << STAT_NEW_REGS_SHIFT;
+    s->copy_to_analog |= bit;
+    stmp3770_rtc_rearm_copy_timer(s);
+}
+
+static void stmp3770_rtc_copy_step(void *opaque)
+{
+    STMP3770RTCState *s = STMP3770_RTC(opaque);
+    uint8_t pending = s->copy_to_shadow | s->copy_to_analog;
+    unsigned reg;
+    uint32_t bit;
+
+    if (!pending) {
+        return;
+    }
+
+    reg = ctz32(pending);
+    bit = 1U << reg;
+    if (s->copy_to_shadow & bit) {
+        *stmp3770_rtc_shadow_reg(s, reg) =
+            *stmp3770_rtc_analog_reg(s, reg);
+        s->copy_to_shadow &= ~bit;
+        s->copy_to_analog &= ~bit;
+        s->stat &= ~(bit << STAT_STALE_REGS_SHIFT);
+        s->stat &= ~(bit << STAT_NEW_REGS_SHIFT);
+    } else {
+        *stmp3770_rtc_analog_reg(s, reg) =
+            *stmp3770_rtc_shadow_reg(s, reg);
+        s->copy_to_analog &= ~bit;
+        s->stat &= ~(bit << STAT_NEW_REGS_SHIFT);
+    }
+
+    stmp3770_rtc_rearm_copy_timer(s);
 }
 
 static void stmp3770_rtc_update_irq(STMP3770RTCState *s)
@@ -127,6 +214,7 @@ static void stmp3770_rtc_tick(void *opaque)
 
     if ((s->milliseconds % 1000) == 0) {
         s->seconds++;
+        s->analog_seconds = s->seconds;
         stmp3770_rtc_check_alarm(s);
     }
 
@@ -279,7 +367,7 @@ static void stmp3770_rtc_write(void *opaque, hwaddr offset,
         }
         if ((old_ctrl & CTRL_FORCE_UPDATE) == 0 &&
             (s->ctrl & CTRL_FORCE_UPDATE)) {
-            /* Force-update completes immediately in this model */
+            stmp3770_rtc_queue_shadow_refresh(s);
             s->ctrl &= ~CTRL_FORCE_UPDATE;
         }
         stmp3770_rtc_rearm(s);
@@ -295,6 +383,7 @@ static void stmp3770_rtc_write(void *opaque, hwaddr offset,
         if (!(s->persistent[0] & PERSISTENT0_LCK_SECS)) {
             stmp3770_rtc_apply_write(&s->seconds, 0xFFFFFFFF, (uint32_t)value,
                                     sct, offset, size);
+            stmp3770_rtc_queue_shadow_write(s, 7);
             stmp3770_rtc_check_alarm(s);
         }
         return;
@@ -302,6 +391,7 @@ static void stmp3770_rtc_write(void *opaque, hwaddr offset,
     case REG_ALARM:
         stmp3770_rtc_apply_write(&s->alarm, 0xFFFFFFFF, (uint32_t)value,
                                 sct, offset, size);
+        stmp3770_rtc_queue_shadow_write(s, 6);
         stmp3770_rtc_check_alarm(s);
         return;
 
@@ -335,6 +425,7 @@ static void stmp3770_rtc_write(void *opaque, hwaddr offset,
             stmp3770_rtc_apply_write(&s->persistent[idx], 0xFFFFFFFF,
                                      (uint32_t)value, sct, offset, size);
         }
+        stmp3770_rtc_queue_shadow_write(s, idx);
         return;
     }
 
@@ -360,6 +451,7 @@ static void stmp3770_rtc_reset(DeviceState *dev)
     ptimer_transaction_begin(s->tick);
     ptimer_stop(s->tick);
     ptimer_transaction_commit(s->tick);
+    timer_del(s->copy_timer);
 
     s->ctrl = CTRL_SFTRST | CTRL_CLKGATE | CTRL_FORCE_UPDATE;
     s->stat = STAT_STALE_REGS_MASK << STAT_STALE_REGS_SHIFT;
@@ -369,8 +461,16 @@ static void stmp3770_rtc_reset(DeviceState *dev)
     s->watchdog = 0xFFFFFFFF;
     memset(s->persistent, 0, sizeof(s->persistent));
     s->persistent[0] = 0x100; /* MSEC_RES = 1 ms */
+    s->analog_seconds = 0;
+    s->analog_alarm = 0;
+    memset(s->analog_persistent, 0, sizeof(s->analog_persistent));
+    s->analog_persistent[0] = 0x100;
+    s->copy_to_shadow = 0;
+    s->copy_to_analog = 0;
     s->debug = 0;
     s->version = 0x02000000; /* RTC Block v2.0 */
+    stmp3770_rtc_queue_shadow_refresh(s);
+    s->ctrl &= ~CTRL_FORCE_UPDATE;
     stmp3770_rtc_update_irq(s);
 }
 
@@ -390,12 +490,38 @@ static void stmp3770_rtc_init(Object *obj)
     ptimer_set_freq(s->tick, 1000);
     ptimer_set_limit(s->tick, 1, 1);
     ptimer_transaction_commit(s->tick);
+    s->copy_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stmp3770_rtc_copy_step,
+                                 s);
+}
+
+static void stmp3770_rtc_finalize(Object *obj)
+{
+    STMP3770RTCState *s = STMP3770_RTC(obj);
+
+    timer_free(s->copy_timer);
+}
+
+static int stmp3770_rtc_post_load(void *opaque, int version_id)
+{
+    STMP3770RTCState *s = STMP3770_RTC(opaque);
+
+    if (version_id < 2) {
+        s->analog_seconds = s->seconds;
+        s->analog_alarm = s->alarm;
+        memcpy(s->analog_persistent, s->persistent,
+               sizeof(s->analog_persistent));
+        s->copy_to_shadow = 0;
+        s->copy_to_analog = 0;
+    }
+    stmp3770_rtc_rearm_copy_timer(s);
+    return 0;
 }
 
 static const VMStateDescription vmstate_stmp3770_rtc = {
     .name = TYPE_STMP3770_RTC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = stmp3770_rtc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770RTCState),
         VMSTATE_UINT32(stat, STMP3770RTCState),
@@ -408,6 +534,13 @@ static const VMStateDescription vmstate_stmp3770_rtc = {
         VMSTATE_UINT32(debug, STMP3770RTCState),
         VMSTATE_UINT32(version, STMP3770RTCState),
         VMSTATE_PTIMER(tick, STMP3770RTCState),
+        VMSTATE_UINT32_V(analog_seconds, STMP3770RTCState, 2),
+        VMSTATE_UINT32_V(analog_alarm, STMP3770RTCState, 2),
+        VMSTATE_UINT32_ARRAY_V(analog_persistent, STMP3770RTCState,
+                               STMP3770_RTC_NUM_PERSISTENT, 2),
+        VMSTATE_UINT8_V(copy_to_shadow, STMP3770RTCState, 2),
+        VMSTATE_UINT8_V(copy_to_analog, STMP3770RTCState, 2),
+        VMSTATE_TIMER_PTR_V(copy_timer, STMP3770RTCState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -425,6 +558,7 @@ static const TypeInfo stmp3770_rtc_type_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770RTCState),
     .instance_init = stmp3770_rtc_init,
+    .instance_finalize = stmp3770_rtc_finalize,
     .class_init    = stmp3770_rtc_class_init,
 };
 

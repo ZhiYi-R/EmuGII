@@ -16,6 +16,7 @@
 
 #include "hw/sysbus.h"
 #include "hw/ptimer.h"
+#include "qemu/timer.h"
 
 #define TYPE_STMP3770_RTC "stmp3770-rtc"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770RTCState, STMP3770_RTC)
@@ -40,8 +41,16 @@ struct STMP3770RTCState {
     uint32_t debug;
     uint32_t version;
 
+    /* Always-on analog copies of the eight shadow registers. */
+    uint32_t analog_seconds;
+    uint32_t analog_alarm;
+    uint32_t analog_persistent[STMP3770_RTC_NUM_PERSISTENT];
+    uint8_t copy_to_shadow;
+    uint8_t copy_to_analog;
+
     /* 1 kHz tick timer (drives ms counter, watchdog, seconds, alarm) */
     ptimer_state *tick;
+    QEMUTimer *copy_timer;
 };
 
 #endif /* STMP3770_RTC_H */

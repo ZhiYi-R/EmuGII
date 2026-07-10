@@ -240,6 +240,54 @@ async function testRtcResetAndPersistent0Contract() {
   });
 }
 
+async function testRtcCopyControllerContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      (await machine.readl(RTC_BASE + 0x010) >>> 16) & 0xff,
+      0xff,
+      'RTC copy controller must report all shadow registers stale after reset',
+    );
+    await machine.clockStep(3_000_000);
+    assert.equal(
+      (await machine.readl(RTC_BASE + 0x010) >>> 16) & 0xff,
+      0,
+      'RTC copy controller must complete reset shadow refresh in approximately 3 ms',
+    );
+
+    await machine.writel(RTC_BASE + 0x070, 0x12345678);
+    assert.notEqual(
+      (await machine.readl(RTC_BASE + 0x010) >>> 8) & 0x02,
+      0,
+      'RTC PERSISTENT1 write must mark its shadow value newer than analog storage',
+    );
+    await machine.clockStep(3_000_000);
+    assert.equal(
+      (await machine.readl(RTC_BASE + 0x010) >>> 8) & 0x02,
+      0,
+      'RTC copy controller must clear PERSISTENT1 NEW_REGS after write-back',
+    );
+
+    await machine.writel(RTC_BASE + 0x004, 0x00000020);
+    const ctrlAfterForceUpdate = await machine.readl(RTC_BASE + 0x000);
+    assert.equal(
+      ctrlAfterForceUpdate & 0x20,
+      0,
+      'RTC FORCE_UPDATE must self-clear after the copy request is accepted',
+    );
+    assert.equal(
+      (await machine.readl(RTC_BASE + 0x010) >>> 16) & 0xff,
+      0xff,
+      'RTC FORCE_UPDATE must mark every shadow register stale',
+    );
+    await machine.clockStep(3_000_000);
+    assert.equal(
+      (await machine.readl(RTC_BASE + 0x010) >>> 16) & 0xff,
+      0,
+      'RTC FORCE_UPDATE refresh must complete through the copy controller',
+    );
+  });
+}
+
 async function testPwmRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -1642,6 +1690,7 @@ async function testOcotpLockAndShadowContract() {
 const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
   ['RTC reset and persistent0 contract', testRtcResetAndPersistent0Contract],
+  ['RTC copy controller contract', testRtcCopyControllerContract],
   ['PWM register contract', testPwmRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
