@@ -58,9 +58,12 @@ struct STMP3770PWMState {
     STMP3770PWMChannel channel[STMP3770_PWM_NUM_CHANNELS];
     STMP3770PWMCallbackInfo cb_info[STMP3770_PWM_NUM_CHANNELS];
     STMP3770PINCTRLState *pinctrl;
+    bool pwm2_analog_enable;
 };
 
 void stmp3770_pwm_set_pinctrl(STMP3770PWMState *s,
                                STMP3770PINCTRLState *pinctrl);
+void stmp3770_pwm_set_pwm2_analog_enable(STMP3770PWMState *s,
+                                          bool enabled);
 
 #endif /* STMP3770_PWM_H */

@@ -24,6 +24,7 @@ const POWER_BASE = 0x80044000;
 const RTC_BASE = 0x8005c000;
 const PWM_BASE = 0x80064000;
 const TIMROT_BASE = 0x80068000;
+const LRADC_BASE = 0x80050000;
 const I2C_BASE = 0x80058000;
 const APPUART_BASE = 0x8006c000;
 const DBGUART_BASE = 0x80070000;
@@ -657,6 +658,40 @@ async function testPwmMattContract() {
       (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
       initial,
       'PWM MATT must return to the prior state after a 24 MHz clock period',
+    );
+  });
+}
+
+async function testPwm2AnalogEnableContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(PINCTRL_BASE + 0x140, 0);
+    await machine.writel(PWM_BASE + 0x008, 0xc0000000);
+    await machine.writel(PWM_BASE + 0x050, 0xffffffff);
+    await machine.writel(PWM_BASE + 0x060, 0x000f0003);
+    await machine.writel(PWM_BASE + 0x004, 0x00000024);
+
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x4,
+      0,
+      'PWM2 analog path must disable PWM2 while LRADC BL_ENABLE is clear',
+    );
+    await machine.writel(LRADC_BASE + 0x024, 0x00400000);
+    assert.notEqual(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x4,
+      0,
+      'PWM2 analog path must enable PWM2 when LRADC BL_ENABLE is set',
+    );
+    await machine.writel(LRADC_BASE + 0x028, 0x00400000);
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x4,
+      0,
+      'clearing LRADC BL_ENABLE must disable PWM2 through the analog path',
+    );
+    await machine.writel(PWM_BASE + 0x008, 0x00000020);
+    assert.notEqual(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x4,
+      0,
+      'clearing PWM2_ANA_CTRL_ENABLE must restore ordinary PWM2 behavior',
     );
   });
 }
@@ -2267,6 +2302,7 @@ const tests = [
   ['PWM register contract', testPwmRegisterContract],
   ['PWM waveform contract', testPwmWaveformContract],
   ['PWM MATT contract', testPwmMattContract],
+  ['PWM2 analog enable contract', testPwm2AnalogEnableContract],
   ['I2C register contract', testI2cRegisterContract],
   ['Application UART register contract', testAppUartRegisterContract],
   ['Debug UART register contract', testDebugUartRegisterContract],

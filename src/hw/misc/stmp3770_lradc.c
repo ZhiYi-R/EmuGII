@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/misc/stmp3770_lradc.h"
+#include "hw/timer/stmp3770_pwm.h"
 
 struct STMP3770LRADCState {
     SysBusDevice parent_obj;
@@ -41,6 +42,7 @@ struct STMP3770LRADCState {
     uint32_t debug1;
     uint32_t conversion;
     uint32_t version;
+    STMP3770PWMState *pwm;
 };
 
 #define LRADC_VERSION   0x01010000
@@ -88,6 +90,7 @@ struct STMP3770LRADCState {
 #define CTRL0_SFTRST    (1U << 31)
 #define CTRL0_CLKGATE   (1U << 30)
 #define CTRL0_SCHEDULE_MASK 0xFF
+#define CTRL2_BL_ENABLE  (1U << 22)
 
 /* Channel result bits */
 #define CH_TOGGLE       (1U << 31)
@@ -147,6 +150,14 @@ static void lradc_complete_scheduled(STMP3770LRADCState *s)
 
     /* Hardware clears SCHEDULE bits when conversions are done */
     s->ctrl0 &= ~CTRL0_SCHEDULE_MASK;
+}
+
+static void lradc_update_pwm2_analog_enable(STMP3770LRADCState *s)
+{
+    if (s->pwm) {
+        stmp3770_pwm_set_pwm2_analog_enable(s->pwm,
+                                             s->ctrl2 & CTRL2_BL_ENABLE);
+    }
 }
 
 static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
@@ -255,6 +266,7 @@ static void lradc_write(void *opaque, hwaddr offset,
         break;
     case REG_CTRL2:
         lradc_apply_sct(&s->ctrl2, (uint32_t)value, sct, offset, size);
+        lradc_update_pwm2_analog_enable(s);
         break;
     case REG_CTRL3:
         lradc_apply_sct(&s->ctrl3, (uint32_t)value, sct, offset, size);
@@ -316,6 +328,7 @@ static void lradc_reset(DeviceState *dev)
     s->ctrl0 = CTRL0_SFTRST | CTRL0_CLKGATE;
     s->ctrl1 = 0;
     s->ctrl2 = 0;
+    lradc_update_pwm2_analog_enable(s);
     s->ctrl3 = 0;
     s->ctrl4 = 0x76543210;  /* default channel MUX mapping */
     s->conversion = 0x00000080;
@@ -336,10 +349,19 @@ static void lradc_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
+static int lradc_post_load(void *opaque, int version_id)
+{
+    STMP3770LRADCState *s = STMP3770_LRADC(opaque);
+
+    lradc_update_pwm2_analog_enable(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_lradc = {
     .name = "stmp3770-lradc",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = lradc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl0, STMP3770LRADCState),
         VMSTATE_UINT32(ctrl1, STMP3770LRADCState),
@@ -378,6 +400,12 @@ static void lradc_class_init(ObjectClass *oc, const void *data)
     dc->realize = lradc_realize;
     device_class_set_legacy_reset(dc, lradc_reset);
     dc->vmsd = &vmstate_lradc;
+}
+
+void stmp3770_lradc_set_pwm(STMP3770LRADCState *s, STMP3770PWMState *pwm)
+{
+    s->pwm = pwm;
+    lradc_update_pwm2_analog_enable(s);
 }
 
 static const TypeInfo lradc_type_info = {

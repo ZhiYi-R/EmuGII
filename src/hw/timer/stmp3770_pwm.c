@@ -38,6 +38,7 @@
 #define CTRL0_SFTRST    (1U << 31)
 #define CTRL0_CLKGATE   (1U << 30)
 #define CTRL0_PRESENT   (0x1FU << 25)
+#define CTRL0_PWM2_ANA_CTRL_ENABLE (1U << 5)
 #define CTRL0_RW_MASK   (CTRL0_SFTRST | CTRL0_CLKGATE | 0x3FU)
 #define CTRL0_RESET     (CTRL0_SFTRST | CTRL0_CLKGATE | CTRL0_PRESENT)
 #define PERIOD_RW_MASK  0x00FFFFFF
@@ -72,7 +73,9 @@ static uint8_t pwm_state_to_level(uint32_t state)
 static bool pwm_channel_enabled(const STMP3770PWMState *s, unsigned ch)
 {
     return !(s->ctrl0 & (CTRL0_SFTRST | CTRL0_CLKGATE)) &&
-           (s->ctrl0 & CTRL0_PWM_ENABLE(ch));
+           (s->ctrl0 & CTRL0_PWM_ENABLE(ch)) &&
+           (ch != 2 || !(s->ctrl0 & CTRL0_PWM2_ANA_CTRL_ENABLE) ||
+            s->pwm2_analog_enable);
 }
 
 static void pwm_update_output(STMP3770PWMState *s, unsigned ch)
@@ -389,7 +392,7 @@ static const VMStateDescription vmstate_pwm_channel = {
 
 static const VMStateDescription vmstate_pwm = {
     .name = "stmp3770-pwm",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = pwm_post_load,
     .fields = (const VMStateField[]) {
@@ -400,6 +403,7 @@ static const VMStateDescription vmstate_pwm = {
         VMSTATE_STRUCT_ARRAY(channel, STMP3770PWMState,
                              STMP3770_PWM_NUM_CHANNELS, 2,
                              vmstate_pwm_channel, STMP3770PWMChannel),
+        VMSTATE_BOOL_V(pwm2_analog_enable, STMP3770PWMState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -430,6 +434,9 @@ static int pwm_post_load(void *opaque, int version_id)
             s->channel[ch].pending_period = s->period[ch];
         }
     }
+    if (version_id < 3) {
+        s->pwm2_analog_enable = false;
+    }
     pwm_rearm_all(s);
     return 0;
 }
@@ -452,6 +459,13 @@ void stmp3770_pwm_set_pinctrl(STMP3770PWMState *s,
     for (ch = 0; ch < STMP3770_PWM_NUM_CHANNELS; ch++) {
         pwm_update_output(s, ch);
     }
+}
+
+void stmp3770_pwm_set_pwm2_analog_enable(STMP3770PWMState *s,
+                                          bool enabled)
+{
+    s->pwm2_analog_enable = enabled;
+    pwm_update_output(s, 2);
 }
 
 static const TypeInfo pwm_type_info = {

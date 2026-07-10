@@ -478,6 +478,7 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->lradc), 0, STMP3770_LRADC_ADDR);
+    stmp3770_lradc_set_pwm(s->lradc, s->pwm);
 
     /* Realize USB PHY */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->usbphy), errp)) {
