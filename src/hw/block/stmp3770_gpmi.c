@@ -799,6 +799,8 @@ static uint64_t gpmi_read(void *opaque, hwaddr offset, unsigned size)
         return s->timing0;
     case GPMI_TIMING1:
         return s->timing1;
+    case GPMI_TIMING2:
+        return s->timing2;
     case GPMI_DATA:
         /* Pop one word from FIFO */
         if (s->fifo_count > 0) {
@@ -876,6 +878,11 @@ static void gpmi_write(void *opaque, hwaddr offset,
     case GPMI_TIMING1:
         s->timing1 = (uint32_t)value;
         break;
+    case GPMI_TIMING2:
+        if (offset == GPMI_TIMING2) {
+            s->timing2 = (uint32_t)value;
+        }
+        break;
     case GPMI_DATA:
         /* Push one word to FIFO */
         if (s->fifo_count < ARRAY_SIZE(s->fifo)) {
@@ -927,6 +934,7 @@ static void gpmi_reset(DeviceState *dev)
     s->ctrl1 = 0;
     s->timing0 = 0x00010203;
     s->timing1 = 0;
+    s->timing2 = 0x09020101;
     s->stat = GPMI_STAT_PRESENT | GPMI_STAT_FIFO_EMPTY;
     s->debug = 0;
     s->fifo_count = 0;
@@ -1178,7 +1186,7 @@ void stmp3770_gpmi_set_bch(STMP3770GPMIState *s, STMP3770BCHState *bch)
 
 static const VMStateDescription vmstate_gpmi = {
     .name = "stmp3770-gpmi",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl0, STMP3770GPMIState),
@@ -1190,6 +1198,7 @@ static const VMStateDescription vmstate_gpmi = {
         VMSTATE_UINT32(ctrl1, STMP3770GPMIState),
         VMSTATE_UINT32(timing0, STMP3770GPMIState),
         VMSTATE_UINT32(timing1, STMP3770GPMIState),
+        VMSTATE_UINT32_V(timing2, STMP3770GPMIState, 2),
         VMSTATE_UINT32(stat, STMP3770GPMIState),
         VMSTATE_UINT32(debug, STMP3770GPMIState),
         VMSTATE_UINT32(fifo_count, STMP3770GPMIState),

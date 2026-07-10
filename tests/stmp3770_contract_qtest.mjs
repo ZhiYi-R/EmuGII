@@ -28,6 +28,7 @@ const TIMROT_BASE = 0x80068000;
 const USBPHY_BASE = 0x8007c000;
 const USB_BASE = 0x80080000;
 const LRADC_BASE = 0x80050000;
+const GPMI_BASE = 0x8000c000;
 const I2C_BASE = 0x80058000;
 const SSP1_BASE = 0x80010000;
 const SSP2_BASE = 0x80034000;
@@ -2026,6 +2027,32 @@ async function testSspDataEmptyReadContract() {
   });
 }
 
+async function testGpmiTiming2Contract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x090),
+      0x09020101,
+      'GPMI TIMING2 must occupy 0x90 and expose all four documented reset bytes',
+    );
+
+    await machine.writel(GPMI_BASE + 0x090, 0x5a3c1708);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x090),
+      0x5a3c1708,
+      'GPMI TIMING2 must retain all four documented UDMA timing fields',
+    );
+
+    for (const offset of [0x094, 0x098, 0x09c]) {
+      await machine.writel(GPMI_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(GPMI_BASE + 0x090),
+        0x5a3c1708,
+        `GPMI TIMING2 must not decode an undocumented alias at 0x${offset.toString(16)}`,
+      );
+    }
+  });
+}
+
 async function testOnChipRomAndSramMirrorContract() {
   await withMachine(async (machine) => {
     await machine.writel(SRAM_BASE + 0x1234, 0x11223344);
@@ -3847,6 +3874,7 @@ const tests = [
   ['SSP SCT and CMD0 reserved contract', testSspSctAndCmd0ReservedContract],
   ['SSP error IRQ pairing contract', testSspErrorIrqPairingContract],
   ['SSP DATA empty read contract', testSspDataEmptyReadContract],
+  ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],
   ['DCP channel register map contract', testDcpChannelRegisterMapContract],

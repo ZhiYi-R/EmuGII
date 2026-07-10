@@ -36,6 +36,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BCHState, STMP3770_BCH)
 #define GPMI_CTRL1      0x60
 #define GPMI_TIMING0    0x70
 #define GPMI_TIMING1    0x80
+#define GPMI_TIMING2    0x90
 #define GPMI_DATA       0xA0
 #define GPMI_STAT       0xB0
 #define GPMI_DEBUG      0xC0
@@ -175,6 +176,7 @@ struct STMP3770GPMIState {
     uint32_t ctrl1;
     uint32_t timing0;
     uint32_t timing1;
+    uint32_t timing2;
     uint32_t stat;
     uint32_t debug;
 
