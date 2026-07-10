@@ -1216,6 +1216,32 @@ async function testLcdifClockGateContract() {
   });
 }
 
+async function testLcdifSoftResetContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
+    await machine.writel(LCDIF_BASE + 0x010, 0x00030001);
+    await machine.writel(LCDIF_BASE + 0x020, 0x11223344);
+    await machine.writel(LCDIF_BASE + 0x040, 0x55667788);
+
+    await machine.writel(LCDIF_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(LCDIF_BASE + 0x010),
+      0x000f0001,
+      'LCDIF SFTRST must restore CTRL1 defaults while preserving the external RESET line',
+    );
+    assert.equal(
+      await machine.readl(LCDIF_BASE + 0x020),
+      0,
+      'LCDIF SFTRST must restore TIMING defaults',
+    );
+    assert.equal(
+      await machine.readl(LCDIF_BASE + 0x040),
+      0,
+      'LCDIF SFTRST must restore VDCTRL1 defaults',
+    );
+  });
+}
+
 async function testLcdifDataAccessContract() {
   await withMachine(async (machine) => {
     const ctrl = 0x00030001;
@@ -2573,6 +2599,7 @@ const tests = [
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['LCDIF register map contract', testLcdifRegisterMapContract],
   ['LCDIF clock gate contract', testLcdifClockGateContract],
+  ['LCDIF soft reset contract', testLcdifSoftResetContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],

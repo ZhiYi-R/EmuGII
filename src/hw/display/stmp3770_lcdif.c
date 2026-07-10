@@ -1176,6 +1176,30 @@ static void lcdif_apply_sct(uint32_t *reg, uint32_t value, int sct)
     }
 }
 
+static void lcdif_soft_reset(STMP3770LCDIFState *s)
+{
+    uint32_t panel_reset = s->ctrl1 & 1;
+
+    s->ctrl0 = CTRL0_SFTRST | CTRL0_CLKGATE;
+    s->ctrl1 = CTRL1_RESET_VALUE | panel_reset;
+    s->cur_buf = 0;
+    s->next_buf = 0;
+    memset(s->timing, 0, sizeof(s->timing));
+    s->vdctrl0 = 0;
+    s->vdctrl1 = 0;
+    s->vdctrl2 = 0;
+    s->vdctrl3 = 0;
+    s->hw_timing = 0;
+    memset(s->vdctrl, 0, sizeof(s->vdctrl));
+    memset(s->dvctrl, 0, sizeof(s->dvctrl));
+    s->irq = 0;
+    s->irq_en = 0;
+    s->width = 0;
+    s->height = 0;
+    s->dma_pio_ctrl = 0;
+    lcdif_update_irq(s);
+}
+
 static void lcdif_consume_data_words(STMP3770LCDIFState *s, size_t bytes)
 {
     unsigned int words;
@@ -1289,7 +1313,7 @@ static void lcdif_write(void *opaque, hwaddr offset,
          * gates the clock, so firmware polls CLKGATE after setting SFTRST.
          */
         if (s->ctrl0 & CTRL0_SFTRST) {
-            s->ctrl0 |= CTRL0_CLKGATE;
+            lcdif_soft_reset(s);
         }
         return;
     }
