@@ -15,6 +15,7 @@
 #define STMP3770_USB_H
 
 #include "hw/sysbus.h"
+#include "hw/ptimer.h"
 
 #define TYPE_STMP3770_USB "stmp3770-usb"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770USBState, STMP3770_USB)
@@ -53,7 +54,10 @@ struct STMP3770USBState {
     uint32_t endptcomplete;
     uint32_t endptctrl[STMP3770_USB_MIGRATION_ENDPOINTS];
 
+    uint32_t gptimer_load[2];
     uint32_t gptimer[2];
+    ptimer_state *gptimer_ptimer[2];
+    struct STMP3770USBGPTimerCBInfo *gptimer_cb_info;
 };
 
 #endif /* STMP3770_USB_H */

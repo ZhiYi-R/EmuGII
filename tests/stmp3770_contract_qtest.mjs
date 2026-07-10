@@ -1617,6 +1617,123 @@ async function testUsbEndpointRegisterContract() {
   });
 }
 
+async function testUsbGptimerContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(USB_BASE + 0x080, 0x00000001);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x080),
+      0x00000001,
+      'USBCTRL GPTIMER0LD must retain its documented 24-bit load value',
+    );
+    await machine.writel(USB_BASE + 0x148, 0x01000000);
+    await machine.writel(USB_BASE + 0x084, 0x40000000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x00000001,
+      'USBCTRL GPTRST must load GPTCNT and self-clear while the timer remains stopped',
+    );
+
+    await machine.clockStep(1_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x00000001,
+      'USBCTRL GPTRST without GTPRUN must retain GPTCNT while the timer is stopped',
+    );
+    await machine.writel(USB_BASE + 0x084, 0x80000000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x80000001,
+      'USBCTRL GTPRUN must start from the reset-loaded GPTCNT without changing it',
+    );
+
+    await machine.clockStep(1_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x80000001,
+      'USBCTRL GPTIMER0 must retain GPTCNT for the first 1 microsecond interval',
+    );
+    assert.equal(
+      (await machine.readl(USB_BASE + 0x144)) & 0x01000000,
+      0,
+      'USBCTRL TI0 must remain clear before GPTCNT transitions to zero',
+    );
+
+    await machine.clockStep(1_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x00000000,
+      'USBCTRL GPTIMER0 must stop at zero when the countdown expires',
+    );
+    assert.notEqual(
+      (await machine.readl(USB_BASE + 0x144)) & 0x01000000,
+      0,
+      'USBCTRL GPTIMER0 expiry must set USBSTS.TI0',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL TIE0 and TI0 must assert the USB interrupt on ICOLL source 11',
+    );
+    await machine.writel(USB_BASE + 0x144, 0x01000000);
+    assert.equal(
+      (await machine.readl(USB_BASE + 0x144)) & 0x01000000,
+      0,
+      'USBCTRL USBSTS.TI0 must clear by write-one-to-clear',
+    );
+    assert.equal(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL USB interrupt must deassert after TI0 is acknowledged',
+    );
+    await machine.writel(USB_BASE + 0x084, 0x80000000);
+    await machine.clockStep(2_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0,
+      'USBCTRL one-shot must remain stopped when GTPRUN is written without GPTRST',
+    );
+    assert.equal(
+      (await machine.readl(USB_BASE + 0x144)) & 0x01000000,
+      0,
+      'USBCTRL one-shot must not reassert TI0 until software resets GPTCNT',
+    );
+
+    await machine.writel(USB_BASE + 0x080, 0x00000009);
+    await machine.writel(USB_BASE + 0x084, 0xc0000000);
+    await machine.clockStep(2_000);
+    await machine.writel(USB_BASE + 0x080, 0x00000003);
+    await machine.writel(USB_BASE + 0x084, 0x40000000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x00000003,
+      'USBCTRL GPTRST must reload GPTCNT even when it stops an active timer',
+    );
+    await machine.clockStep(10_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x084),
+      0x00000003,
+      'USBCTRL GPTRST without GTPRUN must leave a reloaded active timer stopped',
+    );
+
+    await machine.writel(USB_BASE + 0x088, 0x00000000);
+    await machine.writel(USB_BASE + 0x148, 0x02000000);
+    await machine.writel(USB_BASE + 0x08c, 0xc1000000);
+    await machine.clockStep(1_000);
+    assert.notEqual(
+      (await machine.readl(USB_BASE + 0x144)) & 0x02000000,
+      0,
+      'USBCTRL GPTIMER1 repeat mode must set USBSTS.TI1 on expiry',
+    );
+    await machine.writel(USB_BASE + 0x144, 0x02000000);
+    await machine.clockStep(1_000);
+    assert.notEqual(
+      (await machine.readl(USB_BASE + 0x144)) & 0x02000000,
+      0,
+      'USBCTRL GPTIMER1 repeat mode must automatically reload after expiry',
+    );
+  });
+}
+
 async function testLcdifDataAccessContract() {
   await withMachine(async (machine) => {
     const ctrl = 0x00030001;
@@ -2986,6 +3103,7 @@ const tests = [
   ['USBCTRL capability register contract', testUsbCapabilityRegisterContract],
   ['USBCTRL device control contract', testUsbDeviceControlContract],
   ['USBCTRL endpoint register contract', testUsbEndpointRegisterContract],
+  ['USBCTRL GPTIMER contract', testUsbGptimerContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],

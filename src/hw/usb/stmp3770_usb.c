@@ -68,15 +68,21 @@
 #define USBCMD_RST          (1U << 1)
 #define USBCMD_RUN          (1U << 0)
 
-#define USBSTS_URI          (1U << 6)
-#define USBSTS_PCI          (1U << 2)
-#define USBSTS_UEI          (1U << 1)
-#define USBSTS_UI           (1U << 0)
+#define USBSTS_W1C_MASK             0x030C05FF
+#define USBINTR_WRITABLE_MASK        0x030D05FF
+#define USBSTS_URI                  (1U << 6)
+#define GPTIMER_RUN                  (1U << 31)
+#define GPTIMER_RESET                (1U << 30)
+#define GPTIMER_REPEAT               (1U << 24)
+#define GPTIMER_CONTROL_WRITABLE_MASK (GPTIMER_RUN | GPTIMER_RESET | GPTIMER_REPEAT)
+#define GPTIMER_COUNT_MASK           0x00FFFFFF
+#define USBSTS_GPTIMER0              (1U << 24)
+#define USBSTS_GPTIMER1              (1U << 25)
 
 #define USBCTRL_USBCMD_DEVICE_RESET     0x00080000
 #define USBCTRL_BURSTSIZE_RESET         0x00001010
 #define USBCTRL_OTGSC_DEVICE_RESET      0x00000020
-#define USBCTRL_USBINTR_WRITABLE_MASK   0x030D05FF
+#define USBCTRL_USBINTR_WRITABLE_MASK   USBINTR_WRITABLE_MASK
 #define USBCTRL_DEVICEADDR_WRITABLE_MASK 0xFF000000
 #define USBCTRL_ENDPTLISTADDR_WRITABLE_MASK 0xFFFFF800
 #define USBCTRL_TTCTRL_WRITABLE_MASK    0x7F000000
@@ -103,16 +109,54 @@
 #define PORTSC1_PE          (1U << 2)
 #define PORTSC1_CCS         (1U << 0)
 
+typedef struct STMP3770USBGPTimerCBInfo {
+    STMP3770USBState *s;
+    unsigned int idx;
+} STMP3770USBGPTimerCBInfo;
+
 static void usb_update_irq(STMP3770USBState *s)
 {
-    bool pending = false;
+    qemu_set_irq(s->irq, (s->usbsts & s->usbintr &
+                          USBINTR_WRITABLE_MASK) != 0);
+}
 
-    if ((s->usbsts & s->usbintr & (USBSTS_UI | USBSTS_UEI |
-                                       USBSTS_PCI | USBSTS_URI)) != 0) {
-        pending = true;
+static void usb_gptimer_configure(STMP3770USBState *s, unsigned int idx,
+                                  bool reload)
+{
+    ptimer_state *ptimer = s->gptimer_ptimer[idx];
+    uint32_t control = s->gptimer[idx];
+    uint64_t count;
+
+    ptimer_transaction_begin(ptimer);
+    if (!(control & GPTIMER_RUN)) {
+        ptimer_stop(ptimer);
     }
+    if (reload) {
+        ptimer_set_limit(ptimer, (uint64_t)s->gptimer_load[idx] + 1, 1);
+        ptimer_set_count(ptimer, (uint64_t)s->gptimer_load[idx] + 1);
+    }
+    if (control & GPTIMER_RUN) {
+        count = ptimer_get_count(ptimer);
+        if (reload || count != 0) {
+            ptimer_run(ptimer, (control & GPTIMER_REPEAT) == 0);
+        } else {
+            s->gptimer[idx] &= ~GPTIMER_RUN;
+        }
+    }
+    ptimer_transaction_commit(ptimer);
+}
 
-    qemu_set_irq(s->irq, pending);
+static void usb_gptimer_tick(void *opaque)
+{
+    STMP3770USBGPTimerCBInfo *info = opaque;
+    STMP3770USBState *s = info->s;
+    unsigned int idx = info->idx;
+
+    s->usbsts |= USBSTS_GPTIMER0 << idx;
+    if (!(s->gptimer[idx] & GPTIMER_REPEAT)) {
+        s->gptimer[idx] &= ~GPTIMER_RUN;
+    }
+    usb_update_irq(s);
 }
 
 static void usb_controller_reset(STMP3770USBState *s)
@@ -140,7 +184,14 @@ static void usb_controller_reset(STMP3770USBState *s)
     s->endptcomplete = 0;
     memset(s->endptctrl, 0, sizeof(s->endptctrl));
     s->endptctrl[0] = USBCTRL_ENDPTCTRL0_RESET;
+    memset(s->gptimer_load, 0, sizeof(s->gptimer_load));
     memset(s->gptimer, 0, sizeof(s->gptimer));
+    for (unsigned int i = 0; i < 2; i++) {
+        ptimer_transaction_begin(s->gptimer_ptimer[i]);
+        ptimer_stop(s->gptimer_ptimer[i]);
+        ptimer_set_limit(s->gptimer_ptimer[i], 0, 1);
+        ptimer_transaction_commit(s->gptimer_ptimer[i]);
+    }
 }
 
 static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
@@ -193,10 +244,19 @@ static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
         return USBCTRL_HWRXBUF_RESET;
     case REG_GPTIMER0LD:
     case REG_GPTIMER1LD:
-        return 0;
+        return s->gptimer_load[(offset - REG_GPTIMER0LD) / 8];
     case REG_GPTIMER0CTRL:
     case REG_GPTIMER1CTRL:
-        return s->gptimer[(offset - REG_GPTIMER0CTRL) / 8];
+    {
+        unsigned int idx = (offset - REG_GPTIMER0CTRL) / 8;
+        uint32_t count;
+
+        ptimer_transaction_begin(s->gptimer_ptimer[idx]);
+        count = ptimer_get_count(s->gptimer_ptimer[idx]);
+        ptimer_transaction_commit(s->gptimer_ptimer[idx]);
+        return (s->gptimer[idx] & (GPTIMER_RUN | GPTIMER_REPEAT)) |
+               ((count ? count - 1 : 0) & GPTIMER_COUNT_MASK);
+    }
     case REG_SBUSCFG:
         return 0;
     case REG_HCSPARAMS:
@@ -279,8 +339,7 @@ static void usb_write(void *opaque, hwaddr offset,
         break;
     case REG_USBSTS:
         /* Write-1-to-clear */
-        s->usbsts &= ~((uint32_t)value & (USBSTS_UI | USBSTS_UEI |
-                                               USBSTS_PCI | USBSTS_URI));
+        s->usbsts &= ~((uint32_t)value & USBSTS_W1C_MASK);
         usb_update_irq(s);
         break;
     case REG_USBINTR:
@@ -355,10 +414,23 @@ static void usb_write(void *opaque, hwaddr offset,
         s->endptctrl[(offset - REG_ENDPTCTRL0) / 4] =
             (uint32_t)value & USBCTRL_ENDPTCTRLN_WRITABLE_MASK;
         break;
+    case REG_GPTIMER0LD:
+    case REG_GPTIMER1LD:
+        s->gptimer_load[(offset - REG_GPTIMER0LD) / 8] =
+            (uint32_t)value & GPTIMER_COUNT_MASK;
+        break;
     case REG_GPTIMER0CTRL:
     case REG_GPTIMER1CTRL:
-        s->gptimer[(offset - REG_GPTIMER0CTRL) / 8] = (uint32_t)value;
+    {
+        unsigned int idx = (offset - REG_GPTIMER0CTRL) / 8;
+        uint32_t control = (uint32_t)value;
+        bool reload = (control & GPTIMER_RESET) != 0;
+
+        s->gptimer[idx] = control &
+                          (GPTIMER_CONTROL_WRITABLE_MASK & ~GPTIMER_RESET);
+        usb_gptimer_configure(s, idx, reload);
         break;
+    }
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-usb: write to unimplemented offset "
@@ -395,11 +467,22 @@ static void usb_realize(DeviceState *dev, Error **errp)
                           TYPE_STMP3770_USB, 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+}
+
+static void usb_finalize(Object *obj)
+{
+    STMP3770USBState *s = STMP3770_USB(obj);
+
+    for (unsigned int i = 0; i < 2; i++) {
+        ptimer_free(s->gptimer_ptimer[i]);
+    }
+    g_free(s->gptimer_cb_info);
 }
 
 static const VMStateDescription vmstate_usb = {
     .name = "stmp3770-usb",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(usbcmd, STMP3770USBState),
@@ -425,7 +508,11 @@ static const VMStateDescription vmstate_usb = {
         VMSTATE_UINT32(endptcomplete, STMP3770USBState),
         VMSTATE_UINT32_ARRAY(endptctrl, STMP3770USBState,
                              STMP3770_USB_MIGRATION_ENDPOINTS),
+        VMSTATE_UINT32_ARRAY_V(gptimer_load, STMP3770USBState, 2, 4),
         VMSTATE_UINT32_ARRAY(gptimer, STMP3770USBState, 2),
+        VMSTATE_ARRAY_OF_POINTER_TO_STRUCT(gptimer_ptimer,
+                                           STMP3770USBState, 2, 4,
+                                           vmstate_ptimer, ptimer_state),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -434,6 +521,19 @@ static void usb_init(Object *obj)
 {
     STMP3770USBState *s = STMP3770_USB(obj);
 
+    s->gptimer_cb_info = g_new0(STMP3770USBGPTimerCBInfo, 2);
+    for (unsigned int i = 0; i < 2; i++) {
+        s->gptimer_cb_info[i].s = s;
+        s->gptimer_cb_info[i].idx = i;
+        s->gptimer_ptimer[i] = ptimer_init(usb_gptimer_tick,
+                                           &s->gptimer_cb_info[i],
+                                           PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                           PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+        ptimer_transaction_begin(s->gptimer_ptimer[i]);
+        ptimer_set_freq(s->gptimer_ptimer[i], 1000000);
+        ptimer_set_limit(s->gptimer_ptimer[i], 0, 1);
+        ptimer_transaction_commit(s->gptimer_ptimer[i]);
+    }
     usb_controller_reset(s);
 }
 
@@ -451,6 +551,7 @@ static const TypeInfo usb_type_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770USBState),
     .instance_init = usb_init,
+    .instance_finalize = usb_finalize,
     .class_init    = usb_class_init,
 };
 
