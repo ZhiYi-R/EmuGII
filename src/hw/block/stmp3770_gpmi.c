@@ -878,19 +878,29 @@ static void gpmi_write(void *opaque, hwaddr offset,
         }
         break;
     case GPMI_COMPARE:
-        s->compare = (uint32_t)value;
+        if (offset == GPMI_COMPARE) {
+            s->compare = (uint32_t)value;
+        }
         break;
     case GPMI_ECCCTRL:
-        s->eccctrl = (uint32_t)value;
+        gpmi_apply_sct(&s->eccctrl,
+                       (uint32_t)value & GPMI_ECCCTRL_WRITABLE_MASK, sct);
+        s->eccctrl &= GPMI_ECCCTRL_WRITABLE_MASK;
         break;
     case GPMI_ECCCOUNT:
-        s->ecccount = (uint32_t)value;
+        if (offset == GPMI_ECCCOUNT) {
+            s->ecccount = (uint32_t)value & GPMI_ECCCOUNT_COUNT_MASK;
+        }
         break;
     case GPMI_PAYLOAD:
-        s->payload = (uint32_t)value;
+        if (offset == GPMI_PAYLOAD) {
+            s->payload = (uint32_t)value & GPMI_BUFFER_ADDRESS_MASK;
+        }
         break;
     case GPMI_AUXILIARY:
-        s->auxiliary = (uint32_t)value;
+        if (offset == GPMI_AUXILIARY) {
+            s->auxiliary = (uint32_t)value & GPMI_BUFFER_ADDRESS_MASK;
+        }
         break;
     case GPMI_CTRL1:
         gpmi_write_ctrl1(s, (uint32_t)value, sct);

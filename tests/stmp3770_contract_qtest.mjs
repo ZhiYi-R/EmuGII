@@ -2089,6 +2089,69 @@ async function testGpmiCtrl1Contract() {
   });
 }
 
+async function testGpmiEccRegisterContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(GPMI_BASE + 0x020, 0xffffffff);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x020),
+      0xffff71ff,
+      'GPMI ECCCTRL must retain only HANDLE, ECC_CMD, ENABLE_ECC, and BUFFER_MASK',
+    );
+    await machine.writel(GPMI_BASE + 0x028, 0x00005001);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x020),
+      0xffff21fe,
+      'GPMI ECCCTRL_CLR must clear documented fields',
+    );
+    await machine.writel(GPMI_BASE + 0x02c, 0x00002002);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x020),
+      0xffff01fc,
+      'GPMI ECCCTRL_TOG must toggle documented fields',
+    );
+
+    await machine.writel(GPMI_BASE + 0x010, 0x12345678);
+    for (const offset of [0x014, 0x018, 0x01c]) {
+      await machine.writel(GPMI_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(GPMI_BASE + 0x010),
+        0x12345678,
+        `GPMI COMPARE must not decode an undocumented alias at 0x${offset.toString(16)}`,
+      );
+    }
+
+    await machine.writel(GPMI_BASE + 0x030, 0xffff1234);
+    for (const offset of [0x034, 0x038, 0x03c]) {
+      await machine.writel(GPMI_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(GPMI_BASE + 0x030),
+        0x00001234,
+        `GPMI ECCCOUNT must retain only its documented count and reject alias 0x${offset.toString(16)}`,
+      );
+    }
+
+    await machine.writel(GPMI_BASE + 0x040, 0x12345679);
+    for (const offset of [0x044, 0x048, 0x04c]) {
+      await machine.writel(GPMI_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(GPMI_BASE + 0x040),
+        0x12345678,
+        `GPMI PAYLOAD must remain word-aligned and reject alias 0x${offset.toString(16)}`,
+      );
+    }
+
+    await machine.writel(GPMI_BASE + 0x050, 0xcafebabf);
+    for (const offset of [0x054, 0x058, 0x05c]) {
+      await machine.writel(GPMI_BASE + offset, 0xffffffff);
+      assert.equal(
+        await machine.readl(GPMI_BASE + 0x050),
+        0xcafebabc,
+        `GPMI AUXILIARY must remain word-aligned and reject alias 0x${offset.toString(16)}`,
+      );
+    }
+  });
+}
+
 async function testOnChipRomAndSramMirrorContract() {
   await withMachine(async (machine) => {
     await machine.writel(SRAM_BASE + 0x1234, 0x11223344);
@@ -3912,6 +3975,7 @@ const tests = [
   ['SSP DATA empty read contract', testSspDataEmptyReadContract],
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
+  ['GPMI ECC register contract', testGpmiEccRegisterContract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],
   ['DCP channel register map contract', testDcpChannelRegisterMapContract],
