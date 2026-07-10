@@ -1650,6 +1650,13 @@ async function testUsbEndpointRegisterContract() {
       0x001f001f,
       'USBCTRL ENDPTNAKEN must retain only RX/TX endpoint bits 0 through 4',
     );
+
+    await machine.writel(USB_BASE + 0x164, 0xffffffff);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x164),
+      0x003f007f,
+      'USBCTRL TXFILLTUNING must hide reserved bits and clear TXSCHHEALTH writes',
+    );
     await machine.writel(USB_BASE + 0x1d4, 0xffffffff);
     assert.equal(
       await machine.readl(USB_BASE + 0x1d4),

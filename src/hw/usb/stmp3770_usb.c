@@ -87,6 +87,7 @@
 #define USBCTRL_ENDPTLISTADDR_WRITABLE_MASK 0xFFFFF800
 #define USBCTRL_TTCTRL_WRITABLE_MASK    0x7F000000
 #define USBCTRL_BURSTSIZE_WRITABLE_MASK 0x0000FFFF
+#define USBCTRL_TXFILLTUNING_WRITABLE_MASK 0x003F007F
 #define USBCTRL_USBMODE_WRITABLE_MASK   0x0000003F
 #define USBCTRL_ENDPOINT_BITMAP_MASK     0x001F001F
 #define USBCTRL_ENDPTSETUP_MASK          0x0000001F
@@ -364,7 +365,7 @@ static void usb_write(void *opaque, hwaddr offset,
         s->burstsize = (uint32_t)value & USBCTRL_BURSTSIZE_WRITABLE_MASK;
         break;
     case REG_TXFILLTUNING:
-        s->txfilltuning = (uint32_t)value;
+        s->txfilltuning = (uint32_t)value & USBCTRL_TXFILLTUNING_WRITABLE_MASK;
         break;
     case REG_ENDPTNAK:
         /* Write-1-to-clear */
