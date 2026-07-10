@@ -206,20 +206,23 @@ static void stmp3770_rtc_tick(void *opaque)
 {
     STMP3770RTCState *s = STMP3770_RTC(opaque);
 
+    s->analog_msec_phase++;
+    if (s->analog_msec_phase == 1000) {
+        s->analog_msec_phase = 0;
+        s->analog_seconds++;
+        if (stmp3770_rtc_enabled(s)) {
+            s->seconds = s->analog_seconds;
+            stmp3770_rtc_check_alarm(s);
+        }
+    }
+
     if (!stmp3770_rtc_enabled(s)) {
         return;
     }
-
     s->milliseconds++;
 
     if (s->ctrl & CTRL_ONEMSEC_IRQ_EN) {
         s->ctrl |= CTRL_ONEMSEC_IRQ;
-    }
-
-    if ((s->milliseconds % 1000) == 0) {
-        s->seconds++;
-        s->analog_seconds = s->seconds;
-        stmp3770_rtc_check_alarm(s);
     }
 
     if (s->ctrl & CTRL_ONEMSEC_IRQ_EN) {
@@ -276,11 +279,7 @@ static void stmp3770_rtc_apply_write(uint32_t *reg, uint32_t mask,
 static void stmp3770_rtc_rearm(STMP3770RTCState *s)
 {
     ptimer_transaction_begin(s->tick);
-    if (stmp3770_rtc_enabled(s)) {
-        ptimer_run(s->tick, 0);
-    } else {
-        ptimer_stop(s->tick);
-    }
+    ptimer_run(s->tick, 0);
     ptimer_transaction_commit(s->tick);
 }
 
@@ -473,6 +472,7 @@ static void stmp3770_rtc_reset(DeviceState *dev)
         s->analog_alarm = 0;
         memset(s->analog_persistent, 0, sizeof(s->analog_persistent));
         s->analog_persistent[0] = 0x100;
+        s->analog_msec_phase = 0;
         s->analog_initialized = true;
     }
     s->copy_to_shadow = 0;
@@ -481,6 +481,7 @@ static void stmp3770_rtc_reset(DeviceState *dev)
     s->version = 0x02000000; /* RTC Block v2.0 */
     stmp3770_rtc_queue_shadow_refresh(s);
     s->ctrl &= ~CTRL_FORCE_UPDATE;
+    stmp3770_rtc_rearm(s);
     stmp3770_rtc_update_irq(s);
 }
 
@@ -526,13 +527,16 @@ static int stmp3770_rtc_post_load(void *opaque, int version_id)
     if (version_id < 3) {
         s->analog_initialized = true;
     }
+    if (version_id < 4) {
+        s->analog_msec_phase = s->milliseconds % 1000;
+    }
     stmp3770_rtc_rearm_copy_timer(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_stmp3770_rtc = {
     .name = TYPE_STMP3770_RTC,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = stmp3770_rtc_post_load,
     .fields = (const VMStateField[]) {
@@ -552,6 +556,7 @@ static const VMStateDescription vmstate_stmp3770_rtc = {
         VMSTATE_UINT32_ARRAY_V(analog_persistent, STMP3770RTCState,
                                STMP3770_RTC_NUM_PERSISTENT, 2),
         VMSTATE_BOOL_V(analog_initialized, STMP3770RTCState, 3),
+        VMSTATE_UINT16_V(analog_msec_phase, STMP3770RTCState, 4),
         VMSTATE_UINT8_V(copy_to_shadow, STMP3770RTCState, 2),
         VMSTATE_UINT8_V(copy_to_analog, STMP3770RTCState, 2),
         VMSTATE_TIMER_PTR_V(copy_timer, STMP3770RTCState, 2),

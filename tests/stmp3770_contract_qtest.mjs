@@ -404,6 +404,26 @@ async function testRtcAnalogStateSurvivesChipReset() {
   });
 }
 
+async function testRtcAnalogSecondsRunWhileDigitalClockGated() {
+  await withMachine(async (machine) => {
+    await machine.clockStep(3_000_000);
+    await machine.writel(RTC_BASE + 0x030, 0);
+    await machine.clockStep(3_000_000);
+
+    await machine.writel(RTC_BASE + 0x004, 0x40000000);
+    await machine.clockStep(1_000_000_000);
+    await machine.writel(RTC_BASE + 0x008, 0x40000000);
+    await machine.writel(RTC_BASE + 0x004, 0x00000020);
+    await machine.clockStep(3_000_000);
+
+    assert.equal(
+      await machine.readl(RTC_BASE + 0x030),
+      1,
+      'RTC analog seconds must continue while the digital clock is gated and refresh after it is enabled',
+    );
+  });
+}
+
 async function testTimrotTickAndUpdateContract() {
   await withMachine(async (machine) => {
     await machine.writel(TIMROT_BASE + 0x008, 0xc0000000);
@@ -2106,6 +2126,7 @@ const tests = [
   ['RTC alarm wake contract', testRtcAlarmWakeContract],
   ['RTC suppress copy-to-analog contract', testRtcSuppressCopyToAnalogContract],
   ['RTC analog state survives chip reset', testRtcAnalogStateSurvivesChipReset],
+  ['RTC analog seconds run while digital clock gated', testRtcAnalogSecondsRunWhileDigitalClockGated],
   ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
   ['I2C register contract', testI2cRegisterContract],
