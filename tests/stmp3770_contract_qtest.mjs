@@ -223,6 +223,23 @@ async function testRtc1MsecIrq() {
   });
 }
 
+async function testRtcResetAndPersistent0Contract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(RTC_BASE + 0x010),
+      0xe0ff0000,
+      'RTC STAT reset must expose presence flags and all eight stale shadow registers',
+    );
+
+    await machine.writel(RTC_BASE + 0x064, 0x80030000);
+    assert.equal(
+      await machine.readl(RTC_BASE + 0x060),
+      0x80030100,
+      'RTC PERSISTENT0 SET must retain SPARE_ANALOG, AUTO_RESTART, and DISABLE_PSWITCH',
+    );
+  });
+}
+
 async function testPwmRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -1624,6 +1641,7 @@ async function testOcotpLockAndShadowContract() {
 
 const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
+  ['RTC reset and persistent0 contract', testRtcResetAndPersistent0Contract],
   ['PWM register contract', testPwmRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],

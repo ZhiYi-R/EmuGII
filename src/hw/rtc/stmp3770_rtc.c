@@ -83,14 +83,7 @@
 #define PERSISTENT0_ALARM_EN        (1U << 2)
 #define PERSISTENT0_ALARM_WAKE_EN   (1U << 1)
 #define PERSISTENT0_CLOCKSOURCE     (1U << 0)
-#define PERSISTENT0_WRITABLE_MASK   (0xFF80U | PERSISTENT0_ALARM_WAKE | \
-                                     PERSISTENT0_XTAL32_FREQ | \
-                                     PERSISTENT0_XTAL32KHZ_PWRUP | \
-                                     PERSISTENT0_XTAL24MHZ_PWRUP | \
-                                     PERSISTENT0_LCK_SECS | \
-                                     PERSISTENT0_ALARM_EN | \
-                                     PERSISTENT0_ALARM_WAKE_EN | \
-                                     PERSISTENT0_CLOCKSOURCE)
+#define PERSISTENT0_WRITABLE_MASK   0xFFFFFFFFU
 
 static inline bool stmp3770_rtc_enabled(STMP3770RTCState *s)
 {
@@ -369,7 +362,7 @@ static void stmp3770_rtc_reset(DeviceState *dev)
     ptimer_transaction_commit(s->tick);
 
     s->ctrl = CTRL_SFTRST | CTRL_CLKGATE | CTRL_FORCE_UPDATE;
-    s->stat = 0;
+    s->stat = STAT_STALE_REGS_MASK << STAT_STALE_REGS_SHIFT;
     s->milliseconds = 0;
     s->seconds = 0;
     s->alarm = 0;
