@@ -110,6 +110,7 @@ def apply_patches(target, source, env):
 
     files_to_copy = [
         ('src/include/hw/arm/stmp3770.h', 'include/hw/arm/stmp3770.h'),
+        ('src/include/hw/arm/stmp3770_uartdbg.h', 'include/hw/arm/stmp3770_uartdbg.h'),
         ('src/include/hw/arm/stmp3770_uartapp.h', 'include/hw/arm/stmp3770_uartapp.h'),
         ('src/include/hw/audio/stmp3770_audio.h', 'include/hw/audio/stmp3770_audio.h'),
         ('src/include/hw/display/stmp3770_lcdif.h', 'include/hw/display/stmp3770_lcdif.h'),
@@ -133,6 +134,7 @@ def apply_patches(target, source, env):
         ('src/include/hw/i2c/stmp3770_i2c.h', 'include/hw/i2c/stmp3770_i2c.h'),
         ('src/include/hw/ssi/stmp3770_ssp.h', 'include/hw/ssi/stmp3770_ssp.h'),
         ('src/hw/arm/stmp3770.c', 'hw/arm/stmp3770.c'),
+        ('src/hw/arm/stmp3770_uartdbg.c', 'hw/arm/stmp3770_uartdbg.c'),
         ('src/hw/arm/stmp3770_uartapp.c', 'hw/arm/stmp3770_uartapp.c'),
         ('src/hw/arm/stmp3770-board.c', 'hw/arm/stmp3770-board.c'),
         ('src/hw/audio/stmp3770_audio.c', 'hw/audio/stmp3770_audio.c'),

@@ -138,7 +138,7 @@ static void stmp3770_dig_reset(void *opaque)
     device_cold_reset(DEVICE(s->usb));
     device_cold_reset(DEVICE(s->ssp[0]));
     device_cold_reset(DEVICE(s->ssp[1]));
-    device_cold_reset(DEVICE(s->uart[0]));
+    device_cold_reset(DEVICE(s->uartdbg));
     device_cold_reset(DEVICE(s->uartapp));
     device_cold_reset(DEVICE(s));
 }
@@ -255,12 +255,9 @@ static void stmp3770_init(Object *obj)
         object_unref(OBJECT(s->ssp[i]));
     }
 
-    /* Initialize UARTs */
-    for (i = 0; i < STMP3770_NUM_UARTS; i++) {
-        s->uart[i] = PL011(object_new(TYPE_PL011));
-        object_property_add_child(obj, "uart[*]", OBJECT(s->uart[i]));
-        object_unref(OBJECT(s->uart[i]));
-    }
+    s->uartdbg = STMP3770_UARTDBG(object_new(TYPE_STMP3770_UARTDBG));
+    object_property_add_child(obj, "uartdbg", OBJECT(s->uartdbg));
+    object_unref(OBJECT(s->uartdbg));
 
     s->uartapp = STMP3770_UARTAPP(object_new(TYPE_STMP3770_UARTAPP));
     object_property_add_child(obj, "uartapp", OBJECT(s->uartapp));
@@ -534,11 +531,11 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
 
     /* Realize UARTs */
     /* Debug UART at 0x80070000 */
-    if (!sysbus_realize(SYS_BUS_DEVICE(s->uart[0]), errp)) {
+    if (!sysbus_realize(SYS_BUS_DEVICE(s->uartdbg), errp)) {
         return;
     }
-    sysbus_mmio_map(SYS_BUS_DEVICE(s->uart[0]), 0, STMP3770_DBGUART_ADDR);
-    sysbus_connect_irq(SYS_BUS_DEVICE(s->uart[0]), 0,
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->uartdbg), 0, STMP3770_DBGUART_ADDR);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->uartdbg), 0,
                        qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_DBGUART));
 
     /* Application UART at 0x8006C000 */

@@ -2,7 +2,7 @@ diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
 index 2aa4b5d..ce8f427 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -524,6 +524,46 @@
+@@ -524,6 +524,45 @@
      select WDT_IMX2
      select LAN9118
 
@@ -11,7 +11,6 @@ index 2aa4b5d..ce8f427 100644
 +    default y
 +    depends on TCG && ARM
 +    select SERIAL_MM
-+    select PL011
 +    select PTIMER
 +    select UNIMP
 +    select STMP3770_APBH_DMA

@@ -26,6 +26,7 @@ const PWM_BASE = 0x80064000;
 const TIMROT_BASE = 0x80068000;
 const I2C_BASE = 0x80058000;
 const APPUART_BASE = 0x8006c000;
+const DBGUART_BASE = 0x80070000;
 
 class QTestMachine {
   constructor(port) {
@@ -644,6 +645,54 @@ async function testAppUartRegisterContract() {
       await machine.readl(APPUART_BASE + 0x000),
       0xc0030000,
       'UARTAPP SFTRST must restore the block reset state and gate clocks',
+    );
+  });
+}
+
+async function testDebugUartRegisterContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x030),
+      0x00000300,
+      'UARTDBG CR must reset with RXE and TXE asserted',
+    );
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x034),
+      0x00000012,
+      'UARTDBG IFLS must reset both FIFO levels to half',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x030, 0xffffffff);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x030),
+      0x0000ffc7,
+      'UARTDBG CR must reject unavailable and reserved bits',
+    );
+    await machine.writel(DBGUART_BASE + 0x034, 0xffffffff);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x034),
+      0x0000003f,
+      'UARTDBG IFLS must expose only RX/TX FIFO level fields',
+    );
+    await machine.writel(DBGUART_BASE + 0x038, 0xffffffff);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x038),
+      0x000007ff,
+      'UARTDBG IMSC must expose only documented interrupt masks',
+    );
+    await machine.writel(DBGUART_BASE + 0x048, 0xffffffff);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x048),
+      0x00000007,
+      'UARTDBG DMACR must expose only RXDMAE, TXDMAE, and DMAONERR',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x030, 0x00000381);
+    await machine.writel(DBGUART_BASE + 0x000, 0x0000005a);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x000),
+      0x0000005a,
+      'UARTDBG LBE must feed normal-mode transmitted data back to the receive FIFO',
     );
   });
 }
@@ -1985,6 +2034,7 @@ const tests = [
   ['PWM register contract', testPwmRegisterContract],
   ['I2C register contract', testI2cRegisterContract],
   ['Application UART register contract', testAppUartRegisterContract],
+  ['Debug UART register contract', testDebugUartRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],

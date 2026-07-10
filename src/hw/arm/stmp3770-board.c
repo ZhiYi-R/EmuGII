@@ -127,7 +127,7 @@ static void stmp3770_board_init(MachineState *machine)
         chr = qemu_chr_new("stdio", "stdio", NULL);
     }
     if (chr) {
-        qdev_prop_set_chr(DEVICE(s->soc.uart[0]), "chardev", chr);
+        qdev_prop_set_chr(DEVICE(s->soc.uartdbg), "chardev", chr);
     }
 
     /* Connect NAND drive to GPMI if one was provided with -drive if=none */
@@ -158,10 +158,10 @@ static void stmp3770_board_init(MachineState *machine)
      * Based on ExistOS-For-HP39GII BSP analysis.
      */
 
-    /* 1. Pre-configure Debug UART (PL011)
+    /* 1. Pre-configure Debug UART
      *
      * ExistOS Uart::init() is a no-op because Boot ROM already configured UART.
-     * PL011 Control Register (UARTCR) @ offset 0x30:
+     * UARTDBG Control Register (UARTDBGCR) @ offset 0x30:
      *   Bit 0: UARTEN (UART enable)
      *   Bit 8: TXE (transmit enable)
      *   Bit 9: RXE (receive enable)
@@ -169,7 +169,7 @@ static void stmp3770_board_init(MachineState *machine)
     {
         uint32_t uartcr_val = (1 << 0) | (1 << 8) | (1 << 9);
         MemoryRegion *uart_mr = sysbus_mmio_get_region(
-            SYS_BUS_DEVICE(s->soc.uart[0]), 0);
+            SYS_BUS_DEVICE(s->soc.uartdbg), 0);
         memory_region_dispatch_write(uart_mr, 0x30, uartcr_val,
                                       MO_32, MEMTXATTRS_UNSPECIFIED);
     }

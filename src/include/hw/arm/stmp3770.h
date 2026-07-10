@@ -20,7 +20,7 @@
 #include "target/arm/cpu.h"
 #include "qom/object.h"
 #include "hw/sysbus.h"
-#include "hw/char/pl011.h"
+#include "hw/arm/stmp3770_uartdbg.h"
 #include "hw/arm/stmp3770_uartapp.h"
 #include "hw/audio/stmp3770_audio.h"
 #include "hw/display/stmp3770_lcdif.h"
@@ -45,7 +45,6 @@
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770State, STMP3770)
 
 /* Number of peripheral instances */
-#define STMP3770_NUM_UARTS       1
 #define STMP3770_NUM_TIMERS      4
 #define STMP3770_NUM_SSPS        2
 #define STMP3770_NUM_GPIO_BANKS  4
@@ -75,8 +74,7 @@ struct STMP3770State {
     /* Pin control and GPIO - PINCTRL */
     STMP3770PINCTRLState *pinctrl;
 
-    /* Debug UART uses the PL011-compatible register interface. */
-    PL011State *uart[STMP3770_NUM_UARTS];
+    STMP3770UARTDebugState *uartdbg;
     STMP3770UARTAppState *uartapp;
 
     /* Timers and rotary decoder - TIMROT */
