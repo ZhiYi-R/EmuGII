@@ -164,6 +164,7 @@ struct STMP3770DIGCTLState {
     uint32_t hclkcount;
     uint32_t hclk_hz;
     uint64_t hclkcount_base_ns;
+    uint64_t hclkcount_remainder;
 
     /* OCRAM BIST */
     uint32_t ocram_bist_csr;
@@ -219,19 +220,20 @@ static void digctl_write_masked(uint32_t *target, uint32_t value,
     *target = (*target & ~writable_mask) | next;
 }
 
-static uint64_t digctl_elapsed_hclk_cycles(uint64_t elapsed_ns, uint32_t hclk_hz)
-{
-    return elapsed_ns / NANOSECONDS_PER_SECOND * hclk_hz +
-           elapsed_ns % NANOSECONDS_PER_SECOND * hclk_hz /
-           NANOSECONDS_PER_SECOND;
-}
-
 static void digctl_hclkcount_sync(STMP3770DIGCTLState *s)
 {
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t elapsed_ns = now - s->hclkcount_base_ns;
+    uint64_t hclk_cycles;
 
-    s->hclkcount += digctl_elapsed_hclk_cycles(now - s->hclkcount_base_ns,
-                                                s->hclk_hz);
+    hclk_cycles = elapsed_ns / NANOSECONDS_PER_SECOND * s->hclk_hz +
+                  (elapsed_ns % NANOSECONDS_PER_SECOND * s->hclk_hz +
+                   s->hclkcount_remainder) / NANOSECONDS_PER_SECOND;
+    s->hclkcount_remainder =
+        (elapsed_ns % NANOSECONDS_PER_SECOND * s->hclk_hz +
+         s->hclkcount_remainder) % NANOSECONDS_PER_SECOND;
+
+    s->hclkcount += hclk_cycles;
     s->hclkcount_base_ns = now;
 }
 
@@ -668,6 +670,7 @@ static void stmp3770_digctl_reset(DeviceState *dev)
     s->hclkcount = 0;
     s->hclk_hz = 24000000;
     s->hclkcount_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->hclkcount_remainder = 0;
 
     s->ocram_bist_csr = 0;
     memset(s->ocram_status, 0, sizeof(s->ocram_status));
@@ -709,7 +712,7 @@ static void stmp3770_digctl_init(Object *obj)
 
 static const VMStateDescription vmstate_stmp3770_digctl = {
     .name = TYPE_STMP3770_DIGCTL,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770DIGCTLState),
@@ -727,6 +730,7 @@ static const VMStateDescription vmstate_stmp3770_digctl = {
         VMSTATE_UINT32(hclkcount, STMP3770DIGCTLState),
         VMSTATE_UINT32(hclk_hz, STMP3770DIGCTLState),
         VMSTATE_UINT64(hclkcount_base_ns, STMP3770DIGCTLState),
+        VMSTATE_UINT64_V(hclkcount_remainder, STMP3770DIGCTLState, 4),
         VMSTATE_UINT32(ocram_bist_csr, STMP3770DIGCTLState),
         VMSTATE_UINT32_ARRAY(ocram_status, STMP3770DIGCTLState, 14),
         VMSTATE_UINT32_ARRAY(scratch, STMP3770DIGCTLState, 2),

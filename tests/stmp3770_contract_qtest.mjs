@@ -913,6 +913,23 @@ async function testDigctlHclkCountContract() {
       `DIGCTL HCLKCOUNT must advance once per 24 MHz HCLK edge: start=0x${hclkStart.toString(16)}, end=0x${hclkAt24Mhz.toString(16)}`,
     );
 
+    const hclkBeforeFractionalReads = await machine.readl(DIGCTL_BASE + 0x020);
+    await machine.clockStep(20);
+    const hclkAfterFirstFractionalRead = await machine.readl(DIGCTL_BASE + 0x020);
+    await machine.clockStep(22);
+    const hclkAfterSecondFractionalRead = await machine.readl(DIGCTL_BASE + 0x020);
+
+    assert.equal(
+      (hclkAfterFirstFractionalRead - hclkBeforeFractionalReads) >>> 0,
+      0,
+      'DIGCTL HCLKCOUNT must not increment before a 24 MHz HCLK edge',
+    );
+    assert.equal(
+      (hclkAfterSecondFractionalRead - hclkBeforeFractionalReads) >>> 0,
+      1,
+      'DIGCTL HCLKCOUNT must retain fractional time across reads until an HCLK edge occurs',
+    );
+
     await machine.writel(CLKCTRL_BASE + 0x030, 0x00000002);
     const hclkBeforeDivide = await machine.readl(DIGCTL_BASE + 0x020);
     await machine.clockStep(1_000);
