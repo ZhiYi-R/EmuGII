@@ -170,6 +170,17 @@ class QTestMachine {
     assert.equal(resp, 'OK', `Unexpected writel response: ${resp}`);
   }
 
+  async readb(addr) {
+    const resp = await this.cmd(`readb 0x${addr.toString(16)}`);
+    assert.match(resp, /^OK 0x[0-9a-fA-F]+$/, `Unexpected readb response: ${resp}`);
+    return Number(BigInt(resp.split(' ')[1]));
+  }
+
+  async writeb(addr, value) {
+    const resp = await this.cmd(`writeb 0x${addr.toString(16)} 0x${value.toString(16)}`);
+    assert.equal(resp, 'OK', `Unexpected writeb response: ${resp}`);
+  }
+
   async clockStep(ns) {
     const resp = ns === undefined
       ? await this.cmd('clock_step')
@@ -1181,6 +1192,46 @@ async function testLcdifRegisterMapContract() {
       await machine.readl(LCDIF_BASE + 0x030),
       0x3f3803ff,
       'LCDIF VDCTRL0 SET alias must operate only on documented fields',
+    );
+  });
+}
+
+async function testLcdifClockGateContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
+    await machine.writel(LCDIF_BASE + 0x004, 0x40000000);
+    assert.notEqual(
+      (await machine.readl(LCDIF_BASE + 0x000)) & 0x40000000,
+      0,
+      'LCDIF CLKGATE must remain set when SFTRST is clear',
+    );
+
+    await machine.writel(LCDIF_BASE + 0x004, 0x80000000);
+    await machine.writel(LCDIF_BASE + 0x008, 0x80000000);
+    assert.notEqual(
+      (await machine.readl(LCDIF_BASE + 0x000)) & 0x40000000,
+      0,
+      'LCDIF clearing SFTRST must not implicitly clear a separately gated clock',
+    );
+  });
+}
+
+async function testLcdifDataAccessContract() {
+  await withMachine(async (machine) => {
+    const ctrl = 0x00030001;
+
+    await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
+    await machine.writel(LCDIF_BASE + 0x000, ctrl);
+    await machine.writeb(LCDIF_BASE + 0x0b0, 0xdb);
+    assert.equal(
+      (await machine.readl(LCDIF_BASE + 0x000)) & 0x00010000,
+      0,
+      'LCDIF byte DATA write must consume COUNT and clear RUN at transfer completion',
+    );
+    assert.equal(
+      await machine.readb(LCDIF_BASE + 0x0b0),
+      0x80,
+      'LCDIF DATA must support byte reads from the selected panel register',
     );
   });
 }
@@ -2521,6 +2572,8 @@ const tests = [
   ['Debug UART register contract', testDebugUartRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['LCDIF register map contract', testLcdifRegisterMapContract],
+  ['LCDIF clock gate contract', testLcdifClockGateContract],
+  ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],
   ['ICOLL vector acknowledge contract', testIcollVectorAcknowledgeContract],

@@ -1176,14 +1176,38 @@ static void lcdif_apply_sct(uint32_t *reg, uint32_t value, int sct)
     }
 }
 
+static void lcdif_consume_data_words(STMP3770LCDIFState *s, size_t bytes)
+{
+    unsigned int words;
+    uint32_t count;
+
+    if (!(s->ctrl0 & CTRL0_RUN) || (s->ctrl0 & CTRL0_BYPASS_COUNT)) {
+        return;
+    }
+
+    words = (s->ctrl0 & CTRL0_WORD_LENGTH) ? bytes : DIV_ROUND_UP(bytes, 2);
+    count = s->ctrl0 & CTRL0_COUNT_MASK;
+    if (words >= count) {
+        s->ctrl0 &= ~(CTRL0_RUN | CTRL0_COUNT_MASK);
+    } else {
+        s->ctrl0 = (s->ctrl0 & ~CTRL0_COUNT_MASK) | (count - words);
+    }
+}
+
 static uint64_t lcdif_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770LCDIFState *s = opaque;
 
-    if (size != 4) {
+    if (offset != REG_DATA && size != 4) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-lcdif: unsupported read size %u at offset "
                       HWADDR_FMT_plx "\n", size, offset);
+        return 0;
+    }
+    if (offset == REG_DATA && size != 1 && size != 2 && size != 4) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-lcdif: unsupported data read size %u\n",
+                      size);
         return 0;
     }
 
@@ -1213,11 +1237,15 @@ static uint64_t lcdif_read(void *opaque, hwaddr offset, unsigned size)
     case REG_DATA:
     {
         uint8_t data[4];
-        lcdif_panel_read(s, data, sizeof(data));
-        return (uint32_t)data[0] |
-               ((uint32_t)data[1] << 8) |
-               ((uint32_t)data[2] << 16) |
-               ((uint32_t)data[3] << 24);
+        uint32_t value = 0;
+        unsigned int i;
+
+        lcdif_panel_read(s, data, size);
+        lcdif_consume_data_words(s, size);
+        for (i = 0; i < size; i++) {
+            value |= (uint32_t)data[i] << (i * 8);
+        }
+        return value;
     }
     case REG_STAT:
         return STAT_RESET_VALUE;
@@ -1240,10 +1268,16 @@ static void lcdif_write(void *opaque, hwaddr offset,
     int sct = (offset >> 2) & 3;
     hwaddr base = offset & ~0xC;
 
-    if (size != 4) {
+    if (offset != REG_DATA && size != 4) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-lcdif: unsupported write size %u at offset "
                       HWADDR_FMT_plx "\n", size, offset);
+        return;
+    }
+    if (offset == REG_DATA && size != 1 && size != 2 && size != 4) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "stmp3770-lcdif: unsupported data write size %u\n",
+                      size);
         return;
     }
 
@@ -1256,8 +1290,6 @@ static void lcdif_write(void *opaque, hwaddr offset,
          */
         if (s->ctrl0 & CTRL0_SFTRST) {
             s->ctrl0 |= CTRL0_CLKGATE;
-        } else {
-            s->ctrl0 &= ~CTRL0_CLKGATE;
         }
         return;
     }
@@ -1322,12 +1354,13 @@ static void lcdif_write(void *opaque, hwaddr offset,
     {
         uint8_t data[4];
         bool data_select = (s->ctrl0 & CTRL0_DATA_SELECT) != 0;
+        unsigned int i;
 
-        data[0] = value & 0xFF;
-        data[1] = (value >> 8) & 0xFF;
-        data[2] = (value >> 16) & 0xFF;
-        data[3] = (value >> 24) & 0xFF;
-        lcdif_panel_write(s, data, sizeof(data), data_select);
+        for (i = 0; i < size; i++) {
+            data[i] = value >> (i * 8);
+        }
+        lcdif_panel_write(s, data, size, data_select);
+        lcdif_consume_data_words(s, size);
         break;
     }
     case REG_STAT:
@@ -1365,11 +1398,13 @@ static int stmp3770_lcdif_dma_handler(STMP3770DMAState *dma,
 
     if (event == STMP3770_DMA_EVENT_DATA_WRITE) {
         lcdif_panel_write(s, buf, len, data_select);
+        lcdif_consume_data_words(s, len);
         return len;
     }
 
     if (event == STMP3770_DMA_EVENT_DATA_READ) {
         lcdif_panel_read(s, buf, len);
+        lcdif_consume_data_words(s, len);
         return len;
     }
 
