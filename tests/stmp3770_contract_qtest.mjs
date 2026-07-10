@@ -34,6 +34,7 @@ class QTestMachine {
     this.queue = [];
     this.waiters = [];
     this.stderr = '';
+    this.socketError = null;
     this.proc = spawn(
       qemuBinary,
       [
@@ -60,6 +61,12 @@ class QTestMachine {
     this.socket = new net.Socket();
     this.socket.setEncoding('utf8');
     this.socket.on('data', (chunk) => this.#onStdout(chunk));
+    this.socket.on('error', (err) => {
+      this.socketError = err;
+      while (this.waiters.length > 0) {
+        this.waiters.shift().reject(err);
+      }
+    });
   }
 
   #onStdout(chunk) {
@@ -100,6 +107,11 @@ class QTestMachine {
       const done = (line) => {
         clearTimeout(timer);
         resolve(line);
+      };
+
+      done.reject = (err) => {
+        clearTimeout(timer);
+        reject(new Error(`qtest socket failed: ${err.message}; stderr=${this.stderr}`));
       };
 
       this.waiters.push(done);
@@ -467,17 +479,23 @@ async function testPwmRegisterContract() {
       'PWM VERSION must be v1.1 at the documented offset',
     );
 
-    await machine.writel(PWM_BASE + 0x000, 0xffffffff);
-    assert.equal(
-      await machine.readl(PWM_BASE + 0x000),
-      0xfe00003f,
-      'PWM CTRL must preserve present bits and only store documented control bits',
-    );
-    await machine.writel(PWM_BASE + 0x008, 0xff000000);
+    await machine.writel(PWM_BASE + 0x000, 0x0000003f);
     assert.equal(
       await machine.readl(PWM_BASE + 0x000),
       0x3e00003f,
-      'PWM CTRL_CLR must only clear writable reset and gate bits, not present bits',
+      'PWM CTRL must preserve present bits and only store documented writable bits',
+    );
+    await machine.writel(PWM_BASE + 0x008, 0x0000003f);
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0x3e000000,
+      'PWM CTRL_CLR must only clear documented channel enable bits',
+    );
+    await machine.writel(PWM_BASE + 0x000, 0x80000000);
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0xfe000000,
+      'PWM SFTRST must reset the block and automatically gate its clock',
     );
 
     for (let channel = 0; channel < 5; channel += 1) {
@@ -522,6 +540,77 @@ async function testPwmRegisterContract() {
       await machine.readl(PWM_BASE + 0x100),
       0,
       'PWM must not expose the obsolete synthetic PERIOD register map',
+    );
+  });
+}
+
+async function testPwmWaveformContract() {
+  await withMachine(async (machine) => {
+    const pwm0Period = 0x004b0003;
+
+    await machine.writel(PINCTRL_BASE + 0x140, 0);
+    await machine.writel(PWM_BASE + 0x008, 0xc0000000);
+    await machine.writel(PWM_BASE + 0x010, 0x00010000);
+    await machine.writel(PWM_BASE + 0x020, pwm0Period);
+    await machine.writel(PWM_BASE + 0x004, 0x00000001);
+
+    assert.notEqual(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM0 active state must drive Bank 2 Pin 0 when muxed to PWM0 and enabled',
+    );
+    await machine.clockStep(1_400);
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM0 must enter its programmed inactive state after the ACTIVE.INACTIVE count',
+    );
+
+    await machine.writel(PWM_BASE + 0x010, 0x00000000);
+    await machine.writel(PWM_BASE + 0x020, pwm0Period);
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM0 ACTIVE/PERIOD rewrite must not take effect in the middle of a period',
+    );
+    await machine.clockStep(700);
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM0 staged parameters must remain pending until the next period boundary',
+    );
+    await machine.clockStep(700);
+    assert.notEqual(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM0 staged ACTIVE/PERIOD parameters must commit at the next period boundary',
+    );
+
+    await machine.writel(PWM_BASE + 0x004, 0x40000000);
+    await machine.clockStep(1_400);
+    assert.notEqual(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM CLKGATE must freeze the currently driven output state',
+    );
+    await machine.writel(PWM_BASE + 0x008, 0x40000000);
+    await machine.clockStep(700);
+    assert.equal(
+      (await machine.readl(PINCTRL_BASE + 0x520)) & 0x1,
+      0,
+      'PWM must resume its preserved phase after CLKGATE is cleared',
+    );
+
+    await machine.writel(PWM_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0xfe000000,
+      'PWM SFTRST must reset the block and automatically gate its clock',
+    );
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x010),
+      0,
+      'PWM SFTRST must clear staged ACTIVE state',
     );
   });
 }
@@ -2129,6 +2218,7 @@ const tests = [
   ['RTC analog seconds run while digital clock gated', testRtcAnalogSecondsRunWhileDigitalClockGated],
   ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
+  ['PWM waveform contract', testPwmWaveformContract],
   ['I2C register contract', testI2cRegisterContract],
   ['Application UART register contract', testAppUartRegisterContract],
   ['Debug UART register contract', testDebugUartRegisterContract],

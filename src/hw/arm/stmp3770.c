@@ -471,6 +471,7 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->pwm), 0, STMP3770_PWM_ADDR);
+    stmp3770_pwm_set_pinctrl(s->pwm, s->pinctrl);
 
     /* Realize LRADC controller */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->lradc), errp)) {

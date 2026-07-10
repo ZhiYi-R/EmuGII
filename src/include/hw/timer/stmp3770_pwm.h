@@ -20,11 +20,31 @@
 #define STMP3770_PWM_H
 
 #include "hw/sysbus.h"
+#include "hw/ptimer.h"
 
 #define TYPE_STMP3770_PWM "stmp3770-pwm"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770PWMState, STMP3770_PWM)
 
 #define STMP3770_PWM_NUM_CHANNELS 5
+
+typedef struct STMP3770PWMChannel {
+    ptimer_state *ptimer;
+    uint32_t latched_active;
+    uint32_t latched_period;
+    uint32_t pending_active;
+    uint32_t pending_period;
+    uint16_t counter;
+    bool pending;
+    bool latched;
+    bool running;
+} STMP3770PWMChannel;
+
+typedef struct STMP3770PWMCallbackInfo {
+    STMP3770PWMState *s;
+    uint8_t channel;
+} STMP3770PWMCallbackInfo;
+
+typedef struct STMP3770PINCTRLState STMP3770PINCTRLState;
 
 struct STMP3770PWMState {
     SysBusDevice parent_obj;
@@ -35,6 +55,12 @@ struct STMP3770PWMState {
     uint32_t period[STMP3770_PWM_NUM_CHANNELS];
     uint32_t duty[STMP3770_PWM_NUM_CHANNELS];
     uint32_t active[STMP3770_PWM_NUM_CHANNELS];
+    STMP3770PWMChannel channel[STMP3770_PWM_NUM_CHANNELS];
+    STMP3770PWMCallbackInfo cb_info[STMP3770_PWM_NUM_CHANNELS];
+    STMP3770PINCTRLState *pinctrl;
 };
+
+void stmp3770_pwm_set_pinctrl(STMP3770PWMState *s,
+                               STMP3770PINCTRLState *pinctrl);
 
 #endif /* STMP3770_PWM_H */

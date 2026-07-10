@@ -21,6 +21,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770PINCTRLState, STMP3770_PINCTRL)
 
 #define STMP3770_PINCTRL_NUM_BANKS 4
+#define STMP3770_PINCTRL_PWM_HI_Z  2
 
 struct STMP3770PINCTRLState {
     SysBusDevice parent_obj;
@@ -44,6 +45,7 @@ struct STMP3770PINCTRLState {
     uint32_t dout[4];
     uint32_t din[4];
     uint32_t doe[4];
+    uint8_t pwm_output[5];
 
     /* GPIO interrupts */
     uint32_t pin2irq[4];
@@ -61,5 +63,7 @@ struct STMP3770PINCTRLState {
 
 void stmp3770_pinctrl_set_key(STMP3770PINCTRLState *s,
                               unsigned int key, bool down);
+void stmp3770_pinctrl_set_pwm_output(STMP3770PINCTRLState *s,
+                                     unsigned int channel, uint8_t level);
 
 #endif /* STMP3770_PINCTRL_H */

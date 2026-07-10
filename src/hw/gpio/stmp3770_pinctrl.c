@@ -206,6 +206,15 @@ void stmp3770_pinctrl_set_key(STMP3770PINCTRLState *s,
     }
 }
 
+void stmp3770_pinctrl_set_pwm_output(STMP3770PINCTRLState *s,
+                                     unsigned int channel, uint8_t level)
+{
+    if (channel >= ARRAY_SIZE(s->pwm_output)) {
+        return;
+    }
+    s->pwm_output[channel] = level;
+}
+
 static inline int bank_from_offset(unsigned offset)
 {
     if (offset >= REG_DOUT0 && offset < REG_DOUT0 + 0x100) {
@@ -256,6 +265,23 @@ static void stmp3770_pinctrl_update_irq(STMP3770PINCTRLState *s)
 static uint32_t stmp3770_pinctrl_read_din(STMP3770PINCTRLState *s, int bank)
 {
     uint32_t val = s->din[bank] | (s->dout[bank] & s->doe[bank]);
+    unsigned int ch;
+
+    if (bank == 2) {
+        for (ch = 0; ch < ARRAY_SIZE(s->pwm_output); ch++) {
+            uint32_t mux = (s->muxsel[4] >> (ch * 2)) & 0x3;
+            uint32_t mask = 1U << ch;
+
+            if (mux != 0 || s->pwm_output[ch] == STMP3770_PINCTRL_PWM_HI_Z) {
+                continue;
+            }
+            if (s->pwm_output[ch]) {
+                val |= mask;
+            } else {
+                val &= ~mask;
+            }
+        }
+    }
 
     if (bank == HP39GII_KEY_COL_BANK) {
         uint32_t input_cols = HP39GII_KEY_COL_MASK & ~s->doe[bank];
@@ -323,6 +349,8 @@ static void stmp3770_pinctrl_reset(DeviceState *dev)
         s->irqstat[i] = 0;
     }
     memset(s->key_state, 0, sizeof(s->key_state));
+    memset(s->pwm_output, STMP3770_PINCTRL_PWM_HI_Z,
+           sizeof(s->pwm_output));
 
     stmp3770_pinctrl_update_irq(s);
 }
@@ -575,10 +603,22 @@ static void stmp3770_pinctrl_init(Object *obj)
     }
 }
 
+static int stmp3770_pinctrl_post_load(void *opaque, int version_id)
+{
+    STMP3770PINCTRLState *s = STMP3770_PINCTRL(opaque);
+
+    if (version_id < 2) {
+        memset(s->pwm_output, STMP3770_PINCTRL_PWM_HI_Z,
+               sizeof(s->pwm_output));
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_stmp3770_pinctrl = {
     .name = TYPE_STMP3770_PINCTRL,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = stmp3770_pinctrl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770PINCTRLState),
         VMSTATE_UINT32_ARRAY(muxsel, STMP3770PINCTRLState, 8),
@@ -587,6 +627,7 @@ static const VMStateDescription vmstate_stmp3770_pinctrl = {
         VMSTATE_UINT32_ARRAY(dout, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(din, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(doe, STMP3770PINCTRLState, 4),
+        VMSTATE_UINT8_ARRAY_V(pwm_output, STMP3770PINCTRLState, 5, 2),
         VMSTATE_UINT32_ARRAY(pin2irq, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(irqen, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(irqlevel, STMP3770PINCTRLState, 4),
