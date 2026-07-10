@@ -1321,6 +1321,18 @@ async function testLcdifIdleOnlyControlContract() {
   });
 }
 
+async function testLcdifFifoStatusContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
+    await machine.writel(LCDIF_BASE + 0x000, 0x00030004);
+    assert.equal(
+      await machine.readl(LCDIF_BASE + 0x0c0),
+      0xd4000000,
+      'LCDIF STAT must report an empty TX FIFO and asserted DMA request during an enabled write transfer',
+    );
+  });
+}
+
 async function testLcdifDataAccessContract() {
   await withMachine(async (machine) => {
     const ctrl = 0x00030001;
@@ -2683,6 +2695,7 @@ const tests = [
   ['LCDIF data swizzle contract', testLcdifDataSwizzleContract],
   ['LCDIF data shift contract', testLcdifDataShiftContract],
   ['LCDIF idle-only control contract', testLcdifIdleOnlyControlContract],
+  ['LCDIF FIFO status contract', testLcdifFifoStatusContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],

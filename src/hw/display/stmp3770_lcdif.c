@@ -158,6 +158,16 @@ static inline bool lcdif_enabled(STMP3770LCDIFState *s)
            (s->ctrl0 & CTRL0_RUN) != 0;
 }
 
+static uint32_t lcdif_status(STMP3770LCDIFState *s)
+{
+    uint32_t status = STAT_RESET_VALUE;
+
+    if (lcdif_enabled(s) && !(s->ctrl0 & CTRL0_READ_WRITEB)) {
+        status |= STAT_DMA_REQ | STAT_TXFIFO_EMPTY;
+    }
+    return status;
+}
+
 static void lcdif_update_irq(STMP3770LCDIFState *s)
 {
     bool pending = (s->irq & s->irq_en) != 0;
@@ -1416,7 +1426,7 @@ static uint64_t lcdif_read(void *opaque, hwaddr offset, unsigned size)
         return value;
     }
     case REG_STAT:
-        return STAT_RESET_VALUE;
+        return lcdif_status(s);
     case REG_VERSION:
         return LCDIF_VERSION;
     case REG_DEBUG0:
