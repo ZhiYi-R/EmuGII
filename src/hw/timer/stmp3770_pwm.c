@@ -24,37 +24,38 @@
 #include "qemu/module.h"
 #include "hw/timer/stmp3770_pwm.h"
 
-#define PWM_VERSION     0x01000000
+#define PWM_VERSION     0x01010000
 
 #define REG_CTRL0       0x000
 #define REG_CTRL0_SET   0x004
 #define REG_CTRL0_CLR   0x008
 #define REG_CTRL0_TOG   0x00C
-#define REG_PERIOD(ch)  (0x100 + ((ch) * 0x10))
-#define REG_DUTY(ch)    (0x180 + ((ch) * 0x10))
-#define REG_ACTIVE(ch)  (0x200 + ((ch) * 0x10))
-#define REG_VERSION     0x1F0
+#define REG_ACTIVE(ch)  (0x010 + ((ch) * 0x20))
+#define REG_PERIOD(ch)  (0x020 + ((ch) * 0x20))
+#define REG_VERSION     0x0B0
 
 #define CTRL0_SFTRST    (1U << 31)
 #define CTRL0_CLKGATE   (1U << 30)
+#define CTRL0_PRESENT   (0x1FU << 25)
+#define CTRL0_RW_MASK   (CTRL0_SFTRST | CTRL0_CLKGATE | 0x3FU)
+#define CTRL0_RESET     (CTRL0_SFTRST | CTRL0_CLKGATE | CTRL0_PRESENT)
+#define PERIOD_RW_MASK  0x00FFFFFF
 #define CTRL0_PWM_ENABLE(chan) (1U << (chan))
 
-static void pwm_apply_sct(uint32_t *reg, uint32_t value, int sct)
+static uint32_t pwm_apply_sct(uint32_t current, uint32_t value, int sct)
 {
     switch (sct) {
     case 0:
-        *reg = value;
-        break;
+        return value;
     case 1:
-        *reg |= value;
-        break;
+        return current | value;
     case 2:
-        *reg &= ~value;
-        break;
+        return current & ~value;
     case 3:
-        *reg ^= value;
-        break;
+        return current ^ value;
     }
+
+    g_assert_not_reached();
 }
 
 static uint64_t pwm_read(void *opaque, hwaddr offset, unsigned size)
@@ -79,9 +80,6 @@ static uint64_t pwm_read(void *opaque, hwaddr offset, unsigned size)
     for (ch = 0; ch < STMP3770_PWM_NUM_CHANNELS; ch++) {
         if (offset == REG_PERIOD(ch)) {
             return s->period[ch];
-        }
-        if (offset == REG_DUTY(ch)) {
-            return s->duty[ch];
         }
         if (offset == REG_ACTIVE(ch)) {
             return s->active[ch];
@@ -109,21 +107,24 @@ static void pwm_write(void *opaque, hwaddr offset,
     }
 
     if ((offset & ~0xC) == REG_CTRL0) {
-        pwm_apply_sct(&s->ctrl0, (uint32_t)value, sct);
+        uint32_t current = s->ctrl0 & CTRL0_RW_MASK;
+        uint32_t next = pwm_apply_sct(current, (uint32_t)value & CTRL0_RW_MASK,
+                                      sct) & CTRL0_RW_MASK;
+
+        s->ctrl0 = CTRL0_PRESENT | next;
         return;
     }
 
     for (ch = 0; ch < STMP3770_PWM_NUM_CHANNELS; ch++) {
-        if (offset == REG_PERIOD(ch)) {
-            s->period[ch] = (uint32_t)value;
+        if ((offset & ~0xC) == REG_PERIOD(ch)) {
+            s->period[ch] =
+                pwm_apply_sct(s->period[ch], (uint32_t)value & PERIOD_RW_MASK,
+                              sct) & PERIOD_RW_MASK;
             return;
         }
-        if (offset == REG_DUTY(ch)) {
-            s->duty[ch] = (uint32_t)value;
-            return;
-        }
-        if (offset == REG_ACTIVE(ch)) {
-            s->active[ch] = (uint32_t)value;
+        if ((offset & ~0xC) == REG_ACTIVE(ch)) {
+            s->active[ch] = pwm_apply_sct(s->active[ch], (uint32_t)value,
+                                          sct);
             return;
         }
     }
@@ -147,7 +148,7 @@ static void pwm_reset(DeviceState *dev)
 {
     STMP3770PWMState *s = STMP3770_PWM(dev);
 
-    s->ctrl0 = CTRL0_SFTRST | CTRL0_CLKGATE;
+    s->ctrl0 = CTRL0_RESET;
     memset(s->period, 0, sizeof(s->period));
     memset(s->duty, 0, sizeof(s->duty));
     memset(s->active, 0, sizeof(s->active));
@@ -180,7 +181,7 @@ static void pwm_init(Object *obj)
 {
     STMP3770PWMState *s = STMP3770_PWM(obj);
 
-    s->ctrl0 = CTRL0_SFTRST | CTRL0_CLKGATE;
+    s->ctrl0 = CTRL0_RESET;
 }
 
 static void pwm_class_init(ObjectClass *oc, const void *data)

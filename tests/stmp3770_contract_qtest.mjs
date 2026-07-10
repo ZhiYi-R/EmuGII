@@ -22,6 +22,7 @@ const LCDIF_BASE = 0x80030000;
 const OCOTP_BASE = 0x8002c000;
 const POWER_BASE = 0x80044000;
 const RTC_BASE = 0x8005c000;
+const PWM_BASE = 0x80064000;
 
 class QTestMachine {
   constructor(port) {
@@ -219,6 +220,78 @@ async function testRtc1MsecIrq() {
     assert.notEqual(ctrl & (1 << 3), 0, `RTC 1ms status bit missing: ctrl=0x${ctrl.toString(16)}`);
     assert.equal(raw0 & (1 << 22), 0, `RTC alarm line asserted unexpectedly: raw0=0x${raw0.toString(16)}`);
     assert.notEqual(raw1 & (1 << 16), 0, `RTC 1ms line not asserted on ICOLL source 48: raw1=0x${raw1.toString(16)}`);
+  });
+}
+
+async function testPwmRegisterContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0xfe000000,
+      'PWM CTRL reset must retain SFTRST, CLKGATE, and five present bits',
+    );
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x0b0),
+      0x01010000,
+      'PWM VERSION must be v1.1 at the documented offset',
+    );
+
+    await machine.writel(PWM_BASE + 0x000, 0xffffffff);
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0xfe00003f,
+      'PWM CTRL must preserve present bits and only store documented control bits',
+    );
+    await machine.writel(PWM_BASE + 0x008, 0xff000000);
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x000),
+      0x3e00003f,
+      'PWM CTRL_CLR must only clear writable reset and gate bits, not present bits',
+    );
+
+    for (let channel = 0; channel < 5; channel += 1) {
+      const activeOffset = 0x010 + channel * 0x020;
+      const periodOffset = 0x020 + channel * 0x020;
+      const active = (0x10203040 + channel) >>> 0;
+      const period = (0xff234567 + channel) >>> 0;
+
+      await machine.writel(PWM_BASE + activeOffset, active);
+      await machine.writel(PWM_BASE + periodOffset, period);
+      assert.equal(
+        await machine.readl(PWM_BASE + activeOffset),
+        active,
+        `PWM ACTIVE${channel} must use its documented register offset`,
+      );
+      assert.equal(
+        await machine.readl(PWM_BASE + periodOffset),
+        period & 0x00ffffff,
+        `PWM PERIOD${channel} must ignore reserved bits 31:24 at its documented register offset`,
+      );
+
+      await machine.writel(PWM_BASE + activeOffset + 0x004, 0x00000003);
+      await machine.writel(PWM_BASE + activeOffset + 0x008, 0x00000001);
+      await machine.writel(PWM_BASE + activeOffset + 0x00c, 0x00000006);
+      assert.equal(
+        await machine.readl(PWM_BASE + activeOffset),
+        (active | 0x00000003) & ~0x00000001 ^ 0x00000006,
+        `PWM ACTIVE${channel} SET/CLR/TOG aliases must update the documented register`,
+      );
+
+      await machine.writel(PWM_BASE + periodOffset + 0x004, 0x00000003);
+      await machine.writel(PWM_BASE + periodOffset + 0x008, 0x00000001);
+      await machine.writel(PWM_BASE + periodOffset + 0x00c, 0x00000006);
+      assert.equal(
+        await machine.readl(PWM_BASE + periodOffset),
+        (((period & 0x00ffffff) | 0x00000003) & ~0x00000001 ^ 0x00000006) & 0x00ffffff,
+        `PWM PERIOD${channel} SET/CLR/TOG aliases must preserve reserved bits`,
+      );
+    }
+
+    assert.equal(
+      await machine.readl(PWM_BASE + 0x100),
+      0,
+      'PWM must not expose the obsolete synthetic PERIOD register map',
+    );
   });
 }
 
@@ -1551,6 +1624,7 @@ async function testOcotpLockAndShadowContract() {
 
 const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
+  ['PWM register contract', testPwmRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],
