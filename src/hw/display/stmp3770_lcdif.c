@@ -1204,9 +1204,7 @@ static unsigned int lcdif_data_words(STMP3770LCDIFState *s,
                                      uint8_t valid_bytes)
 {
     unsigned int words = 0;
-    uint8_t byte_packing = (s->ctrl1 >> 16) & 0xf;
 
-    valid_bytes &= byte_packing;
     if (s->ctrl0 & CTRL0_WORD_LENGTH) {
         while (valid_bytes) {
             words += valid_bytes & 1;
@@ -1224,8 +1222,50 @@ static unsigned int lcdif_data_words(STMP3770LCDIFState *s,
     return words;
 }
 
+static void lcdif_data_swizzle(STMP3770LCDIFState *s, uint8_t data[4],
+                                uint8_t *valid_bytes)
+{
+    uint8_t tmp;
+    uint8_t valid = *valid_bytes;
+
+    switch ((s->ctrl0 & CTRL0_DATA_SWIZZLE_MASK) >> 21) {
+    case 1:
+        tmp = data[0];
+        data[0] = data[3];
+        data[3] = tmp;
+        tmp = data[1];
+        data[1] = data[2];
+        data[2] = tmp;
+        valid = ((valid & 0x1) << 3) | ((valid & 0x2) << 1) |
+                ((valid & 0x4) >> 1) | ((valid & 0x8) >> 3);
+        break;
+    case 2:
+        tmp = data[0];
+        data[0] = data[2];
+        data[2] = tmp;
+        tmp = data[1];
+        data[1] = data[3];
+        data[3] = tmp;
+        valid = ((valid & 0x3) << 2) | ((valid & 0xc) >> 2);
+        break;
+    case 3:
+        tmp = data[0];
+        data[0] = data[1];
+        data[1] = tmp;
+        tmp = data[2];
+        data[2] = data[3];
+        data[3] = tmp;
+        valid = ((valid & 0x5) << 1) | ((valid & 0xa) >> 1);
+        break;
+    default:
+        break;
+    }
+
+    *valid_bytes = valid;
+}
+
 static unsigned int lcdif_panel_write_packed(STMP3770LCDIFState *s,
-                                             const uint8_t data[4],
+                                             uint8_t data[4],
                                              uint8_t valid_bytes,
                                              bool data_select)
 {
@@ -1235,6 +1275,7 @@ static unsigned int lcdif_panel_write_packed(STMP3770LCDIFState *s,
     unsigned int packed_len = 0;
 
     valid_bytes &= byte_packing;
+    lcdif_data_swizzle(s, data, &valid_bytes);
     if (s->ctrl0 & CTRL0_WORD_LENGTH) {
         for (i = 0; i < 4; i++) {
             if (valid_bytes & (1U << i)) {

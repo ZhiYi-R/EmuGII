@@ -1270,6 +1270,23 @@ async function testLcdifBytePackingContract() {
   });
 }
 
+async function testLcdifDataSwizzleContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
+    await machine.writel(LCDIF_BASE + 0x000, 0x00020000);
+    await machine.writeb(LCDIF_BASE + 0x0b0, 0x2c);
+    await machine.writel(LCDIF_BASE + 0x000, 0x00270004);
+    await machine.writel(LCDIF_BASE + 0x0b0, 0x11223344);
+
+    await machine.writel(LCDIF_BASE + 0x000, 0x20020000);
+    await machine.writeb(LCDIF_BASE + 0x0b0, 0x2e);
+    assert.equal(await machine.readb(LCDIF_BASE + 0x0b0), 0x11);
+    assert.equal(await machine.readb(LCDIF_BASE + 0x0b0), 0x22);
+    assert.equal(await machine.readb(LCDIF_BASE + 0x0b0), 0x33);
+    assert.equal(await machine.readb(LCDIF_BASE + 0x0b0), 0x44);
+  });
+}
+
 async function testLcdifDataAccessContract() {
   await withMachine(async (machine) => {
     const ctrl = 0x00030001;
@@ -2629,6 +2646,7 @@ const tests = [
   ['LCDIF clock gate contract', testLcdifClockGateContract],
   ['LCDIF soft reset contract', testLcdifSoftResetContract],
   ['LCDIF byte packing contract', testLcdifBytePackingContract],
+  ['LCDIF data swizzle contract', testLcdifDataSwizzleContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],
