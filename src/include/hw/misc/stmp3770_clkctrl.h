@@ -19,9 +19,14 @@
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770CLKCTRLState, STMP3770_CLKCTRL)
 
 typedef void (*STMP3770CLKCTRLDigResetFn)(void *opaque);
+typedef void (*STMP3770CLKCTRLHclkRateFn)(void *opaque, uint32_t hclk_hz);
 
 void stmp3770_clkctrl_set_dig_reset_callback(STMP3770CLKCTRLState *s,
                                              STMP3770CLKCTRLDigResetFn cb,
                                              void *opaque);
+void stmp3770_clkctrl_set_hclk_rate_callback(STMP3770CLKCTRLState *s,
+                                              STMP3770CLKCTRLHclkRateFn cb,
+                                              void *opaque);
+uint32_t stmp3770_clkctrl_get_hclk_rate(STMP3770CLKCTRLState *s);
 
 #endif /* HW_MISC_STMP3770_CLKCTRL_H */

@@ -55,6 +55,7 @@
 #define CPU_DIV_CPU_MASK        0x3FF
 #define CPU_DIV_XTAL_MASK       (0x3FF << 16)
 #define CPU_DIV_CPU_FRAC_EN     (1 << 18)
+#define CPU_DIV_XTAL_FRAC_EN    (1 << 26)
 #define CPU_BUSY_REF_CPU        (1 << 28)
 #define CPU_BUSY_REF_XTAL       (1 << 29)
 #define CPU_RW_MASK             0x07FF17FFU
@@ -139,6 +140,8 @@ struct STMP3770CLKCTRLState {
 
     STMP3770CLKCTRLDigResetFn dig_reset_cb;
     void *dig_reset_opaque;
+    STMP3770CLKCTRLHclkRateFn hclk_rate_cb;
+    void *hclk_rate_opaque;
 };
 
 void stmp3770_clkctrl_set_dig_reset_callback(STMP3770CLKCTRLState *s,
@@ -147,6 +150,74 @@ void stmp3770_clkctrl_set_dig_reset_callback(STMP3770CLKCTRLState *s,
 {
     s->dig_reset_cb = cb;
     s->dig_reset_opaque = opaque;
+}
+
+static uint32_t stmp3770_clkctrl_scale_fractional(uint32_t input_hz,
+                                                   uint32_t divider,
+                                                   uint32_t width)
+{
+    return (uint64_t)input_hz * divider / (1U << width);
+}
+
+uint32_t stmp3770_clkctrl_get_hclk_rate(STMP3770CLKCTRLState *s)
+{
+    uint32_t cpu_div;
+    uint32_t hbus_div = s->hbus & HBUS_DIV_MASK;
+    uint32_t cpu_hz;
+    uint32_t hclk_hz;
+
+    if (s->clkseq & CLKSEQ_BYPASS_CPU) {
+        cpu_div = (s->cpu & CPU_DIV_XTAL_MASK) >> 16;
+        cpu_hz = 24000000;
+        if (s->cpu & CPU_DIV_XTAL_FRAC_EN) {
+            cpu_hz = stmp3770_clkctrl_scale_fractional(cpu_hz, cpu_div, 10);
+        } else {
+            cpu_hz /= cpu_div;
+        }
+    } else {
+        uint32_t cpu_frac = s->frac & FRAC_CPUFRAC_MASK;
+
+        if (!s->pll_powered || (s->frac & FRAC_CLKGATECPU)) {
+            return 0;
+        }
+
+        cpu_div = s->cpu & CPU_DIV_CPU_MASK;
+        cpu_hz = 480000000ULL * 18 / cpu_frac;
+        if (s->cpu & CPU_DIV_CPU_FRAC_EN) {
+            cpu_hz = stmp3770_clkctrl_scale_fractional(cpu_hz, cpu_div, 10);
+        } else {
+            cpu_hz /= cpu_div;
+        }
+    }
+
+    if (s->hbus & HBUS_DIV_FRAC_EN) {
+        hclk_hz = stmp3770_clkctrl_scale_fractional(cpu_hz, hbus_div, 5);
+    } else {
+        hclk_hz = cpu_hz / hbus_div;
+    }
+
+    if (s->hbus & HBUS_AUTO_SLOW_MODE) {
+        hclk_hz >>= (s->hbus & HBUS_SLOW_DIV_MASK) >> 16;
+    }
+
+    return hclk_hz;
+}
+
+static void stmp3770_clkctrl_notify_hclk_rate(STMP3770CLKCTRLState *s)
+{
+    if (s->hclk_rate_cb) {
+        s->hclk_rate_cb(s->hclk_rate_opaque,
+                        stmp3770_clkctrl_get_hclk_rate(s));
+    }
+}
+
+void stmp3770_clkctrl_set_hclk_rate_callback(STMP3770CLKCTRLState *s,
+                                              STMP3770CLKCTRLHclkRateFn cb,
+                                              void *opaque)
+{
+    s->hclk_rate_cb = cb;
+    s->hclk_rate_opaque = opaque;
+    stmp3770_clkctrl_notify_hclk_rate(s);
 }
 
 static uint32_t stmp3770_clkctrl_apply_sct(uint32_t current, uint32_t val,
@@ -358,20 +429,6 @@ static void stmp3770_clkctrl_write_clkseq(STMP3770CLKCTRLState *s, uint32_t val,
     s->clkseq &= ~CLKSEQ_BYPASS_SAIF;
 }
 
-/* Helper: Calculate actual clock frequency (for future use) */
-static uint32_t stmp3770_clkctrl_get_cpu_freq(STMP3770CLKCTRLState *s)
-{
-    /* Simplified: assume 24 MHz XTAL for now */
-    uint32_t base_freq = 24000000;
-    uint32_t div = (s->cpu & CPU_DIV_CPU_MASK);
-
-    if (div == 0) {
-        div = 1;
-    }
-
-    return base_freq / div;
-}
-
 static uint64_t stmp3770_clkctrl_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770CLKCTRLState *s = STMP3770_CLKCTRL(opaque);
@@ -470,6 +527,7 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
         stmp3770_clkctrl_write_masked(target, val, PLLCTRL0_RW_MASK,
                                       is_set, is_clr, is_tog);
         s->pll_powered = (s->pllctrl0 & PLLCTRL0_POWER) != 0;
+        stmp3770_clkctrl_notify_hclk_rate(s);
         return;
 
     case REG_PLLCTRL1:
@@ -481,11 +539,13 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
     case REG_CPU:
         target = &s->cpu;
         stmp3770_clkctrl_write_cpu(target, val, is_set, is_clr, is_tog);
+        stmp3770_clkctrl_notify_hclk_rate(s);
         return;
 
     case REG_HBUS:
         target = &s->hbus;
         stmp3770_clkctrl_write_hbus(target, val, is_set, is_clr, is_tog);
+        stmp3770_clkctrl_notify_hclk_rate(s);
         return;
 
     case REG_XBUS:
@@ -533,10 +593,12 @@ static void stmp3770_clkctrl_write(void *opaque, hwaddr offset,
     case REG_FRAC:
         target = &s->frac;
         stmp3770_clkctrl_write_frac(target, val, is_set, is_clr, is_tog);
+        stmp3770_clkctrl_notify_hclk_rate(s);
         return;
 
     case REG_CLKSEQ:
         stmp3770_clkctrl_write_clkseq(s, val, is_set, is_clr, is_tog);
+        stmp3770_clkctrl_notify_hclk_rate(s);
         return;
 
     case REG_RESET:

@@ -319,6 +319,9 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->digctl), 0, STMP3770_DIGCTL_ADDR);
+    stmp3770_clkctrl_set_hclk_rate_callback(s->clkctrl,
+                                             stmp3770_digctl_set_hclk_rate,
+                                             s->digctl);
 
     /* Realize pin control and GPIO (PINCTRL) */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->pinctrl), errp)) {

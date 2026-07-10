@@ -901,6 +901,31 @@ async function testDigctlWriteonceResetsWithDigReset() {
   });
 }
 
+async function testDigctlHclkCountContract() {
+  await withMachine(async (machine) => {
+    const hclkStart = await machine.readl(DIGCTL_BASE + 0x020);
+    await machine.clockStep(1_000);
+    const hclkAt24Mhz = await machine.readl(DIGCTL_BASE + 0x020);
+
+    assert.equal(
+      (hclkAt24Mhz - hclkStart) >>> 0,
+      24,
+      `DIGCTL HCLKCOUNT must advance once per 24 MHz HCLK edge: start=0x${hclkStart.toString(16)}, end=0x${hclkAt24Mhz.toString(16)}`,
+    );
+
+    await machine.writel(CLKCTRL_BASE + 0x030, 0x00000002);
+    const hclkBeforeDivide = await machine.readl(DIGCTL_BASE + 0x020);
+    await machine.clockStep(1_000);
+    const hclkAt12Mhz = await machine.readl(DIGCTL_BASE + 0x020);
+
+    assert.equal(
+      (hclkAt12Mhz - hclkBeforeDivide) >>> 0,
+      12,
+      `DIGCTL HCLKCOUNT must follow HBUS.DIV=2: start=0x${hclkBeforeDivide.toString(16)}, end=0x${hclkAt12Mhz.toString(16)}`,
+    );
+  });
+}
+
 async function testClkctrlResetContract() {
   await withMachine(async (machine) => {
     const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
@@ -1478,6 +1503,7 @@ const tests = [
   ['DIGCTL undocumented alias decode', testDigctlUndocumentedAliasDecode],
   ['DIGCTL ctrl behavior contract', testDigctlCtrlBehaviorContract],
   ['DIGCTL writeonce resets with dig reset', testDigctlWriteonceResetsWithDigReset],
+  ['DIGCTL HCLK counter contract', testDigctlHclkCountContract],
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],

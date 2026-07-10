@@ -161,7 +161,9 @@ struct STMP3770DIGCTLState {
     /* Counters */
     uint32_t microseconds;
     uint64_t microseconds_base_ns;
-    uint64_t hclkcount_base_ns;  /* QEMU clock snapshot at last sync */
+    uint32_t hclkcount;
+    uint32_t hclk_hz;
+    uint64_t hclkcount_base_ns;
 
     /* OCRAM BIST */
     uint32_t ocram_bist_csr;
@@ -217,14 +219,34 @@ static void digctl_write_masked(uint32_t *target, uint32_t value,
     *target = (*target & ~writable_mask) | next;
 }
 
-static uint64_t digctl_hclkcount_get(STMP3770DIGCTLState *s)
+static uint64_t digctl_elapsed_hclk_cycles(uint64_t elapsed_ns, uint32_t hclk_hz)
 {
-    /*
-     * Free-running HCLK counter. Return the elapsed virtual time since reset
-     * as a 32-bit monotonic value. This approximates a real HCLK frequency;
-     * it is sufficient for software that polls the counter for delays.
-     */
-    return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->hclkcount_base_ns);
+    return elapsed_ns / NANOSECONDS_PER_SECOND * hclk_hz +
+           elapsed_ns % NANOSECONDS_PER_SECOND * hclk_hz /
+           NANOSECONDS_PER_SECOND;
+}
+
+static void digctl_hclkcount_sync(STMP3770DIGCTLState *s)
+{
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->hclkcount += digctl_elapsed_hclk_cycles(now - s->hclkcount_base_ns,
+                                                s->hclk_hz);
+    s->hclkcount_base_ns = now;
+}
+
+static uint32_t digctl_hclkcount_get(STMP3770DIGCTLState *s)
+{
+    digctl_hclkcount_sync(s);
+    return s->hclkcount;
+}
+
+void stmp3770_digctl_set_hclk_rate(void *opaque, uint32_t hclk_hz)
+{
+    STMP3770DIGCTLState *s = opaque;
+
+    digctl_hclkcount_sync(s);
+    s->hclk_hz = hclk_hz;
 }
 
 static uint32_t digctl_microseconds_get(STMP3770DIGCTLState *s)
@@ -643,6 +665,8 @@ static void stmp3770_digctl_reset(DeviceState *dev)
     s->sjtagdbg = SJTAGDBG_RESET;        /* SJTAG_STATE = 0x2 */
     s->microseconds = 0;
     s->microseconds_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->hclkcount = 0;
+    s->hclk_hz = 24000000;
     s->hclkcount_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     s->ocram_bist_csr = 0;
@@ -685,8 +709,8 @@ static void stmp3770_digctl_init(Object *obj)
 
 static const VMStateDescription vmstate_stmp3770_digctl = {
     .name = TYPE_STMP3770_DIGCTL,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, STMP3770DIGCTLState),
         VMSTATE_UINT32(status, STMP3770DIGCTLState),
@@ -700,6 +724,8 @@ static const VMStateDescription vmstate_stmp3770_digctl = {
         VMSTATE_UINT32(sjtagdbg, STMP3770DIGCTLState),
         VMSTATE_UINT32(microseconds, STMP3770DIGCTLState),
         VMSTATE_UINT64(microseconds_base_ns, STMP3770DIGCTLState),
+        VMSTATE_UINT32(hclkcount, STMP3770DIGCTLState),
+        VMSTATE_UINT32(hclk_hz, STMP3770DIGCTLState),
         VMSTATE_UINT64(hclkcount_base_ns, STMP3770DIGCTLState),
         VMSTATE_UINT32(ocram_bist_csr, STMP3770DIGCTLState),
         VMSTATE_UINT32_ARRAY(ocram_status, STMP3770DIGCTLState, 14),
