@@ -2053,6 +2053,42 @@ async function testGpmiTiming2Contract() {
   });
 }
 
+async function testGpmiCtrl1Contract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x060),
+      0x00000004,
+      'GPMI CTRL1 must reset with ATA_IRQRDY_POLARITY asserted',
+    );
+
+    await machine.writel(GPMI_BASE + 0x064, 0x00004001);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x060),
+      0x00004005,
+      'GPMI CTRL1_SET must affect only documented control fields',
+    );
+    await machine.writel(GPMI_BASE + 0x068, 0x00004001);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x060),
+      0x00000004,
+      'GPMI CTRL1_CLR must clear documented control fields',
+    );
+
+    await machine.writel(GPMI_BASE + 0x060, 0xffffffff);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x060),
+      0x000079ff,
+      'GPMI CTRL1 must ignore reserved bits and not software-set IRQ status',
+    );
+    await machine.writel(GPMI_BASE + 0x06c, 0x00004001);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x060),
+      0x000039fe,
+      'GPMI CTRL1_TOG must affect only documented control fields',
+    );
+  });
+}
+
 async function testOnChipRomAndSramMirrorContract() {
   await withMachine(async (machine) => {
     await machine.writel(SRAM_BASE + 0x1234, 0x11223344);
@@ -3875,6 +3911,7 @@ const tests = [
   ['SSP error IRQ pairing contract', testSspErrorIrqPairingContract],
   ['SSP DATA empty read contract', testSspDataEmptyReadContract],
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
+  ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],
   ['DCP channel register map contract', testDcpChannelRegisterMapContract],

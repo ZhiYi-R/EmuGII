@@ -71,10 +71,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770BCHState, STMP3770_BCH)
 #define GPMI_ADDRESS_ALE  2
 
 /* CTRL1 bits */
-#define GPMI_CTRL1_DEV_RESET          (1U << 3)
 #define GPMI_CTRL1_GPMI_MODE          (1U << 0)
+#define GPMI_CTRL1_CAMERA_MODE        (1U << 1)
+#define GPMI_CTRL1_ATA_IRQRDY_POLARITY (1U << 2)
+#define GPMI_CTRL1_DEV_RESET          (1U << 3)
+#define GPMI_CTRL1_ABORT_WAIT_FOR_READY_MASK (0xFU << 4)
+#define GPMI_CTRL1_BURST_EN           (1U << 8)
 #define GPMI_CTRL1_TIMEOUT_IRQ        (1U << 9)
 #define GPMI_CTRL1_DEV_IRQ            (1U << 10)
+#define GPMI_CTRL1_DMA2ECC_MODE       (1U << 11)
+#define GPMI_CTRL1_DSAMPLE_TIME_MASK  (0x7U << 12)
+#define GPMI_CTRL1_IRQ_MASK           (GPMI_CTRL1_TIMEOUT_IRQ | GPMI_CTRL1_DEV_IRQ)
+#define GPMI_CTRL1_CONFIG_MASK        0x000079FFU
 
 /* STAT bits */
 #define GPMI_STAT_PRESENT          (1U << 31)

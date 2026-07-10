@@ -93,6 +93,30 @@ static void gpmi_update_irq(STMP3770GPMIState *s)
     qemu_set_irq(s->irq, pending);
 }
 
+static void gpmi_write_ctrl1(STMP3770GPMIState *s, uint32_t value, int sct)
+{
+    switch (sct) {
+    case 0:
+        /* DEV_IRQ and TIMEOUT_IRQ are hardware status bits with W0C access. */
+        s->ctrl1 &= value | ~GPMI_CTRL1_IRQ_MASK;
+        s->ctrl1 = (s->ctrl1 & GPMI_CTRL1_IRQ_MASK) |
+                   (value & GPMI_CTRL1_CONFIG_MASK);
+        break;
+    case 1:
+        s->ctrl1 |= value & GPMI_CTRL1_CONFIG_MASK;
+        break;
+    case 2:
+        s->ctrl1 &= ~(value & (GPMI_CTRL1_CONFIG_MASK |
+                               GPMI_CTRL1_IRQ_MASK));
+        break;
+    case 3:
+        s->ctrl1 ^= value & GPMI_CTRL1_CONFIG_MASK;
+        break;
+    }
+
+    gpmi_update_irq(s);
+}
+
 static void bch_update_irq(STMP3770BCHState *s)
 {
     bool pending = (s->ctrl & BCH_CTRL_COMPLETE_IRQ) &&
@@ -869,8 +893,7 @@ static void gpmi_write(void *opaque, hwaddr offset,
         s->auxiliary = (uint32_t)value;
         break;
     case GPMI_CTRL1:
-        gpmi_apply_sct(&s->ctrl1, (uint32_t)value, sct);
-        gpmi_update_irq(s);
+        gpmi_write_ctrl1(s, (uint32_t)value, sct);
         break;
     case GPMI_TIMING0:
         s->timing0 = (uint32_t)value;
@@ -931,7 +954,7 @@ static void gpmi_reset(DeviceState *dev)
     s->ecccount = 0;
     s->payload = 0;
     s->auxiliary = 0;
-    s->ctrl1 = 0;
+    s->ctrl1 = GPMI_CTRL1_ATA_IRQRDY_POLARITY;
     s->timing0 = 0x00010203;
     s->timing1 = 0;
     s->timing2 = 0x09020101;
