@@ -25,6 +25,7 @@ const RTC_BASE = 0x8005c000;
 const PWM_BASE = 0x80064000;
 const TIMROT_BASE = 0x80068000;
 const I2C_BASE = 0x80058000;
+const APPUART_BASE = 0x8006c000;
 
 class QTestMachine {
   constructor(port) {
@@ -559,6 +560,90 @@ async function testI2cRegisterContract() {
       await machine.readl(I2C_BASE + 0x040),
       0x00860000,
       'I2C SFTRST must restore CTRL1 reset state',
+    );
+  });
+}
+
+async function testAppUartRegisterContract() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x000),
+      0xc0030000,
+      'UARTAPP CTRL0 must reset with SFTRST, CLKGATE, and RXTIMEOUT=3',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x010),
+      0,
+      'UARTAPP CTRL1 must reset with no TX DMA command pending',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x020),
+      0x00220300,
+      'UARTAPP CTRL2 must reset with both FIFOs half-level and RX/TX enabled',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x070),
+      0xc9f00000,
+      'UARTAPP STAT must reset with present/high-speed, empty FIFOs, and four invalid RX bytes',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x080),
+      0,
+      'UARTAPP DEBUG must reset with all DMA signal state low',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x090),
+      0x02000000,
+      'UARTAPP VERSION must report block v2.0',
+    );
+
+    await machine.writel(APPUART_BASE + 0x010, 0xffffffff);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x010),
+      0x1000ffff,
+      'UARTAPP CTRL1 must retain only RUN and XFER_COUNT',
+    );
+    await machine.writel(APPUART_BASE + 0x020, 0xffffffff);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x020),
+      0xff77ffc7,
+      'UARTAPP CTRL2 must ignore its documented reserved fields',
+    );
+    await machine.writel(APPUART_BASE + 0x030, 0xffffffff);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x030),
+      0xffff3fff,
+      'UARTAPP LINECTRL must retain only its documented baud and framing fields',
+    );
+    await machine.writel(APPUART_BASE + 0x040, 0xffffffff);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x040),
+      0xffff3ffe,
+      'UARTAPP LINECTRL2 must retain its documented fields and reject BRK',
+    );
+    await machine.writel(APPUART_BASE + 0x050, 0xffffffff);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x07ff07ff,
+      'UARTAPP INTR must retain only documented enable and status bits',
+    );
+    const raw0 = await machine.readl(ICOLL_BASE + 0x040);
+    assert.notEqual(
+      raw0 & (1 << 24),
+      0,
+      'enabled UARTAPP interrupt status must assert ICOLL source 24',
+    );
+    assert.equal(
+      raw0 & ((1 << 23) | (1 << 25)),
+      0,
+      'UARTAPP device status must not assert APBX-owned TX/RX DMA sources',
+    );
+
+    await machine.writel(APPUART_BASE + 0x004, 0x80000000);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x000),
+      0xc0030000,
+      'UARTAPP SFTRST must restore the block reset state and gate clocks',
     );
   });
 }
@@ -1899,6 +1984,7 @@ const tests = [
   ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
   ['I2C register contract', testI2cRegisterContract],
+  ['Application UART register contract', testAppUartRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['ICOLL core contract', testIcollCoreContract],
