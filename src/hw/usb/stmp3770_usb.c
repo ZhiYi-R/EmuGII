@@ -92,7 +92,8 @@
 #define USBCTRL_ENDPTSETUP_MASK          0x0000001F
 #define USBCTRL_ENDPTCTRL0_WRITABLE_MASK 0x000D000D
 #define USBCTRL_ENDPTCTRL0_RESET         0x00800080
-#define USBCTRL_ENDPTCTRLN_WRITABLE_MASK 0x00AF00AF
+#define USBCTRL_ENDPTCTRLN_ACTION_MASK   0x00400040
+#define USBCTRL_ENDPTCTRLN_WRITABLE_MASK 0x00EF00EF
 
 #define USBCTRL_ID_RESET            0x0042FA05
 #define USBCTRL_ARC_GENERAL_RESET   0x00000015
@@ -367,10 +368,10 @@ static void usb_write(void *opaque, hwaddr offset,
         break;
     case REG_ENDPTNAK:
         /* Write-1-to-clear */
-        s->endptnak &= ~((uint32_t)value & 0xFFFF);
+        s->endptnak &= ~((uint32_t)value & USBCTRL_ENDPOINT_BITMAP_MASK);
         break;
     case REG_ENDPTNAKEN:
-        s->endptnaken = (uint32_t)value;
+        s->endptnaken = (uint32_t)value & USBCTRL_ENDPOINT_BITMAP_MASK;
         break;
     case REG_PORTSC1:
         /* ClearPortFeature / SetPortFeature emulation */
@@ -413,6 +414,8 @@ static void usb_write(void *opaque, hwaddr offset,
     case REG_ENDPTCTRL1 ... REG_ENDPTCTRL4:
         s->endptctrl[(offset - REG_ENDPTCTRL0) / 4] =
             (uint32_t)value & USBCTRL_ENDPTCTRLN_WRITABLE_MASK;
+        s->endptctrl[(offset - REG_ENDPTCTRL0) / 4] &=
+            ~USBCTRL_ENDPTCTRLN_ACTION_MASK;
         break;
     case REG_GPTIMER0LD:
     case REG_GPTIMER1LD:

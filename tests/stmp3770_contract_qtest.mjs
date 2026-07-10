@@ -1643,6 +1643,13 @@ async function testUsbEndpointRegisterContract() {
       0x00af00af,
       'USBCTRL ENDPTCTRL1 must preserve only Table 320 writable fields',
     );
+
+    await machine.writel(USB_BASE + 0x17c, 0xffffffff);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x17c),
+      0x001f001f,
+      'USBCTRL ENDPTNAKEN must retain only RX/TX endpoint bits 0 through 4',
+    );
     await machine.writel(USB_BASE + 0x1d4, 0xffffffff);
     assert.equal(
       await machine.readl(USB_BASE + 0x1d4),
