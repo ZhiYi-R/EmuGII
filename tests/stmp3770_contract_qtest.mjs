@@ -347,6 +347,22 @@ async function testRtcAlarmWakeContract() {
   });
 }
 
+async function testRtcSuppressCopyToAnalogContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(RTC_BASE + 0x008, 0xc0000000);
+    await machine.clockStep(3_000_000);
+    await machine.writel(RTC_BASE + 0x004, 0x00000040);
+    await machine.writel(RTC_BASE + 0x070, 0x12345678);
+    await machine.clockStep(3_000_000);
+
+    assert.notEqual(
+      (await machine.readl(RTC_BASE + 0x010) >>> 8) & 0x02,
+      0,
+      'RTC SUPPRESS_COPY2ANALOG must retain PERSISTENT1 NEW_REGS while automatic copy is disabled',
+    );
+  });
+}
+
 async function testTimrotTickAndUpdateContract() {
   await withMachine(async (machine) => {
     await machine.writel(TIMROT_BASE + 0x008, 0xc0000000);
@@ -2047,6 +2063,7 @@ const tests = [
   ['RTC clock gate contract', testRtcClockGateContract],
   ['RTC watchdog debug contract', testRtcWatchdogDebugContract],
   ['RTC alarm wake contract', testRtcAlarmWakeContract],
+  ['RTC suppress copy-to-analog contract', testRtcSuppressCopyToAnalogContract],
   ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
   ['I2C register contract', testI2cRegisterContract],

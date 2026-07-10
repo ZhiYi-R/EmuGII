@@ -146,8 +146,10 @@ static void stmp3770_rtc_queue_shadow_write(STMP3770RTCState *s,
     uint32_t bit = 1U << reg;
 
     s->stat |= bit << STAT_NEW_REGS_SHIFT;
-    s->copy_to_analog |= bit;
-    stmp3770_rtc_rearm_copy_timer(s);
+    if (!(s->ctrl & CTRL_SUPPRESS_COPY2ANALOG)) {
+        s->copy_to_analog |= bit;
+        stmp3770_rtc_rearm_copy_timer(s);
+    }
 }
 
 static void stmp3770_rtc_copy_step(void *opaque)
