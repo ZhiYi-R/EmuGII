@@ -1859,6 +1859,43 @@ async function testSspCtrl1WritableMaskContract() {
   });
 }
 
+async function testSspErrorIrqPairingContract() {
+  await withMachine(async (machine) => {
+    const errorPairs = [
+      [31, 30, 'SDIO'],
+      [29, 28, 'response error'],
+      [27, 26, 'response timeout'],
+      [25, 24, 'data timeout'],
+      [23, 22, 'data CRC'],
+      [21, 20, 'FIFO underrun'],
+      [19, 18, 'CE-ATA CCS error'],
+      [17, 16, 'receive timeout'],
+      [15, 14, 'FIFO overrun'],
+    ];
+
+    await machine.writel(SSP1_BASE + 0x068, 0xffffffff);
+    for (const [statusBit, enableBit, name] of errorPairs) {
+      const statusMask = 2 ** statusBit;
+      const enableMask = 2 ** enableBit;
+
+      await machine.writel(SSP1_BASE + 0x064, statusMask + enableMask);
+      assert.notEqual(
+        (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 15),
+        0,
+        `SSP1 ${name} status and enable must assert ICOLL source 15`,
+      );
+
+      await machine.writel(SSP1_BASE + 0x068, statusMask);
+      assert.equal(
+        (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 15),
+        0,
+        `SSP1 ${name} status clear must deassert ICOLL source 15`,
+      );
+      await machine.writel(SSP1_BASE + 0x068, enableMask);
+    }
+  });
+}
+
 async function testSspDataEmptyReadContract() {
   await withMachine(async (machine) => {
     await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
@@ -3695,6 +3732,7 @@ const tests = [
   ['SSP register layout and reset contract', testSspRegisterLayoutAndResetContract],
   ['SSP soft reset and clock gate contract', testSspSoftResetAndClockGateContract],
   ['SSP CTRL1 writable mask contract', testSspCtrl1WritableMaskContract],
+  ['SSP error IRQ pairing contract', testSspErrorIrqPairingContract],
   ['SSP DATA empty read contract', testSspDataEmptyReadContract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],

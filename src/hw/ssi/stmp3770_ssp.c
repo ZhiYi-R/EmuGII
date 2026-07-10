@@ -54,8 +54,10 @@ static void stmp3770_ssp_apply_sct(uint32_t *reg, uint32_t value, int sct)
 
 static void stmp3770_ssp_update_irq(STMP3770SSPState *s)
 {
-    qemu_set_irq(s->irq_error, (s->ctrl1 & SSP_CTRL1_FIFO_UNDERRUN_IRQ) &&
-                              (s->ctrl1 & SSP_CTRL1_FIFO_UNDERRUN_EN));
+    uint32_t pending = (s->ctrl1 & SSP_CTRL1_ERROR_IRQ_STATUS_MASK) >> 1;
+
+    qemu_set_irq(s->irq_error,
+                 (pending & s->ctrl1 & SSP_CTRL1_ERROR_IRQ_ENABLE_MASK) != 0);
 }
 
 static void stmp3770_ssp_reset(DeviceState *dev)
