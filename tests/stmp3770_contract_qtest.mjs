@@ -23,6 +23,7 @@ const OCOTP_BASE = 0x8002c000;
 const POWER_BASE = 0x80044000;
 const RTC_BASE = 0x8005c000;
 const PWM_BASE = 0x80064000;
+const TIMROT_BASE = 0x80068000;
 
 class QTestMachine {
   constructor(port) {
@@ -284,6 +285,36 @@ async function testRtcCopyControllerContract() {
       (await machine.readl(RTC_BASE + 0x010) >>> 16) & 0xff,
       0,
       'RTC FORCE_UPDATE refresh must complete through the copy controller',
+    );
+  });
+}
+
+async function testTimrotTickAndUpdateContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(TIMROT_BASE + 0x008, 0xc0000000);
+
+    await machine.writel(TIMROT_BASE + 0x020, 0x000000cf);
+    await machine.writel(TIMROT_BASE + 0x030, 10);
+    await machine.clockStep(1_000);
+    assert.notEqual(
+      (await machine.readl(TIMROT_BASE + 0x020)) & 0x8000,
+      0,
+      'TIMROT SELECT=0xF must use undefined-select always-tick behavior',
+    );
+
+    await machine.writel(TIMROT_BASE + 0x028, 0x00008000);
+    await machine.writel(TIMROT_BASE + 0x020, 0x0000004c);
+    await machine.writel(TIMROT_BASE + 0x030, 1_000);
+    await machine.clockStep(10_000);
+    const runningBeforeUpdate = (await machine.readl(TIMROT_BASE + 0x030)) >>> 16;
+
+    await machine.writel(TIMROT_BASE + 0x024, 0x00000080);
+    await machine.clockStep(1_000);
+    const runningAfterUpdate = (await machine.readl(TIMROT_BASE + 0x030)) >>> 16;
+
+    assert.ok(
+      runningAfterUpdate < runningBeforeUpdate,
+      `TIMROT UPDATE alone must not reload running count: before=${runningBeforeUpdate}, after=${runningAfterUpdate}`,
     );
   });
 }
@@ -1691,6 +1722,7 @@ const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
   ['RTC reset and persistent0 contract', testRtcResetAndPersistent0Contract],
   ['RTC copy controller contract', testRtcCopyControllerContract],
+  ['TIMROT tick and update contract', testTimrotTickAndUpdateContract],
   ['PWM register contract', testPwmRegisterContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],

@@ -161,7 +161,9 @@ static uint32_t stmp3770_timer_get_freq(STMP3770TimerState *s, int idx)
         f = STMP3770_TIMROT_APB_FREQ;
         break;
     default:
-        return 0;
+        /* Undefined SELECT encodings have the same always-tick behavior. */
+        f = STMP3770_TIMROT_APB_FREQ;
+        break;
     }
 
     return f / prescale;
@@ -362,12 +364,9 @@ static void stmp3770_timer_write_timctrl(STMP3770TimerState *s, int idx,
 
     stmp3770_timer_apply_write(&t->timctrl, writable_mask, value, sct);
 
-    /* Treat a 0->1 transition of UPDATE as an immediate reload request */
-    if (!(old & TIMCTRL_UPDATE) && (t->timctrl & TIMCTRL_UPDATE)) {
-        stmp3770_timer_configure(s, idx, true);
-    } else if ((old ^ t->timctrl) & (TIMCTRL_SELECT_MASK |
-                                      (TIMCTRL_PRESCALE_MASK << TIMCTRL_PRESCALE_SHIFT) |
-                                      TIMCTRL_RELOAD | TIMCTRL_IRQ_EN)) {
+    if ((old ^ t->timctrl) & (TIMCTRL_SELECT_MASK |
+                               (TIMCTRL_PRESCALE_MASK << TIMCTRL_PRESCALE_SHIFT) |
+                               TIMCTRL_RELOAD | TIMCTRL_IRQ_EN)) {
         stmp3770_timer_configure(s, idx, false);
     }
 
