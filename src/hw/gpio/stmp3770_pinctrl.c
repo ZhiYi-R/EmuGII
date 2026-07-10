@@ -125,6 +125,19 @@ static const uint32_t bank_pin_mask[STMP3770_PINCTRL_NUM_BANKS] = {
     0x00000000,  /* Bank 3: no GPIO functionality on STMP3770 */
 };
 
+/* Each pad drive field has three writable bits; its fourth bit is reserved. */
+static const uint32_t drive_mask[15] = {
+    0x77777777, 0x77777777, 0x77777777, 0x77777777,
+    0x77777777, 0x77777777, 0x77777777, 0x00077777,
+    0x77777777, 0x77777777, 0x77777777, 0x77777777,
+    0x77777777, 0x77777777, 0x00777777,
+};
+
+/* PULL0..2 implement only the pads documented in Tables 1206, 1208 and 1210. */
+static const uint32_t pull_mask[STMP3770_PINCTRL_NUM_BANKS] = {
+    0x3c1000fe, 0x0f400000, 0x00004000, 0x0003ffff,
+};
+
 #define HP39GII_KEY_COL_BANK 1
 #define HP39GII_KEY_COL_MASK ((1U << 22) | (1U << 23) | (1U << 25) | \
                               (1U << 26) | (1U << 27))
@@ -310,30 +323,10 @@ static void stmp3770_pinctrl_reset(DeviceState *dev)
         s->muxsel[i] = 0;
     }
 
-    /*
-     * Drive strength configuration based on ExistOS BSP analysis.
-     * Each register controls 16 pins (2 bits per pin):
-     *   00 = 4mA, 01 = 8mA, 10 = 12mA, 11 = 16mA
-     *
-     * Default: 4mA for all pins (0x00000000)
-     * GPMI NAND pins (Bank0 Pin 0-7): need 8mA (ExistOS stmp_board.cpp:120-196)
-     */
+    /* PDF Tables 1176-1204 reset each documented pad to 3.3 V / 4 mA. */
     for (i = 0; i < ARRAY_SIZE(s->drive); i++) {
-        s->drive[i] = 0x00000000;       /* Default 4mA for all */
+        s->drive[i] = drive_mask[i] & 0x44444444;
     }
-
-    /* DRIVE0: Bank0 Pin 0-7 (GPMI D0-D7)
-     * Set MA=1 (8mA) for GPMI data lines
-     * Bits [15:0] control Pin 0-7 (2 bits each)
-     */
-    s->drive[0] = 0x00005555;           /* Pin 0-7: 8mA, Pin 8-15: 4mA */
-
-    /* DRIVE1: Bank0 Pin 16-23 (includes GPMI control signals)
-     * Pin 16-19: GPMI CLE/ALE/WRN/RDN also need 8mA
-     * Pin 22-25: GPMI RDY/CS/WP/RST also 8mA
-     */
-    s->drive[1] = 0x00000055;           /* Pin 16-19: 8mA */
-    s->drive[2] = 0x00005555;           /* Pin 22-25 (in next reg): 8mA */
 
     for (i = 0; i < ARRAY_SIZE(s->pull); i++) {
         s->pull[i] = 0;
@@ -370,7 +363,11 @@ static uint64_t stmp3770_pinctrl_read(void *opaque, hwaddr offset,
         return 0;
     }
 
-    /* Ignore SET/CLR/TOG bits on read (offset should not have them) */
+    /* Chapter 34: hardware SET/CLR/TOG aliases are write-only and read zero. */
+    if (offset & 0xF) {
+        return 0;
+    }
+
     offset &= ~0xF;
 
     switch (offset) {
@@ -494,13 +491,13 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
 
     case REG_DRIVE0 ... REG_DRIVE14:
         bank = (offset - REG_DRIVE0) >> 4;
-        stmp3770_pinctrl_apply_write(&s->drive[bank], 0xFFFFFFFF,
+        stmp3770_pinctrl_apply_write(&s->drive[bank], drive_mask[bank],
                                      value, is_set, is_clr, is_tog);
         break;
 
     case REG_PULL0 ... REG_PULL3:
         bank = (offset - REG_PULL0) >> 4;
-        mask = bank_pin_mask[bank];
+        mask = pull_mask[bank];
         stmp3770_pinctrl_apply_write(&s->pull[bank], mask,
                                      value, is_set, is_clr, is_tog);
         break;

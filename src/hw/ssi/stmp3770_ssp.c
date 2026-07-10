@@ -54,19 +54,16 @@ static void stmp3770_ssp_apply_sct(uint32_t *reg, uint32_t value, int sct)
 
 static void stmp3770_ssp_update_irq(STMP3770SSPState *s)
 {
-    bool pending = (s->ctrl1 & s->status &
-                    (SSP_STATUS_DATA_CRC_ERR |
-                     SSP_STATUS_RESP_ERR |
-                     SSP_STATUS_RESP_TIMEOUT)) != 0;
-    qemu_set_irq(s->irq_error, pending);
+    qemu_set_irq(s->irq_error, (s->ctrl1 & SSP_CTRL1_FIFO_UNDERRUN_IRQ) &&
+                              (s->ctrl1 & SSP_CTRL1_FIFO_UNDERRUN_EN));
 }
 
 static void stmp3770_ssp_reset(DeviceState *dev)
 {
     STMP3770SSPState *s = STMP3770_SSP(dev);
 
-    s->ctrl0 = SSP_CTRL0_SFTRST | SSP_CTRL0_CLKGATE;
-    s->ctrl1 = 0;
+    s->ctrl0 = SSP_CTRL0_RESET_VALUE;
+    s->ctrl1 = SSP_CTRL1_RESET_VALUE;
     s->cmd0 = 0;
     s->cmd1 = 0;
     s->compref = 0;
@@ -77,10 +74,8 @@ static void stmp3770_ssp_reset(DeviceState *dev)
     s->sdresp[1] = 0;
     s->sdresp[2] = 0;
     s->sdresp[3] = 0;
-    s->status = SSP_STATUS_FIFO_EMPTY;
+    s->status = SSP_STATUS_RESET_VALUE;
     s->debug = 0;
-    s->dll_ctrl = 0;
-    s->dll_sts = 0;
 
     stmp3770_ssp_update_irq(s);
 }
@@ -112,6 +107,11 @@ static uint64_t stmp3770_ssp_read(void *opaque, hwaddr offset, unsigned size)
     case SSP_TIMING:
         return s->timing;
     case SSP_DATA:
+        if (s->status & SSP_STATUS_FIFO_EMPTY) {
+            s->status |= SSP_STATUS_FIFO_UNDRFLW;
+            s->ctrl1 |= SSP_CTRL1_FIFO_UNDERRUN_IRQ;
+            stmp3770_ssp_update_irq(s);
+        }
         return s->data;
     case SSP_SDRESP0:
         return s->sdresp[0];
@@ -127,10 +127,6 @@ static uint64_t stmp3770_ssp_read(void *opaque, hwaddr offset, unsigned size)
         return s->debug;
     case SSP_VERSION:
         return SSP_VERSION_VALUE;
-    case SSP_DLL_CTRL:
-        return s->dll_ctrl;
-    case SSP_DLL_STS:
-        return s->dll_sts;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-ssp: read from unimplemented offset "
@@ -164,7 +160,8 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
             /* Stub: complete transfer immediately */
             s->ctrl0 &= ~SSP_CTRL0_RUN;
             s->status |= SSP_STATUS_FIFO_EMPTY;
-            s->status &= ~SSP_STATUS_BUSY;
+            s->status &= ~(SSP_STATUS_BUSY | SSP_STATUS_CMD_BUSY |
+                           SSP_STATUS_DATA_BUSY);
         }
         break;
     case SSP_CTRL1:
@@ -196,12 +193,6 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
     case SSP_STATUS:
     case SSP_DEBUG:
     case SSP_VERSION:
-    case SSP_DLL_STS:
-        /* Read-only */
-        break;
-    case SSP_DLL_CTRL:
-        stmp3770_ssp_apply_sct(&s->dll_ctrl, (uint32_t)value, sct);
-        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-ssp: write to unimplemented offset "
@@ -248,8 +239,6 @@ static const VMStateDescription vmstate_stmp3770_ssp = {
         VMSTATE_UINT32_ARRAY(sdresp, STMP3770SSPState, 4),
         VMSTATE_UINT32(status, STMP3770SSPState),
         VMSTATE_UINT32(debug, STMP3770SSPState),
-        VMSTATE_UINT32(dll_ctrl, STMP3770SSPState),
-        VMSTATE_UINT32(dll_sts, STMP3770SSPState),
         VMSTATE_END_OF_LIST()
     }
 };

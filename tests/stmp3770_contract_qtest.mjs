@@ -29,6 +29,8 @@ const USBPHY_BASE = 0x8007c000;
 const USB_BASE = 0x80080000;
 const LRADC_BASE = 0x80050000;
 const I2C_BASE = 0x80058000;
+const SSP1_BASE = 0x80010000;
+const SSP2_BASE = 0x80034000;
 const APBX_BASE = 0x80024000;
 const APPUART_BASE = 0x8006c000;
 const DBGUART_BASE = 0x80070000;
@@ -1765,6 +1767,115 @@ async function testUsbGptimerContract() {
   });
 }
 
+async function testSspRegisterLayoutAndResetContract() {
+  await withMachine(async (machine) => {
+    for (const [name, base] of [['SSP1', SSP1_BASE], ['SSP2', SSP2_BASE]]) {
+      assert.equal(
+        await machine.readl(base + 0x000),
+        0xc0000001,
+        `${name} CTRL0 must reset with SFTRST, CLKGATE, and XFER_COUNT=1`,
+      );
+      assert.equal(
+        await machine.readl(base + 0x060),
+        0x00200080,
+        `${name} CTRL1 must reset with FIFO_UNDERRUN_IRQ and eight-bit word length`,
+      );
+      assert.equal(
+        await machine.readl(base + 0x0c0),
+        0xe0000020,
+        `${name} STATUS must report present controllers and an empty FIFO`,
+      );
+      assert.equal(
+        await machine.readl(base + 0x100),
+        0,
+        `${name} DEBUG must be read-only and reset clear at its documented address`,
+      );
+      assert.equal(
+        await machine.readl(base + 0x110),
+        0x02000000,
+        `${name} VERSION must be 2.0 at its documented address`,
+      );
+    }
+
+    await machine.writel(SSP1_BASE + 0x010, 0x00123456);
+    await machine.writel(SSP1_BASE + 0x020, 0x89abcdef);
+    await machine.writel(SSP1_BASE + 0x030, 0x10203040);
+    await machine.writel(SSP1_BASE + 0x040, 0x55667788);
+    await machine.writel(SSP1_BASE + 0x050, 0x00001234);
+
+    assert.equal(await machine.readl(SSP1_BASE + 0x010), 0x00123456, 'SSP CMD0 must be mapped at +0x10');
+    assert.equal(await machine.readl(SSP1_BASE + 0x020), 0x89abcdef, 'SSP CMD1 must be mapped at +0x20');
+    assert.equal(await machine.readl(SSP1_BASE + 0x030), 0x10203040, 'SSP COMPREF must be mapped at +0x30');
+    assert.equal(await machine.readl(SSP1_BASE + 0x040), 0x55667788, 'SSP COMPMASK must be mapped at +0x40');
+    assert.equal(await machine.readl(SSP1_BASE + 0x050), 0x00001234, 'SSP TIMING must be mapped at +0x50');
+  });
+}
+
+async function testSspSoftResetAndClockGateContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x008, 0x80000000);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x000),
+      0x40000001,
+      'SSP CTRL0_CLR.SFTRST must release reset without clearing CLKGATE',
+    );
+
+    await machine.writel(SSP1_BASE + 0x008, 0x40000000);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x000),
+      0x00000001,
+      'SSP CTRL0_CLR.CLKGATE must independently release the clock gate',
+    );
+
+    await machine.writel(SSP1_BASE + 0x000, 0x80000000);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x000),
+      0xc0000001,
+      'SSP soft reset must restore documented reset state including CLKGATE',
+    );
+  });
+}
+
+async function testSspCtrl1WritableMaskContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x068, 0xffffffff);
+    assert.equal(await machine.readl(SSP1_BASE + 0x060), 0, 'SSP CTRL1_CLR must clear all documented writable fields');
+
+    await machine.writel(SSP1_BASE + 0x064, 0xffffffff);
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x060),
+      0xffffffff,
+      'SSP CTRL1 contains only documented writable status, enable, and mode fields',
+    );
+
+    await machine.writel(SSP1_BASE + 0x068, 1 << 21);
+    assert.equal(
+      (await machine.readl(SSP1_BASE + 0x060)) & (1 << 21),
+      0,
+      'SSP CTRL1_CLR must use write-one-to-clear semantics for FIFO_UNDERRUN_IRQ',
+    );
+  });
+}
+
+async function testSspDataEmptyReadContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+    await machine.writel(SSP1_BASE + 0x068, 1 << 21);
+
+    assert.equal(await machine.readl(SSP1_BASE + 0x070), 0, 'SSP DATA empty read must return zeroed FIFO content');
+    assert.notEqual(
+      (await machine.readl(SSP1_BASE + 0x060)) & (1 << 21),
+      0,
+      'SSP DATA empty read must raise FIFO_UNDERRUN_IRQ',
+    );
+    assert.notEqual(
+      (await machine.readl(SSP1_BASE + 0x0c0)) & (1 << 4),
+      0,
+      'SSP DATA empty read must expose STATUS.FIFO_UNDRFLW',
+    );
+  });
+}
+
 async function testDcpRegisterAndMemcopyContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -2091,6 +2202,84 @@ async function testPinctrlBank3Absent() {
     assert.equal(ctrl & (1 << 29), 0, `PINCTRL PRESENT3 should be 0 on STMP3770: ctrl=0x${ctrl.toString(16)}`);
     assert.equal(before, 0, `Bank 3 DOUT should reset to 0: before=0x${before.toString(16)}`);
     assert.equal(after, 0, `Bank 3 DOUT should remain inactive when GPIO is absent: after=0x${after.toString(16)}`);
+  });
+}
+
+async function testPinctrlDriveAndPullMasks() {
+  await withMachine(async (machine) => {
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x270),
+      0x00044444,
+      'PINCTRL DRIVE7 must reset every documented voltage-select field high',
+    );
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x200),
+      0x44444444,
+      'PINCTRL DRIVE0 must reset every documented voltage-select field high',
+    );
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x280),
+      0x44444444,
+      'PINCTRL DRIVE8 must reset every documented voltage-select field high',
+    );
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x2e0),
+      0x00444444,
+      'PINCTRL DRIVE14 must reset every documented voltage-select field high',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x270, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x270),
+      0x00077777,
+      'PINCTRL DRIVE7 must expose only the Bank 1 pin 24-28 fields',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x280, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x280),
+      0x77777777,
+      'PINCTRL DRIVE8 must keep every per-pin reserved bit clear',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x2e0, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x2e0),
+      0x00777777,
+      'PINCTRL DRIVE14 must hide bits 31:24 and each reserved pad bit',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x300, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x300),
+      0x3c1000fe,
+      'PINCTRL PULL0 must retain only documented pullup-enable bits',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x310, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x310),
+      0x0f400000,
+      'PINCTRL PULL1 must retain only documented pullup-enable bits',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x320, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x320),
+      0x00004000,
+      'PINCTRL PULL2 must retain only the EMI_CE2N pullup-enable bit',
+    );
+
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x304),
+      0,
+      'PINCTRL PULL0_SET is write-only and must read back zero',
+    );
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x278),
+      0,
+      'PINCTRL DRIVE7_CLR is write-only and must read back zero',
+    );
   });
 }
 
@@ -3466,12 +3655,17 @@ const tests = [
   ['USBCTRL device control contract', testUsbDeviceControlContract],
   ['USBCTRL endpoint register contract', testUsbEndpointRegisterContract],
   ['USBCTRL GPTIMER contract', testUsbGptimerContract],
+  ['SSP register layout and reset contract', testSspRegisterLayoutAndResetContract],
+  ['SSP soft reset and clock gate contract', testSspSoftResetAndClockGateContract],
+  ['SSP CTRL1 writable mask contract', testSspCtrl1WritableMaskContract],
+  ['SSP DATA empty read contract', testSspDataEmptyReadContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],
   ['DCP channel register map contract', testDcpChannelRegisterMapContract],
   ['DCP key and context register contract', testDcpKeyAndContextRegisterContract],
   ['DCP CSC register map contract', testDcpCscRegisterMapContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
+  ['PINCTRL drive and pull masks', testPinctrlDriveAndPullMasks],
   ['ICOLL core contract', testIcollCoreContract],
   ['ICOLL same-level priority contract', testIcollSameLevelPriorityContract],
   ['ICOLL BYPASS same-level priority contract', testIcollBypassSameLevelPriorityContract],
