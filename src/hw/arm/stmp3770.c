@@ -564,6 +564,15 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(s->lradc), 0, STMP3770_LRADC_ADDR);
     stmp3770_lradc_set_pwm(s->lradc, s->pwm);
 
+    /* Connect LRADC interrupts to ICOLL */
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->lradc), 0,
+                       qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_TOUCH));
+    for (i = 0; i < 8; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->lradc), i + 1,
+                           qdev_get_gpio_in(DEVICE(s->icoll),
+                                            STMP3770_IRQ_LRADC_CH0 + i));
+    }
+
     /* Realize USB PHY */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->usbphy), errp)) {
         return;

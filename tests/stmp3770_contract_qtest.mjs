@@ -984,6 +984,55 @@ async function testLradcRegisterContract() {
   });
 }
 
+async function testLradcIrqContract() {
+  await withMachine(async (machine) => {
+    /* Bring LRADC out of reset and enable LRADC0/7 interrupts */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+    await machine.writel(LRADC_BASE + 0x010, 0x00810081); /* LRADC0/7 IRQ_EN */
+
+    /* Schedule channels 0 and 7 */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000081);
+
+    /* LRADC0/7 IRQ status should be set and the ICOLL lines should assert */
+    const ctrl1 = await machine.readl(LRADC_BASE + 0x010);
+    assert.notEqual(ctrl1 & 0x0001, 0, 'LRADC0 IRQ status must be set after schedule');
+    assert.notEqual(ctrl1 & 0x0080, 0, 'LRADC7 IRQ status must be set after schedule');
+
+    const raw1 = await machine.readl(ICOLL_BASE + 0x050);
+    assert.notEqual(raw1 & (1 << 5), 0, 'LRADC0 must assert ICOLL source 37');
+    assert.notEqual(raw1 & (1 << 12), 0, 'LRADC7 must assert ICOLL source 44');
+
+    /* Clear LRADC0/7 IRQ status via CTRL1_CLR */
+    await machine.writel(LRADC_BASE + 0x018, 0x00810081);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x010),
+      0,
+      'LRADC0/7 IRQ status must clear after CLR write',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050) & ((1 << 5) | (1 << 12)),
+      0,
+      'LRADC0/7 ICOLL sources must deassert when IRQ cleared',
+    );
+
+    /* Touch detect IRQ should not assert if only enabled but not pending */
+    await machine.writel(LRADC_BASE + 0x014, 0x01000000); /* SET TOUCH_DETECT_IRQ_EN only */
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050) & (1 << 4),
+      0,
+      'TOUCH_DETECT_IRQ must not assert when status is clear',
+    );
+    /* Software can force the touch status bit; when pending + enabled, it asserts */
+    await machine.writel(LRADC_BASE + 0x014, 0x00000100); /* SET TOUCH_DETECT_IRQ */
+    assert.notEqual(
+      await machine.readl(ICOLL_BASE + 0x050) & (1 << 4),
+      0,
+      'TOUCH_DETECT_IRQ must assert when status is set and enabled',
+    );
+    await machine.writel(LRADC_BASE + 0x018, 0x01000100); /* CLR touch */
+  });
+}
+
 async function testI2cRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -4825,6 +4874,7 @@ const tests = [
   ['PWM MATT contract', testPwmMattContract],
   ['PWM2 analog enable contract', testPwm2AnalogEnableContract],
   ['LRADC register contract', testLradcRegisterContract],
+  ['LRADC IRQ contract', testLradcIrqContract],
   ['I2C register contract', testI2cRegisterContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],

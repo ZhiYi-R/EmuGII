@@ -43,6 +43,9 @@ struct STMP3770LRADCState {
     uint32_t conversion;
     uint32_t version;
     STMP3770PWMState *pwm;
+
+    /* IRQ lines: index 0 = touch, 1..8 = LRADC channels 0..7 */
+    qemu_irq irq[9];
 };
 
 #define LRADC_VERSION   0x01010000
@@ -152,6 +155,8 @@ static void lradc_apply_sct(uint32_t *reg, uint32_t value, int sct,
     *reg = (*reg & ~(mask << shift)) | ((cur & mask) << shift);
 }
 
+static void lradc_update_irq(STMP3770LRADCState *s);
+
 static void lradc_complete_scheduled(STMP3770LRADCState *s)
 {
     int ch;
@@ -162,11 +167,14 @@ static void lradc_complete_scheduled(STMP3770LRADCState *s)
             /* Instant conversion: set TOGGLE and a plausible 12-bit value */
             s->channel[ch] &= ~CH_VALUE_MASK;
             s->channel[ch] |= CH_TOGGLE | 0x00000ABC;
+            /* Hardware sets the corresponding IRQ status bit */
+            s->ctrl1 |= (1U << ch);
         }
     }
 
     /* Hardware clears SCHEDULE bits when conversions are done */
     s->ctrl0 &= ~CTRL0_SCHEDULE_MASK;
+    lradc_update_irq(s);
 }
 
 static void lradc_update_pwm2_analog_enable(STMP3770LRADCState *s)
@@ -175,6 +183,19 @@ static void lradc_update_pwm2_analog_enable(STMP3770LRADCState *s)
         stmp3770_pwm_set_pwm2_analog_enable(s->pwm,
                                              s->ctrl2 & CTRL2_BL_ENABLE);
     }
+}
+
+static void lradc_update_irq(STMP3770LRADCState *s)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        bool pending = (s->ctrl1 >> i) & 1;
+        bool enabled = (s->ctrl1 >> (16 + i)) & 1;
+        qemu_set_irq(s->irq[i + 1], pending && enabled);
+    }
+
+    qemu_set_irq(s->irq[0], ((s->ctrl1 >> 8) & 1) && ((s->ctrl1 >> 24) & 1));
 }
 
 static void lradc_reset(DeviceState *dev);
@@ -276,6 +297,7 @@ static void lradc_write(void *opaque, hwaddr offset,
     case REG_CTRL1:
         lradc_apply_sct(&s->ctrl1, (uint32_t)value, sct, offset, size);
         s->ctrl1 &= CTRL1_RW_MASK;
+        lradc_update_irq(s);
         break;
     case REG_CTRL2:
         lradc_apply_sct(&s->ctrl2, (uint32_t)value, sct, offset, size);
@@ -361,16 +383,22 @@ static void lradc_reset(DeviceState *dev)
     memset(s->delay, 0, sizeof(s->delay));
     s->debug0 = 0x43210000;
     s->debug1 = 0;
+    lradc_update_irq(s);
 }
 
 static void lradc_realize(DeviceState *dev, Error **errp)
 {
     STMP3770LRADCState *s = STMP3770_LRADC(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    int i;
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &lradc_ops, s,
                           TYPE_STMP3770_LRADC, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
+
+    for (i = 0; i < 9; i++) {
+        sysbus_init_irq(sbd, &s->irq[i]);
+    }
 }
 
 static int lradc_post_load(void *opaque, int version_id)
