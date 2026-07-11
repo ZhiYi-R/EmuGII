@@ -287,6 +287,20 @@ static void lradc_update_irq(STMP3770LRADCState *s)
     qemu_set_irq(s->irq[0], ((s->ctrl1 >> 8) & 1) && ((s->ctrl1 >> 24) & 1));
 }
 
+void stmp3770_lradc_set_touch_detect(STMP3770LRADCState *s, bool detect)
+{
+    s->touch_detect = detect;
+    lradc_update_irq(s);
+}
+
+static void lradc_touch_detect_set(void *opaque, int n, int level)
+{
+    STMP3770LRADCState *s = STMP3770_LRADC(opaque);
+
+    (void)n;
+    stmp3770_lradc_set_touch_detect(s, !!level);
+}
+
 static void lradc_reset(DeviceState *dev);
 
 static void lradc_update_delay_remaining(STMP3770LRADCState *s)
@@ -608,6 +622,9 @@ static void lradc_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < 9; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
+
+    qdev_init_gpio_in_named(DEVICE(dev), lradc_touch_detect_set,
+                            "touch-detect", 1);
 
     for (i = 0; i < 4; i++) {
         s->delay_ctx[i].s = s;

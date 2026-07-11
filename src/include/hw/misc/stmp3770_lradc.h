@@ -33,5 +33,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770LRADCState, STMP3770_LRADC)
 typedef struct STMP3770PWMState STMP3770PWMState;
 
 void stmp3770_lradc_set_pwm(STMP3770LRADCState *s, STMP3770PWMState *pwm);
+void stmp3770_lradc_set_touch_detect(STMP3770LRADCState *s, bool detect);
 
 #endif /* HW_MISC_STMP3770_LRADC_H */

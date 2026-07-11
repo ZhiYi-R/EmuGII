@@ -1169,6 +1169,49 @@ async function testLradcTouchTemperatureContract() {
       'TOUCH_DETECT_IRQ must deassert when cleared',
     );
 
+    /* Hardware touch-detect input via the named GPIO line */
+    await machine.writel(LRADC_BASE + 0x010, 0x01000000); /* TOUCH_DETECT_IRQ_EN only */
+    await machine.setIrqIn('/machine/soc/lradc', 'touch-detect', 0, 1);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x040),
+      0x07ff0001,
+      'TOUCH_DETECT_RAW must be 1 when touch-detect input is active and enabled',
+    );
+    assert.notEqual(
+      await machine.readl(LRADC_BASE + 0x010) & 0x0100,
+      0,
+      'TOUCH_DETECT_IRQ status must be set by the touch-detect input',
+    );
+    assert.notEqual(
+      await machine.readl(ICOLL_BASE + 0x050) & (1 << 4),
+      0,
+      'TOUCH_DETECT_IRQ must assert ICOLL source 36 when touch-detect input is active',
+    );
+
+    await machine.setIrqIn('/machine/soc/lradc', 'touch-detect', 0, 0);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x040),
+      0x07ff0000,
+      'TOUCH_DETECT_RAW must return to 0 when touch-detect input is released',
+    );
+    assert.notEqual(
+      await machine.readl(LRADC_BASE + 0x010) & 0x0100,
+      0,
+      'TOUCH_DETECT_IRQ status must remain sticky when touch-detect input is released',
+    );
+
+    await machine.writel(LRADC_BASE + 0x018, 0x00000100); /* clear TOUCH_DETECT_IRQ */
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x010) & 0x0100,
+      0,
+      'TOUCH_DETECT_IRQ status must clear when input is released and software clears it',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050) & (1 << 4),
+      0,
+      'TOUCH_DETECT_IRQ must deassert when status is cleared',
+    );
+
     /* Temperature sensor mapping: CH0 -> physical 8, TEMPSENSE_PWD disabled first */
     await machine.writel(LRADC_BASE + 0x140, 0x76543218);
     await machine.writel(LRADC_BASE + 0x020, 0x00000000); /* clear TEMPSENSE_PWD */
