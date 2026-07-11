@@ -402,6 +402,8 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->digctl), 0, STMP3770_DIGCTL_ADDR);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->digctl), 0,
+                       qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_DIGCTL_TRAP));
     stmp3770_clkctrl_set_hclk_rate_callback(s->clkctrl,
                                              stmp3770_digctl_set_hclk_rate,
                                              s->digctl);

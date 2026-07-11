@@ -4841,6 +4841,112 @@ async function testDigctlDcpBistStatusContract() {
   });
 }
 
+async function testDigctlTrapContract() {
+  await withMachine(async (machine) => {
+    const trapRangeLow = 0x8001c010;
+    const trapRangeHigh = 0x8001c01f;
+    const trapIrqMask = 1 << 15; /* ICOLL RAW1 bit 15 = source 47 DIGCTL_TRAP */
+
+    /* Set trap address range and enable trap with TRAP_IN_RANGE=1 */
+    await machine.writel(DIGCTL_BASE + 0x2c0, trapRangeLow);
+    await machine.writel(DIGCTL_BASE + 0x2d0, trapRangeHigh);
+    await machine.writel(DIGCTL_BASE + 0x000, 0x00000034);
+
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x2c0),
+      trapRangeLow,
+      'DIGCTL DEBUG_TRAP_ADDR_LOW must retain written value',
+    );
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x2d0),
+      trapRangeHigh,
+      'DIGCTL DEBUG_TRAP_ADDR_HIGH must retain written value',
+    );
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00000034,
+      'DIGCTL CTRL must reflect TRAP_ENABLE, TRAP_IN_RANGE and USB_CLKGATE',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      0,
+      'ICOLL RAW1 source 47 must be deasserted before a trap',
+    );
+
+    /* Access STATUS (0x8001c010) which is inside the trap range */
+    const status = await machine.readl(DIGCTL_BASE + 0x010);
+    assert.equal(
+      status,
+      0xf0000000,
+      'DIGCTL STATUS read must still return the correct value when trapped',
+    );
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x20000034,
+      'DIGCTL CTRL.TRAP_IRQ must set when an in-range AHB access is trapped',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      trapIrqMask,
+      'ICOLL source 47 (DIGCTL_TRAP) must assert when TRAP_IRQ is set',
+    );
+
+    /* Clear TRAP_IRQ via CLR alias (0x8001c008 is outside the trap range) */
+    await machine.writel(DIGCTL_BASE + 0x008, 0x20000000);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00000034,
+      'DIGCTL CTRL.TRAP_IRQ must clear via CLR alias',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      0,
+      'ICOLL source 47 must deassert when TRAP_IRQ is cleared',
+    );
+
+    /* Change TRAP_IN_RANGE to 0 (outside range triggers) and read CTRL (0x8001c000) which is outside */
+    await machine.writel(DIGCTL_BASE + 0x000, 0x00000014);
+    await machine.readl(DIGCTL_BASE + 0x000);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x20000014,
+      'DIGCTL CTRL.TRAP_IRQ must set when an out-of-range AHB access is trapped and TRAP_IN_RANGE=0',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      trapIrqMask,
+      'ICOLL source 47 must assert on out-of-range trap',
+    );
+
+    /* W1C clear TRAP_IRQ via base write while preserving TRAP_ENABLE/TRAP_IN_RANGE/USB_CLKGATE */
+    await machine.writel(DIGCTL_BASE + 0x000, 0x20000034);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00000034,
+      'DIGCTL CTRL.TRAP_IRQ must be W1C-clearable via base write',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      0,
+      'ICOLL source 47 must deassert when TRAP_IRQ is W1C-cleared',
+    );
+
+    /* Disable trap and confirm no more triggers */
+    await machine.writel(DIGCTL_BASE + 0x000, 0x00000004);
+    await machine.readl(DIGCTL_BASE + 0x010);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00000004,
+      'DIGCTL CTRL.TRAP_IRQ must not set when TRAP_ENABLE is disabled',
+    );
+    assert.equal(
+      await machine.readl(ICOLL_BASE + 0x050),
+      0,
+      'ICOLL source 47 must stay deasserted when TRAP_ENABLE is disabled',
+    );
+  });
+}
+
 async function testClkctrlResetContract() {
   await withMachine(async (machine) => {
     const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
@@ -5496,6 +5602,7 @@ const tests = [
   ['DIGCTL HCLK counter contract', testDigctlHclkCountContract],
   ['DIGCTL read-only status contract', testDigctlReadOnlyStatusContract],
   ['DIGCTL DCP BIST status contract', testDigctlDcpBistStatusContract],
+  ['DIGCTL trap contract', testDigctlTrapContract],
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],

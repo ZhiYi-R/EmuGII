@@ -31,6 +31,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -109,7 +110,11 @@
 #define CTRL_USE_SERIAL_JTAG    (1U << 6)
 #define CTRL_DCP_BIST_START     (1U << 22)
 #define CTRL_DCP_BIST_CLKEN     (1U << 23)
+#define CTRL_TRAP_IRQ           (1U << 29)
 #define CTRL_RW_MASK            0x20FFF87FU
+
+/* DIGCTL MMIO base (for AHB trap address matching) */
+#define DIGCTL_MMIO_BASE        0x8001C000U
 
 /* STATUS register bits (7.4.2) */
 #define STATUS_USB_FEATURES     ((1U << 31) | (1U << 30) | (1U << 29) | (1U << 28))
@@ -156,6 +161,7 @@ struct STMP3770DIGCTLState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    qemu_irq irq_trap;
 
     /* Control / status */
     uint32_t ctrl;
@@ -279,6 +285,40 @@ static uint32_t digctl_entropy_get(STMP3770DIGCTLState *s)
     return (uint32_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+static void digctl_update_trap_irq(STMP3770DIGCTLState *s)
+{
+    if (s->irq_trap) {
+        qemu_set_irq(s->irq_trap, (s->ctrl & CTRL_TRAP_IRQ) != 0);
+    }
+}
+
+static void digctl_check_trap(STMP3770DIGCTLState *s, hwaddr offset)
+{
+    uint32_t addr;
+    bool in_range;
+    bool match;
+
+    if (!(s->ctrl & CTRL_TRAP_ENABLE)) {
+        return;
+    }
+
+    addr = (uint32_t)(DIGCTL_MMIO_BASE + offset);
+
+    if (s->debug_trap_addr_low <= s->debug_trap_addr_high) {
+        in_range = (addr >= s->debug_trap_addr_low &&
+                    addr <= s->debug_trap_addr_high);
+    } else {
+        in_range = false;
+    }
+
+    match = (s->ctrl & CTRL_TRAP_IN_RANGE) ? in_range : !in_range;
+
+    if (match) {
+        s->ctrl |= CTRL_TRAP_IRQ;
+        digctl_update_trap_irq(s);
+    }
+}
+
 static void digctl_microseconds_set(STMP3770DIGCTLState *s, uint32_t value)
 {
     s->microseconds = value;
@@ -323,6 +363,7 @@ static uint64_t stmp3770_digctl_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t value = 0;
     hwaddr reg = offset & ~0xFULL;
     hwaddr alias = offset & 0xFULL;
+    hwaddr original_offset = offset;
 
     if (alias != 0 && !digctl_has_sct_alias(reg)) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -332,6 +373,10 @@ static uint64_t stmp3770_digctl_read(void *opaque, hwaddr offset, unsigned size)
 
     /* Supported SET/CLR/TOG variants read identically to the base register */
     offset = reg;
+
+    /* AHB debug trap: update TRAP_IRQ before returning CTRL, so the same
+     * read that triggers the trap observes the newly set status bit. */
+    digctl_check_trap(s, original_offset);
 
     switch (offset) {
     case REG_CTRL:
@@ -470,6 +515,7 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
     uint32_t old_ctrl = 0;
     bool latch_entropy = false;
     hwaddr reg = offset & ~0xFULL;
+    hwaddr original_offset = offset;
 
     if ((is_set || is_clr || is_tog) && !digctl_has_sct_alias(reg)) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -488,11 +534,11 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
 
     case REG_STATUS:
         /* Read-only, ignore writes */
-        return;
+        goto write_done;
 
     case REG_HCLKCOUNT:
         /* Read-only, ignore writes */
-        return;
+        goto write_done;
 
     case REG_RAMCTRL:
         target = &s->ramctrl;
@@ -516,15 +562,15 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
             s->writeonce_written = true;
             s->status |= (1U << 0);  /* STATUS.WRITTEN */
         }
-        return;
+        goto write_done;
 
     case REG_ENTROPY:
         /* Read-only */
-        return;
+        goto write_done;
 
     case REG_ENTROPY_LATCHED:
         /* Read-only */
-        return;
+        goto write_done;
 
     case REG_SJTAGDBG:
         target = &s->sjtagdbg;
@@ -534,12 +580,12 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
     case REG_MICROSECONDS:
         digctl_microseconds_set(s, digctl_apply_sct(digctl_microseconds_get(s),
                                                     val, is_set, is_clr, is_tog));
-        return;
+        goto write_done;
 
     case REG_DBGRD:
     case REG_DBG:
         /* Read-only debug values */
-        return;
+        goto write_done;
 
     case REG_OCRAM_BIST_CSR:
         s->ocram_bist_csr =
@@ -553,11 +599,11 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
             s->ocram_bist_csr |= (1U << 1);   /* set DONE */
             s->ocram_bist_csr |= (1U << 2);   /* set PASS */
         }
-        return;
+        goto write_done;
 
     case REG_OCRAM_STATUS0 ... REG_OCRAM_STATUS13:
         /* Read-only BIST status registers */
-        return;
+        goto write_done;
 
     case REG_SCRATCH0:
         target = &s->scratch[0];
@@ -582,7 +628,7 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
 
     case REG_CHIPID:
         /* Read-only */
-        return;
+        goto write_done;
 
     case REG_AHB_STATS_SELECT:
         target = &s->ahb_stats_select;
@@ -620,16 +666,16 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
             qemu_log_mask(LOG_GUEST_ERROR,
                          "%s: MPTE%d_LOC forbidden value 0x800\n",
                          __func__, idx);
-            return;
+            goto write_done;
         }
         s->mpte_loc[idx] = masked;
-        return;
+        goto write_done;
     }
 
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                      "%s: bad offset 0x%" HWADDR_PRIx "\n", __func__, offset);
-        return;
+        goto write_done;
     }
 
     if (target) {
@@ -655,12 +701,27 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
                 s->status |= STATUS_DCP_BIST_DONE | STATUS_DCP_BIST_PASS;
                 s->status &= ~STATUS_DCP_BIST_FAIL;
             }
+
+            /* TRAP_IRQ is set by the AHB trap logic; for base writes a write
+             * of 1 is W1C clear, and writing 0 preserves the previous state. */
+            if (!is_set && !is_clr && !is_tog) {
+                uint32_t trap_irq = old_ctrl & CTRL_TRAP_IRQ;
+
+                if (val & CTRL_TRAP_IRQ) {
+                    trap_irq = 0;
+                }
+                s->ctrl = (s->ctrl & ~CTRL_TRAP_IRQ) | trap_irq;
+            }
         }
 
         if (latch_entropy) {
             s->entropy_latched = digctl_entropy_get(s);
         }
     }
+
+write_done:
+    digctl_check_trap(s, original_offset);
+    digctl_update_trap_irq(s);
 }
 
 static const MemoryRegionOps stmp3770_digctl_ops = {
@@ -710,6 +771,8 @@ static void stmp3770_digctl_reset(DeviceState *dev)
     for (int i = 0; i < 8; i++) {
         s->mpte_loc[i] = i;
     }
+
+    digctl_update_trap_irq(s);
 }
 
 void stmp3770_digctl_dig_reset(STMP3770DIGCTLState *s)
@@ -729,6 +792,7 @@ static void stmp3770_digctl_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &stmp3770_digctl_ops, s,
                           TYPE_STMP3770_DIGCTL, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
+    sysbus_init_irq(sbd, &s->irq_trap);
 }
 
 static const VMStateDescription vmstate_stmp3770_digctl = {
