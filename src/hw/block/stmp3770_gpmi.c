@@ -477,6 +477,7 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
     uint32_t status1 = BCH_STATUS1_NOT_CHECKED;
     unsigned int cs;
     unsigned int block;
+    bool bus_error = false;
 
     if (!bch || (bch->ctrl & (BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE |
                               BCH_CTRL_AHBM_SFTRST | BCH_CTRL_COMPLETE_IRQ))) {
@@ -486,10 +487,13 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
     buffer_mask = s->eccctrl & GPMI_ECCCTRL_BUFFER_MASK_MASK;
     for (block = 0; block < 8; block++) {
         if ((buffer_mask & (1U << block)) && s->payload) {
-            address_space_write(&address_space_memory,
-                                s->payload + block * 512,
-                                MEMTXATTRS_UNSPECIFIED,
-                                s->page_buf + block * 512, 512);
+            if (address_space_write(&address_space_memory,
+                                    s->payload + block * 512,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    s->page_buf + block * 512, 512) !=
+                MEMTX_OK) {
+                bus_error = true;
+            }
         }
     }
     if ((buffer_mask & (1U << 8)) && s->auxiliary) {
@@ -499,16 +503,20 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
             memcpy(aux_meta, s->page_buf + s->page_size,
                    MIN(sizeof(aux_meta), s->page_buf_size - s->page_size));
         }
-        address_space_write(&address_space_memory, s->auxiliary,
-                            MEMTXATTRS_UNSPECIFIED,
-                            aux_meta, sizeof(aux_meta));
+        if (address_space_write(&address_space_memory, s->auxiliary,
+                                MEMTXATTRS_UNSPECIFIED,
+                                aux_meta, sizeof(aux_meta)) != MEMTX_OK) {
+            bus_error = true;
+        }
 
         /* Status byte at offset 16: 0x00 means no error. */
         {
             uint8_t status = 0x00;
-            address_space_write(&address_space_memory, s->auxiliary + 16,
-                                MEMTXATTRS_UNSPECIFIED,
-                                &status, 1);
+            if (address_space_write(&address_space_memory, s->auxiliary + 16,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    &status, 1) != MEMTX_OK) {
+                bus_error = true;
+            }
         }
     }
 
@@ -528,6 +536,9 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
         }
     }
 
+    if (bus_error) {
+        bch->ctrl |= BCH_CTRL_BM_ERROR_IRQ;
+    }
     bch->status0 = status0;
     bch->status1 = status1;
     bch->ctrl |= BCH_CTRL_COMPLETE_IRQ;

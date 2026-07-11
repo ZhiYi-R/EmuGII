@@ -3646,6 +3646,51 @@ async function testEcc8RegisterContract() {
   });
 }
 
+async function testEcc8AhbBusErrorContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const commandRead = 1 << 24;
+    const wordLength8Bit = 1 << 23;
+    const addressData = 0 << 17;
+    const enableEcc = 1 << 12;
+
+    /* Release BCH and GPMI from reset/clock gate. */
+    await machine.writel(BCH_BASE + 0x008, 0xe0000000);
+    await machine.writel(GPMI_BASE + 0x000, 0);
+
+    /* Use an unmapped PAYLOAD address and select payload buffer 0. */
+    await machine.writel(GPMI_BASE + 0x040, 0xdead0000);
+    await machine.writel(GPMI_BASE + 0x020, enableEcc | 1);
+
+    const readCtrl0 = runBit | commandRead | wordLength8Bit | addressData | 1;
+    await machine.writel(GPMI_BASE + 0x000, readCtrl0);
+
+    assert.notEqual(
+      (await machine.readl(BCH_BASE + 0x000)) & (1 << 3),
+      0,
+      'ECC8 must set BM_ERROR_IRQ when the AHB master cannot write the payload buffer',
+    );
+    assert.notEqual(
+      (await machine.readl(BCH_BASE + 0x000)) & 1,
+      0,
+      'ECC8 must still set COMPLETE_IRQ after an AHB bus error',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 21),
+      0,
+      'ECC8 AHB bus error must assert the ECC8 ICOLL source (raw bit 21)',
+    );
+
+    /* BM_ERROR_IRQ must be sticky until cleared by CTRL_CLR. */
+    await machine.writel(BCH_BASE + 0x008, 1 << 3);
+    assert.equal(
+      (await machine.readl(BCH_BASE + 0x000)) & (1 << 3),
+      0,
+      'ECC8 BM_ERROR_IRQ must clear with CTRL_CLR',
+    );
+  });
+}
+
 async function testGpmiDataFifoContract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x000, 0);
@@ -6421,6 +6466,7 @@ const tests = [
   ['APBH DMA WAIT4ENDCMD freeze/clkgate/reset contract', testApbhDmaWait4endcmdFreezeClkgateResetContract],
   ['ECC8 completion result contract', testEcc8CompletionResultContract],
   ['ECC8 register contract', testEcc8RegisterContract],
+  ['ECC8 AHB bus error contract', testEcc8AhbBusErrorContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
   ['GPMI RUN WORD_LENGTH XFER_COUNT contract', testGpmiRunWordLengthXferCountContract],
   ['APBH DMA 64 KiB and AHB error contract', testApbhDma64KAndAhbErrorContract],
