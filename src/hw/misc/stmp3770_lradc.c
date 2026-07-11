@@ -114,6 +114,8 @@ struct STMP3770LRADCState {
 #define CTRL0_RW_MASK   (CTRL0_SFTRST | CTRL0_CLKGATE | (0x3FU << 16) | CTRL0_SCHEDULE_MASK)
 #define CTRL2_BL_ENABLE  (1U << 22)
 #define CTRL2_TEMPSENSE_PWD (1U << 15)
+#define CTRL2_TEMP_SENSOR_IENABLE0 (1U << 8)
+#define CTRL2_TEMP_SENSOR_IENABLE1 (1U << 9)
 #define DELAY_KICK       (1U << 20)
 #define DELAY_TICK_NS    500000
 
@@ -193,7 +195,13 @@ static uint32_t lradc_sample_value(STMP3770LRADCState *s, int ch)
     uint32_t value = 0;
 
     if (physical < 8) {
-        value = 0xABC;
+        if (physical == 0 && (s->ctrl2 & CTRL2_TEMP_SENSOR_IENABLE0)) {
+            value = (s->ctrl2 & 0xFU) << 8;
+        } else if (physical == 1 && (s->ctrl2 & CTRL2_TEMP_SENSOR_IENABLE1)) {
+            value = ((s->ctrl2 >> 4) & 0xFU) << 8;
+        } else {
+            value = 0xABC;
+        }
     } else if (physical == 8 || physical == 9) {
         if (s->ctrl2 & CTRL2_TEMPSENSE_PWD) {
             return 0;

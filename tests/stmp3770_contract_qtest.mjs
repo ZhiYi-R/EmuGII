@@ -1298,6 +1298,77 @@ async function testLradcDivideByTwoContract() {
   });
 }
 
+async function testLradcTempCurrentContract() {
+  await withMachine(async (machine) => {
+    /* Bring LRADC out of reset; CH0 maps to physical 0 by default */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+
+    /* Disable current source: physical 0 behaves as a generic input */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'CH0 physical 0 must be 0xabc when TEMP_SENSOR_IENABLE0 is disabled',
+    );
+
+    /* Enable LRADC0 current source at 300 uA (0xF) */
+    await machine.writel(LRADC_BASE + 0x020, 0x0000010f);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xf00,
+      'CH0 physical 0 must be 0xf00 when TEMP_SENSOR_IENABLE0 is enabled with ISRC=0xF',
+    );
+
+    /* Change ISRC0 to 160 uA (0x8) */
+    await machine.writel(LRADC_BASE + 0x020, 0x00000108);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x800,
+      'CH0 physical 0 must be 0x800 when TEMP_SENSOR_IENABLE0 is enabled with ISRC=0x8',
+    );
+
+    /* ISRC0 = 0 (0 uA) should read as zero */
+    await machine.writel(LRADC_BASE + 0x020, 0x00000100);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'CH0 physical 0 must read 0 when TEMP_SENSOR_IENABLE0 is enabled with ISRC=0',
+    );
+
+    /* Disable current source: generic input returns */
+    await machine.writel(LRADC_BASE + 0x020, 0x00000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'CH0 physical 0 must return to 0xabc when TEMP_SENSOR_IENABLE0 is disabled',
+    );
+
+    /* Map CH0 to physical 1 and enable LRADC1 current source at 80 uA (0x4) */
+    await machine.writel(LRADC_BASE + 0x140, 0x76543211);
+    await machine.writel(LRADC_BASE + 0x020, 0x00000240);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x400,
+      'CH0 physical 1 must be 0x400 when TEMP_SENSOR_IENABLE1 is enabled with ISRC=0x4',
+    );
+
+    /* Combine with DIVIDE_BY_TWO: 0xF00 -> 0x780 */
+    await machine.writel(LRADC_BASE + 0x140, 0x76543210);
+    await machine.writel(LRADC_BASE + 0x020, 0x0100010f);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x780,
+      'CH0 physical 0 with ISRC=0xF and DIVIDE_BY_TWO must be halved to 0x780',
+    );
+  });
+}
+
 async function testI2cRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -5143,6 +5214,7 @@ const tests = [
   ['LRADC scheduler contract', testLradcSchedulerContract],
   ['LRADC touch/temperature contract', testLradcTouchTemperatureContract],
   ['LRADC divide-by-two contract', testLradcDivideByTwoContract],
+  ['LRADC temperature current source contract', testLradcTempCurrentContract],
   ['I2C register contract', testI2cRegisterContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],
