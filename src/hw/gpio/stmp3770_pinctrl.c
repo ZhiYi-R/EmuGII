@@ -364,7 +364,7 @@ static uint32_t stmp3770_pinctrl_read_din(STMP3770PINCTRLState *s, int bank)
         val |= 1U << 14;
     }
 
-    return val;
+    return val & bank_pin_mask[bank];
 }
 
 static void stmp3770_pinctrl_reset(DeviceState *dev)
@@ -433,20 +433,23 @@ static uint64_t stmp3770_pinctrl_read(void *opaque, hwaddr offset,
         break;
 
     case REG_MUXSEL0 ... REG_MUXSEL7:
-        val = s->muxsel[(offset - REG_MUXSEL0) >> 4];
+        bank = (offset - REG_MUXSEL0) >> 4;
+        val = s->muxsel[bank] & muxsel_mask[bank];
         break;
 
     case REG_DRIVE0 ... REG_DRIVE14:
-        val = s->drive[(offset - REG_DRIVE0) >> 4];
+        bank = (offset - REG_DRIVE0) >> 4;
+        val = s->drive[bank] & drive_mask[bank];
         break;
 
     case REG_PULL0 ... REG_PULL3:
-        val = s->pull[(offset - REG_PULL0) >> 4];
+        bank = (offset - REG_PULL0) >> 4;
+        val = s->pull[bank] & pull_mask[bank];
         break;
 
     case REG_DOUT0 ... REG_DOUT3:
         bank = (offset - REG_DOUT0) >> 4;
-        val = s->dout[bank];
+        val = s->dout[bank] & bank_pin_mask[bank];
         break;
 
     case REG_DIN0 ... REG_DIN3:
@@ -456,32 +459,32 @@ static uint64_t stmp3770_pinctrl_read(void *opaque, hwaddr offset,
 
     case REG_DOE0 ... REG_DOE3:
         bank = (offset - REG_DOE0) >> 4;
-        val = s->doe[bank];
+        val = s->doe[bank] & bank_pin_mask[bank];
         break;
 
     case REG_PIN2IRQ0 ... REG_PIN2IRQ3:
         bank = (offset - REG_PIN2IRQ0) >> 4;
-        val = s->pin2irq[bank];
+        val = s->pin2irq[bank] & bank_pin_mask[bank];
         break;
 
     case REG_IRQEN0 ... REG_IRQEN3:
         bank = (offset - REG_IRQEN0) >> 4;
-        val = s->irqen[bank];
+        val = s->irqen[bank] & bank_pin_mask[bank];
         break;
 
     case REG_IRQLEVEL0 ... REG_IRQLEVEL3:
         bank = (offset - REG_IRQLEVEL0) >> 4;
-        val = s->irqlevel[bank];
+        val = s->irqlevel[bank] & bank_pin_mask[bank];
         break;
 
     case REG_IRQPOL0 ... REG_IRQPOL3:
         bank = (offset - REG_IRQPOL0) >> 4;
-        val = s->irqpol[bank];
+        val = s->irqpol[bank] & bank_pin_mask[bank];
         break;
 
     case REG_IRQSTAT0 ... REG_IRQSTAT3:
         bank = (offset - REG_IRQSTAT0) >> 4;
-        val = s->irqstat[bank];
+        val = s->irqstat[bank] & bank_pin_mask[bank];
         break;
 
     default:

@@ -95,10 +95,26 @@ struct STMP3770LRADCState {
 
 /* Channel result bits */
 #define CH_TOGGLE       (1U << 31)
+#define CH_TESTMODE_TOGGLE (1U << 30)
 #define CH_ACCUMULATE   (1U << 29)
 #define CH_NUM_SAMPLES_SHIFT 24
 #define CH_NUM_SAMPLES_MASK  0x1F
 #define CH_VALUE_MASK   0x3FFFF
+
+/* CH0-6 write/read mask (bit 30 and 23:18 are reserved) */
+#define CH_RW_MASK      (CH_TOGGLE | CH_ACCUMULATE | \
+                         (CH_NUM_SAMPLES_MASK << CH_NUM_SAMPLES_SHIFT) | CH_VALUE_MASK)
+/* CH7 read mask also exposes TESTMODE_TOGGLE (bit 30) */
+#define CH7_R_MASK      (CH_TOGGLE | CH_TESTMODE_TOGGLE | CH_ACCUMULATE | \
+                         (CH_NUM_SAMPLES_MASK << CH_NUM_SAMPLES_SHIFT) | CH_VALUE_MASK)
+
+/* Remaining LRADC register write/read masks */
+#define CTRL1_RW_MASK   0x01FF01FFU
+#define CTRL2_RW_MASK   0xFFFFB3FFU
+#define CTRL3_RW_MASK   0x03C00333U
+#define CONVERSION_RW_MASK 0x001303FFU
+#define DEBUG1_RW_MASK  0x00001F07U
+#define DELAY_RW_MASK   0xFF1FFFFFU
 
 /* STATUS bits */
 #define STATUS_CHANNEL_PRESENT_MASK 0x07FF0000
@@ -161,6 +177,8 @@ static void lradc_update_pwm2_analog_enable(STMP3770LRADCState *s)
     }
 }
 
+static void lradc_reset(DeviceState *dev);
+
 static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770LRADCState *s = opaque;
@@ -169,16 +187,16 @@ static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (base) {
     case REG_CTRL0:
-        ret = s->ctrl0;
+        ret = s->ctrl0 & CTRL0_RW_MASK;
         break;
     case REG_CTRL1:
-        ret = s->ctrl1;
+        ret = s->ctrl1 & CTRL1_RW_MASK;
         break;
     case REG_CTRL2:
-        ret = s->ctrl2;
+        ret = s->ctrl2 & CTRL2_RW_MASK;
         break;
     case REG_CTRL3:
-        ret = s->ctrl3;
+        ret = s->ctrl3 & CTRL3_RW_MASK;
         break;
     case REG_STATUS:
         /* Report all LRADC channels as present */
@@ -187,42 +205,34 @@ static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
     case REG_CH0 ... REG_CH7:
         {
             int ch = (base - REG_CH0) >> 4;
-            /*
-             * Channel 7: Battery voltage (based on ExistOS BSP analysis)
-             * ExistOS stmp_power.cpp:158-170 expects:
-             *   ADC_val = (Vbatt / 4) / 3.3 * 4095
-             *   For 3.7V battery: ADC ≈ 460
-             *   For 0V (disconnected): ADC ≈ 2748 (ExistOS log shows this)
-             *
-             * Simulate disconnected battery (USB powered):
-             */
             ret = s->channel[ch];
             if (ch == 7) {
-                /* Replace VALUE field with simulated battery ADC, keep control bits */
-                ret = (ret & ~CH_VALUE_MASK) | (2748 & CH_VALUE_MASK);
+                ret &= CH7_R_MASK;
+            } else {
+                ret &= CH_RW_MASK;
             }
         }
         break;
     case REG_DELAY0:
-        ret = s->delay[0];
+        ret = s->delay[0] & DELAY_RW_MASK;
         break;
     case REG_DELAY1:
-        ret = s->delay[1];
+        ret = s->delay[1] & DELAY_RW_MASK;
         break;
     case REG_DELAY2:
-        ret = s->delay[2];
+        ret = s->delay[2] & DELAY_RW_MASK;
         break;
     case REG_DELAY3:
-        ret = s->delay[3];
+        ret = s->delay[3] & DELAY_RW_MASK;
         break;
     case REG_DEBUG0:
         ret = 0x43210000;
         break;
     case REG_DEBUG1:
-        ret = s->debug1;
+        ret = s->debug1 & DEBUG1_RW_MASK;
         break;
     case REG_CONVERSION:
-        ret = s->conversion;
+        ret = s->conversion & CONVERSION_RW_MASK;
         break;
     case REG_CTRL4:
         ret = s->ctrl4;
@@ -252,11 +262,11 @@ static void lradc_write(void *opaque, hwaddr offset,
     case REG_CTRL0:
         lradc_apply_sct(&s->ctrl0, (uint32_t)value, sct, offset, size);
         s->ctrl0 &= CTRL0_RW_MASK;
-        /* Hardware ties CLKGATE to SFTRST */
+        /* SFTRST resets the entire LRADC block; it also gates the clock. */
         if (s->ctrl0 & CTRL0_SFTRST) {
+            lradc_reset(DEVICE(s));
             s->ctrl0 |= CTRL0_CLKGATE;
-        } else {
-            s->ctrl0 &= ~CTRL0_CLKGATE;
+            s->ctrl0 &= ~CTRL0_SCHEDULE_MASK;
         }
         /* Complete any scheduled conversions immediately */
         if (s->ctrl0 & CTRL0_SCHEDULE_MASK) {
@@ -265,13 +275,16 @@ static void lradc_write(void *opaque, hwaddr offset,
         break;
     case REG_CTRL1:
         lradc_apply_sct(&s->ctrl1, (uint32_t)value, sct, offset, size);
+        s->ctrl1 &= CTRL1_RW_MASK;
         break;
     case REG_CTRL2:
         lradc_apply_sct(&s->ctrl2, (uint32_t)value, sct, offset, size);
+        s->ctrl2 &= CTRL2_RW_MASK;
         lradc_update_pwm2_analog_enable(s);
         break;
     case REG_CTRL3:
         lradc_apply_sct(&s->ctrl3, (uint32_t)value, sct, offset, size);
+        s->ctrl3 &= CTRL3_RW_MASK;
         break;
     case REG_CTRL4:
         lradc_apply_sct(&s->ctrl4, (uint32_t)value, sct, offset, size);
@@ -279,27 +292,34 @@ static void lradc_write(void *opaque, hwaddr offset,
     case REG_CH0 ... REG_CH7:
         lradc_apply_sct(&s->channel[(base - REG_CH0) >> 4], (uint32_t)value,
                         sct, offset, size);
+        s->channel[(base - REG_CH0) >> 4] &= CH_RW_MASK;
         break;
     case REG_DELAY0:
         lradc_apply_sct(&s->delay[0], (uint32_t)value, sct, offset, size);
+        s->delay[0] &= DELAY_RW_MASK;
         break;
     case REG_DELAY1:
         lradc_apply_sct(&s->delay[1], (uint32_t)value, sct, offset, size);
+        s->delay[1] &= DELAY_RW_MASK;
         break;
     case REG_DELAY2:
         lradc_apply_sct(&s->delay[2], (uint32_t)value, sct, offset, size);
+        s->delay[2] &= DELAY_RW_MASK;
         break;
     case REG_DELAY3:
         lradc_apply_sct(&s->delay[3], (uint32_t)value, sct, offset, size);
+        s->delay[3] &= DELAY_RW_MASK;
         break;
     case REG_DEBUG0:
         /* Read-only */
         break;
     case REG_DEBUG1:
         lradc_apply_sct(&s->debug1, (uint32_t)value, sct, offset, size);
+        s->debug1 &= DEBUG1_RW_MASK;
         break;
     case REG_CONVERSION:
         lradc_apply_sct(&s->conversion, (uint32_t)value, sct, offset, size);
+        s->conversion &= CONVERSION_RW_MASK;
         break;
     case REG_STATUS:
     case REG_VERSION:
@@ -336,6 +356,8 @@ static void lradc_reset(DeviceState *dev)
     s->conversion = 0x00000080;
     s->version = LRADC_VERSION;
     memset(s->channel, 0, sizeof(s->channel));
+    /* Channel 7 is the battery monitor; default to disconnected battery (USB powered) */
+    s->channel[7] = 2748;
     memset(s->delay, 0, sizeof(s->delay));
     s->debug0 = 0x43210000;
     s->debug1 = 0;
@@ -390,6 +412,7 @@ static void lradc_init(Object *obj)
     s->conversion = 0x00000080;
     s->version = LRADC_VERSION;
     memset(s->channel, 0, sizeof(s->channel));
+    s->channel[7] = 2748;
     memset(s->delay, 0, sizeof(s->delay));
     s->debug0 = 0x43210000;
     s->debug1 = 0;

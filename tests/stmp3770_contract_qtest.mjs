@@ -911,6 +911,79 @@ async function testPwm2AnalogEnableContract() {
   });
 }
 
+async function testLradcRegisterContract() {
+  await withMachine(async (machine) => {
+    /* CTRL0 resets with SFTRST and CLKGATE asserted */
+    const ctrl0 = await machine.readl(LRADC_BASE + 0x000);
+    assert.equal(ctrl0, 0xc0000000, 'LRADC CTRL0 must reset with SFTRST/CLKGATE');
+
+    /* Reserved bits in CTRL1-3 and CONVERSION read as zero and are not writable */
+    await machine.writel(LRADC_BASE + 0x010, 0xffffffff);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x010),
+      0x01ff01ff,
+      'LRADC CTRL1 must mask reserved bits 31:25 and 15:9',
+    );
+    await machine.writel(LRADC_BASE + 0x020, 0xffffffff);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x020),
+      0xffffb3ff,
+      'LRADC CTRL2 must mask reserved bits 14 and 11:10',
+    );
+    await machine.writel(LRADC_BASE + 0x030, 0xffffffff);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x030),
+      0x03c00333,
+      'LRADC CTRL3 must mask reserved bits 31:26, 21:14, 13:10, 7:6, 3:2',
+    );
+    await machine.writel(LRADC_BASE + 0x130, 0xffffffff);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x130),
+      0x001303ff,
+      'LRADC CONVERSION must mask reserved bits 31:21, 19:18, 15:10',
+    );
+
+    /* Channel 7 defaults to the disconnected-battery value used by ExistOS */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x0c0)) & 0x3ffff,
+      2748,
+      'LRADC CH7 VALUE must reset to 2748 (disconnected battery)',
+    );
+
+    /* CH0-6 bit 30 is reserved; CH7 bit 30 is TESTMODE_TOGGLE (kept RO) */
+    await machine.writel(LRADC_BASE + 0x050, 0xffffffff);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x050),
+      0xbf03ffff,
+      'LRADC CH0 must mask reserved bits 30 and 23:18',
+    );
+    await machine.writel(LRADC_BASE + 0x0c0, 0xffffffff);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x0c0)) & 0x3ffff,
+      0x3ffff,
+      'LRADC CH7 VALUE must be writable (software value semantics)',
+    );
+
+    /* SFTRST resets the entire LRADC block, restoring CH7 default */
+    await machine.writel(LRADC_BASE + 0x000, 0x80000000);
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x000),
+      0xc0000000,
+      'LRADC SFTRST must gate clock and remain asserted',
+    );
+    assert.equal(
+      await machine.readl(LRADC_BASE + 0x010),
+      0,
+      'LRADC SFTRST must clear CTRL1',
+    );
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x0c0)) & 0x3ffff,
+      2748,
+      'LRADC SFTRST must restore CH7 default value',
+    );
+  });
+}
+
 async function testI2cRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -3160,6 +3233,44 @@ async function testLcdifDataAccessContract() {
   });
 }
 
+async function testPinctrlCtrl() {
+  await withMachine(async (machine) => {
+    /* Reset: SFTRST and CLKGATE set, PRESENT0/1/2 set, PRESENT3 clear, IRQOUT clear. */
+    const ctrl = await machine.readl(PINCTRL_BASE + 0x000);
+    assert.equal(
+      (ctrl & 0xFC00000F) >>> 0,
+      0xDC000000,
+      'PINCTRL CTRL must reset with SFTRST/CLKGATE/PRESENT0/1/2 set and IRQOUT clear',
+    );
+    assert.equal(ctrl & (1 << 29), 0, 'PINCTRL PRESENT3 must be 0 on STMP3770');
+
+    /* Clear SFTRST/CLKGATE and set up a level-active GPIO0 interrupt. */
+    await machine.writel(PINCTRL_BASE + 0x008, 0xC0000000); /* CTRL_CLR */
+    await machine.writel(PINCTRL_BASE + 0x600, 0x00000001); /* DOE0 */
+    await machine.writel(PINCTRL_BASE + 0x700, 0x00000001); /* PIN2IRQ0 */
+    await machine.writel(PINCTRL_BASE + 0x800, 0x00000001); /* IRQEN0 */
+    await machine.writel(PINCTRL_BASE + 0x900, 0x00000001); /* IRQLEVEL0 */
+    await machine.writel(PINCTRL_BASE + 0xA00, 0x00000001); /* IRQPOL0 */
+    await machine.writel(PINCTRL_BASE + 0x400, 0x00000001); /* DOUT0 high */
+
+    const ctrl_irq = await machine.readl(PINCTRL_BASE + 0x000);
+    assert.equal(
+      ctrl_irq & 0xF,
+      0x1,
+      'PINCTRL CTRL IRQOUT0 must reflect the active level-sensitive GPIO0 interrupt',
+    );
+
+    /* Writing SFTRST=1 must clear the IRQOUT view and leave PRESENT bits untouched. */
+    await machine.writel(PINCTRL_BASE + 0x000, 0xFFFFFFFF); /* CTRL */
+    const ctrl_after = await machine.readl(PINCTRL_BASE + 0x000);
+    assert.equal(
+      (ctrl_after & 0xFC00000F) >>> 0,
+      0xDC000000,
+      'PINCTRL CTRL must re-enter reset state (SFTRST/CLKGATE/PRESENT preserved, IRQOUT cleared)',
+    );
+  });
+}
+
 async function testPinctrlBank3Absent() {
   await withMachine(async (machine) => {
     const ctrl = await machine.readl(PINCTRL_BASE + 0x000);
@@ -3248,6 +3359,18 @@ async function testPinctrlDriveAndPullMasks() {
       await machine.readl(PINCTRL_BASE + 0x320),
       0x00004000,
       'PINCTRL PULL2 must retain only the EMI_CE2N pullup-enable bit',
+    );
+
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x330),
+      0,
+      'PINCTRL PULL3 must reset to 0 (all pad keepers enabled)',
+    );
+    await machine.writel(PINCTRL_BASE + 0x330, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x330),
+      0x0003ffff,
+      'PINCTRL PULL3 must retain only bits 17:0 (pad-keeper disable bits)',
     );
 
     assert.equal(
@@ -4701,6 +4824,7 @@ const tests = [
   ['PWM waveform contract', testPwmWaveformContract],
   ['PWM MATT contract', testPwmMattContract],
   ['PWM2 analog enable contract', testPwm2AnalogEnableContract],
+  ['LRADC register contract', testLradcRegisterContract],
   ['I2C register contract', testI2cRegisterContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],
@@ -4744,6 +4868,7 @@ const tests = [
   ['DCP key and context register contract', testDcpKeyAndContextRegisterContract],
   ['DCP CSC register map contract', testDcpCscRegisterMapContract],
   ['LCDIF data access contract', testLcdifDataAccessContract],
+  ['PINCTRL CTRL contract', testPinctrlCtrl],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['PINCTRL drive and pull masks', testPinctrlDriveAndPullMasks],
   ['PINCTRL MUXSEL default and reserved mask', testPinctrlMuxselDefaultAndMask],
