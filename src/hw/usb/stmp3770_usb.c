@@ -67,8 +67,9 @@
 
 #define USBCMD_RST          (1U << 1)
 #define USBCMD_RUN          (1U << 0)
+#define USBCMD_WRITABLE_MASK        0x00FFEB7FU
 
-#define USBSTS_W1C_MASK             0x030C05FF
+#define USBSTS_W1C_MASK             0x030D05FF
 #define USBINTR_WRITABLE_MASK        0x030D05FF
 #define USBSTS_URI                  (1U << 6)
 #define GPTIMER_RUN                  (1U << 31)
@@ -333,7 +334,7 @@ static void usb_write(void *opaque, hwaddr offset,
 
     switch (offset) {
     case REG_USBCMD:
-        s->usbcmd = (uint32_t)value;
+        s->usbcmd = (uint32_t)value & USBCMD_WRITABLE_MASK;
         if (s->usbcmd & USBCMD_RST) {
             usb_controller_reset(s);
         }

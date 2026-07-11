@@ -122,7 +122,7 @@ static uint64_t usbphy_read(void *opaque, hwaddr offset, unsigned size)
     case REG_DEBUG1:
         return s->debug1;
     case REG_VERSION:
-        return 0;
+        return 0x03000000;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-usbphy: read from unimplemented offset "

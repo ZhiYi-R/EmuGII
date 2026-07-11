@@ -1435,7 +1435,7 @@ async function testUsbPhyRegisterContract() {
       [0x050, 0x7f180000, 'DEBUG'],
       [0x060, 0x0000900d, 'DEBUG0_STATUS'],
       [0x070, 0x00001000, 'DEBUG1'],
-      [0x080, 0x00000000, 'VERSION'],
+      [0x080, 0x03000000, 'VERSION'],
     ];
 
     for (const [offset, expected, name] of resetValues) {
