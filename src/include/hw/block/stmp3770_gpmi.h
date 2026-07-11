@@ -302,6 +302,9 @@ struct STMP3770BCHState {
     uint32_t status0;
     uint32_t status1;
     uint32_t debug0;
+
+    /* HCLK rate for ECC8 THROTTLE AHB burst timing (0 = not yet known). */
+    uint32_t hclk_hz;
 };
 
 /* GPMI API for SoC integration */
@@ -309,5 +312,6 @@ void stmp3770_gpmi_set_dma(STMP3770GPMIState *s, STMP3770DMAState *dma,
                            int channel_base);
 void stmp3770_gpmi_set_bch(STMP3770GPMIState *s, STMP3770BCHState *bch);
 void stmp3770_gpmi_set_gpmi_rate(STMP3770GPMIState *s, uint32_t gpmi_hz);
+void stmp3770_bch_set_hclk_rate(void *opaque, uint32_t hclk_hz);
 
 #endif /* STMP3770_GPMI_H */

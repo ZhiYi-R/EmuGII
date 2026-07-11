@@ -3746,6 +3746,46 @@ async function testEcc8DebugTriggerContract() {
   });
 }
 
+async function testEcc8ThrottleContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const commandRead = 1 << 24;
+    const wordLength8Bit = 1 << 23;
+    const addressData = 0 << 17;
+    const enableEcc = 1 << 12;
+    const throttle = 1;
+    const payload = SRAM_BASE + 0x18000;
+    const auxiliary = SRAM_BASE + 0x20000;
+
+    /* Release GPMI and BCH from reset; set BCH THROTTLE. */
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    await machine.writel(BCH_BASE + 0x000, throttle << 24);
+
+    const hclkBefore = await machine.readl(DIGCTL_BASE + 0x020);
+
+    await machine.writel(GPMI_BASE + 0x040, payload);
+    await machine.writel(GPMI_BASE + 0x050, auxiliary);
+    await machine.writel(GPMI_BASE + 0x020, enableEcc | 0x10f);
+
+    const readCtrl0 = runBit | commandRead | wordLength8Bit | addressData | 1;
+    await machine.writel(GPMI_BASE + 0x000, readCtrl0);
+
+    const hclkAfter = await machine.readl(DIGCTL_BASE + 0x020);
+    /* 4 payload blocks + 2 aux writes = 6 transfers, 5 inter-burst delays. */
+    assert.equal(
+      hclkAfter - hclkBefore,
+      5 * throttle,
+      `ECC8 THROTTLE=${throttle} should advance HCLKCOUNT by exactly ${5 * throttle} cycles (got ${hclkAfter - hclkBefore})`,
+    );
+
+    assert.notEqual(
+      (await machine.readl(BCH_BASE + 0x000)) & 1,
+      0,
+      'ECC8 must complete after THROTTLE delays',
+    );
+  });
+}
+
 async function testGpmiDataFifoContract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x000, 0);
@@ -6523,6 +6563,7 @@ const tests = [
   ['ECC8 register contract', testEcc8RegisterContract],
   ['ECC8 AHB bus error contract', testEcc8AhbBusErrorContract],
   ['ECC8 debug trigger contract', testEcc8DebugTriggerContract],
+  ['ECC8 THROTTLE contract', testEcc8ThrottleContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
   ['GPMI RUN WORD_LENGTH XFER_COUNT contract', testGpmiRunWordLengthXferCountContract],
   ['APBH DMA 64 KiB and AHB error contract', testApbhDma64KAndAhbErrorContract],

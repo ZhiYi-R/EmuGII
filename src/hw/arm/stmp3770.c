@@ -508,6 +508,11 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     /* Link BCH back to GPMI so ECC completions can raise the BCH IRQ */
     stmp3770_gpmi_set_bch(s->gpmi, s->bch);
 
+    /* Propagate HCLK rate changes to BCH for ECC8 THROTTLE timing. */
+    stmp3770_clkctrl_set_hclk_rate_callback(s->clkctrl,
+                                            stmp3770_bch_set_hclk_rate,
+                                            s->bch);
+
     /* Realize I2C */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->i2c), errp)) {
         return;

@@ -140,8 +140,9 @@ struct STMP3770CLKCTRLState {
 
     STMP3770CLKCTRLDigResetFn dig_reset_cb;
     void *dig_reset_opaque;
-    STMP3770CLKCTRLHclkRateFn hclk_rate_cb;
-    void *hclk_rate_opaque;
+    STMP3770CLKCTRLHclkRateFn hclk_rate_cb[2];
+    void *hclk_rate_opaque[2];
+    size_t hclk_rate_cb_count;
     STMP3770CLKCTRLGpmiRateFn gpmi_rate_cb;
     void *gpmi_rate_opaque;
 };
@@ -239,9 +240,11 @@ uint32_t stmp3770_clkctrl_get_gpmi_rate(STMP3770CLKCTRLState *s)
 
 static void stmp3770_clkctrl_notify_hclk_rate(STMP3770CLKCTRLState *s)
 {
-    if (s->hclk_rate_cb) {
-        s->hclk_rate_cb(s->hclk_rate_opaque,
-                        stmp3770_clkctrl_get_hclk_rate(s));
+    size_t i;
+    uint32_t hclk_hz = stmp3770_clkctrl_get_hclk_rate(s);
+
+    for (i = 0; i < s->hclk_rate_cb_count; i++) {
+        s->hclk_rate_cb[i](s->hclk_rate_opaque[i], hclk_hz);
     }
 }
 
@@ -257,8 +260,11 @@ void stmp3770_clkctrl_set_hclk_rate_callback(STMP3770CLKCTRLState *s,
                                               STMP3770CLKCTRLHclkRateFn cb,
                                               void *opaque)
 {
-    s->hclk_rate_cb = cb;
-    s->hclk_rate_opaque = opaque;
+    if (s->hclk_rate_cb_count < ARRAY_SIZE(s->hclk_rate_cb)) {
+        s->hclk_rate_cb[s->hclk_rate_cb_count] = cb;
+        s->hclk_rate_opaque[s->hclk_rate_cb_count] = opaque;
+        s->hclk_rate_cb_count++;
+    }
     stmp3770_clkctrl_notify_hclk_rate(s);
 }
 

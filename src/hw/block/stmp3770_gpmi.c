@@ -429,6 +429,21 @@ static void stmp3770_gpmi_rdy_busy_set(void *opaque, int n, int level)
     gpmi_check_wait_ready(s, n);
 }
 
+static void bch_throttle_delay(STMP3770BCHState *bch)
+{
+    uint32_t throttle_cycles = (bch->ctrl & BCH_CTRL_THROTTLE_MASK) >> 24;
+
+    if (throttle_cycles == 0 || bch->hclk_hz == 0) {
+        return;
+    }
+
+    /* Advance virtual time by throttle_cycles HCLK periods. */
+    uint64_t delay_ns = (uint64_t)throttle_cycles * NANOSECONDS_PER_SECOND;
+    delay_ns = (delay_ns + bch->hclk_hz - 1) / bch->hclk_hz;
+    qemu_clock_advance_virtual_time(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                    delay_ns);
+}
+
 static void bch_update_irq(STMP3770BCHState *s)
 {
     bool pending = ((s->ctrl & BCH_CTRL_COMPLETE_IRQ) &&
@@ -478,6 +493,7 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
     unsigned int cs;
     unsigned int block;
     bool bus_error = false;
+    bool first_transfer = true;
 
     if (!bch || (bch->ctrl & (BCH_CTRL_SFTRST | BCH_CTRL_CLKGATE |
                               BCH_CTRL_AHBM_SFTRST | BCH_CTRL_COMPLETE_IRQ))) {
@@ -487,6 +503,9 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
     buffer_mask = s->eccctrl & GPMI_ECCCTRL_BUFFER_MASK_MASK;
     for (block = 0; block < 8; block++) {
         if ((buffer_mask & (1U << block)) && s->payload) {
+            if (!first_transfer) {
+                bch_throttle_delay(bch);
+            }
             if (address_space_write(&address_space_memory,
                                     s->payload + block * 512,
                                     MEMTXATTRS_UNSPECIFIED,
@@ -494,6 +513,7 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
                 MEMTX_OK) {
                 bus_error = true;
             }
+            first_transfer = false;
             if (bch->ctrl & BCH_CTRL_DEBUG_WRITE_IRQ_EN) {
                 bch->ctrl |= BCH_CTRL_DEBUG_WRITE_IRQ;
             }
@@ -509,11 +529,15 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
             memcpy(aux_meta, s->page_buf + s->page_size,
                    MIN(sizeof(aux_meta), s->page_buf_size - s->page_size));
         }
+        if (!first_transfer) {
+            bch_throttle_delay(bch);
+        }
         if (address_space_write(&address_space_memory, s->auxiliary,
                                 MEMTXATTRS_UNSPECIFIED,
                                 aux_meta, sizeof(aux_meta)) != MEMTX_OK) {
             bus_error = true;
         }
+        first_transfer = false;
         if (bch->ctrl & BCH_CTRL_DEBUG_WRITE_IRQ_EN) {
             bch->ctrl |= BCH_CTRL_DEBUG_WRITE_IRQ;
         }
@@ -521,6 +545,9 @@ static void gpmi_bch_complete_read(STMP3770GPMIState *s)
         /* Status byte at offset 16: 0x00 means no error. */
         {
             uint8_t status = 0x00;
+            if (!first_transfer) {
+                bch_throttle_delay(bch);
+            }
             if (address_space_write(&address_space_memory, s->auxiliary + 16,
                                     MEMTXATTRS_UNSPECIFIED,
                                     &status, 1) != MEMTX_OK) {
@@ -1718,6 +1745,13 @@ void stmp3770_gpmi_set_bch(STMP3770GPMIState *s, STMP3770BCHState *bch)
     s->bch = bch;
 }
 
+void stmp3770_bch_set_hclk_rate(void *opaque, uint32_t hclk_hz)
+{
+    STMP3770BCHState *s = STMP3770_BCH(opaque);
+
+    s->hclk_hz = hclk_hz;
+}
+
 void stmp3770_gpmi_set_gpmi_rate(STMP3770GPMIState *s, uint32_t gpmi_hz)
 {
     unsigned int channel;
@@ -1967,7 +2001,7 @@ static int bch_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_bch = {
     .name = "stmp3770-bch",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = bch_post_load,
     .fields = (const VMStateField[]) {
@@ -1975,6 +2009,7 @@ static const VMStateDescription vmstate_bch = {
         VMSTATE_UINT32(status0, STMP3770BCHState),
         VMSTATE_UINT32(status1, STMP3770BCHState),
         VMSTATE_UINT32_V(debug0, STMP3770BCHState, 2),
+        VMSTATE_UINT32_V(hclk_hz, STMP3770BCHState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
