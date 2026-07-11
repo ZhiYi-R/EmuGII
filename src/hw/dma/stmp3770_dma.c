@@ -289,6 +289,23 @@ static bool stmp3770_dma_load_command(STMP3770DMAState *s, int ch_idx)
     ch->bar = ch->loaded_bar;
 
     /*
+     * CHn_DEBUG2 exposes the number of APB and AHB bytes remaining in the
+     * current transfer.  Load both fields with the command's XFER_COUNT so
+     * the register is observable while the descriptor is pending.
+     */
+    {
+        unsigned int command = (ch->loaded_cmd >> CMD_COMMAND_SHIFT) &
+                               CMD_COMMAND_MASK;
+        if (command == COMMAND_DMA_WRITE || command == COMMAND_DMA_READ) {
+            uint32_t xfer_count = (ch->loaded_cmd >> CMD_XFER_COUNT_SHIFT) &
+                                  CMD_XFER_COUNT_MASK;
+            ch->debug2 = (xfer_count << 16) | xfer_count;
+        } else {
+            ch->debug2 = 0;
+        }
+    }
+
+    /*
      * Forward PIO words to the registered peripheral handler.  If no handler
      * is installed, just log them for debugging.
      */
@@ -373,6 +390,7 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
         if (xfer_count > 0) {
             g_autofree uint8_t *buf = g_malloc0(xfer_count);
             bool transfer_ok = false;
+            int consumed = 0;
 
             if (command == COMMAND_DMA_WRITE) {
                 /*
@@ -389,6 +407,9 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
                 if (handled < 0) {
                     handled = 0;
                 }
+                if (handled > (int)xfer_count) {
+                    handled = (int)xfer_count;
+                }
                 if ((uint32_t)handled < xfer_count) {
                     qemu_log_mask(LOG_UNIMP,
                                   "%s: channel %d only handled %u/%u write bytes\n",
@@ -396,6 +417,7 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
                                                "stmp3770-apbh-dma",
                                   ch_idx, handled, xfer_count);
                 }
+                consumed = handled;
                 transfer_ok = address_space_rw(&address_space_memory, bar,
                                                MEMTXATTRS_UNSPECIFIED,
                                                buf, xfer_count, 1) == MEMTX_OK;
@@ -404,14 +426,41 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
                  * READ (MXS convention): memory -> peripheral.  Read the
                  * buffer from guest memory at BAR and pass it to the handler.
                  */
+                int written = 0;
                 transfer_ok = address_space_rw(&address_space_memory, bar,
                                                MEMTXATTRS_UNSPECIFIED,
                                                buf, xfer_count, 0) == MEMTX_OK;
                 if (transfer_ok && s->ch_handler[ch_idx].handler) {
-                    s->ch_handler[ch_idx].handler(
+                    written = s->ch_handler[ch_idx].handler(
                         s, ch_idx, STMP3770_DMA_EVENT_DATA_WRITE,
                         buf, xfer_count, s->ch_handler[ch_idx].opaque);
                 }
+                if (written < 0) {
+                    written = 0;
+                }
+                if (written > (int)xfer_count) {
+                    written = (int)xfer_count;
+                }
+                if ((uint32_t)written < xfer_count) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "%s: channel %d only consumed %u/%u read bytes\n",
+                                  s->is_apbx ? "stmp3770-apbx-dma" :
+                                               "stmp3770-apbh-dma",
+                                  ch_idx, written, xfer_count);
+                }
+                consumed = written;
+            }
+
+            /*
+             * CHn_DEBUG2 reflects the number of AHB and APB bytes still
+             * remaining in the current transfer.  The AHB side is complete
+             * once the memory access succeeds, while the APB side reflects
+             * the portion the peripheral handler did not consume.
+             */
+            {
+                uint32_t apb_remaining = xfer_count - (uint32_t)consumed;
+                uint32_t ahb_remaining = transfer_ok ? 0 : xfer_count;
+                ch->debug2 = (apb_remaining << 16) | ahb_remaining;
             }
 
             if (!transfer_ok) {
@@ -440,6 +489,12 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
         s->completion_cb[ch_idx](s, ch_idx, s->completion_opaque[ch_idx]);
         return;
     }
+
+    /*
+     * The command completed synchronously.  Clear the remaining byte count
+     * before the descriptor is retired and the next one is loaded.
+     */
+    ch->debug2 = 0;
 
     /* Update semaphore after the command completes. */
     if (decrement_sema) {
@@ -480,6 +535,8 @@ void stmp3770_dma_complete_channel_command(STMP3770DMAState *s, int ch_idx)
     }
 
     ch = &s->ch[ch_idx];
+    ch->debug2 = 0;
+
     cmd = ch->loaded_cmd;
     irq_on_cmplt = (cmd & CMD_IRQONCMPLT) != 0;
     decrement_sema = (cmd & CMD_SEMAPHORE) != 0;

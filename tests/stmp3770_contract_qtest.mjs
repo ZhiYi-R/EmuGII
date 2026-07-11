@@ -3048,6 +3048,93 @@ async function testGpmiWaitForReadyContract() {
   });
 }
 
+async function testApbhDmaDebug2RemainingByteContract() {
+  await withMachine(async (machine) => {
+    const apbhChannel4CurrentCommand = APBH_BASE + 0x200;
+    const apbhChannel4NextCommand = APBH_BASE + 0x210;
+    const apbhChannel4Semaphore = APBH_BASE + 0x240;
+    const apbhChannel4Debug2 = APBH_BASE + 0x260;
+    const waitDescriptor = SRAM_BASE + 0x3100;
+    const doneDescriptor = SRAM_BASE + 0x3140;
+    const bar = SRAM_BASE + 0x00010000;
+    const commandWaitForReady = 3 << 24;
+    const wordLength8Bit = 1 << 23;
+    const runBit = 1 << 29;
+    const chainBit = 1 << 2;
+    const irqOnCompleteBit = 1 << 3;
+    const nandWaitForReadyBit = 1 << 5;
+    const wait4EndCmdBit = 1 << 7;
+    const onePioWord = 1 << 12;
+    const dmaWrite = 1;
+    const dmaTerminal = (1 << 6) | irqOnCompleteBit;
+
+    const writeDescriptor = async (address, next, command, bar, ctrl0 = undefined) => {
+      await machine.writel(address + 0x00, next);
+      await machine.writel(address + 0x04, command);
+      await machine.writel(address + 0x08, bar);
+      if (ctrl0 !== undefined) {
+        await machine.writel(address + 0x0c, ctrl0);
+      }
+    };
+
+    const waitCtrl0 = runBit | commandWaitForReady | wordLength8Bit;
+    const xferCount = 512;
+    const waitCommand = (xferCount << 16) |
+                        onePioWord | wait4EndCmdBit | nandWaitForReadyBit |
+                        chainBit | dmaWrite;
+
+    await machine.writel(CLKCTRL_BASE + 0x080, 0x00000001);
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    await machine.writel(APBH_BASE + 0x008, 0xc0000000);
+    await machine.setIrqIn('/machine/soc/gpmi', 'rdy-busy', 0, 0);
+
+    await writeDescriptor(waitDescriptor, doneDescriptor, waitCommand, bar, waitCtrl0);
+    await writeDescriptor(doneDescriptor, 0, dmaTerminal, 0);
+
+    await machine.writel(apbhChannel4NextCommand, waitDescriptor);
+    await machine.writel(apbhChannel4Semaphore, 1);
+
+    assert.equal(
+      await machine.readl(apbhChannel4CurrentCommand),
+      waitDescriptor,
+      'APBH CH4 DEBUG2 must keep the current descriptor while WAIT4ENDCMD is pending',
+    );
+    assert.equal(
+      await machine.readl(apbhChannel4Debug2),
+      (xferCount << 16) | 0,
+      'APBH CH4 DEBUG2.APB_BYTES must hold the remaining XFER_COUNT while WAIT4ENDCMD is pending',
+    );
+    assert.equal(
+      await machine.readl(bar),
+      0,
+      'APBH CH4 DMA_WRITE must write the XFER_COUNT bytes to BAR while WAIT4ENDCMD is pending',
+    );
+
+    await machine.setIrqIn('/machine/soc/gpmi', 'rdy-busy', 0, 1);
+    assert.equal(
+      await machine.readl(apbhChannel4CurrentCommand),
+      doneDescriptor,
+      'APBH CH4 DEBUG2 must advance to the next descriptor after WAIT4ENDCMD completes',
+    );
+    assert.equal(
+      await machine.readl(apbhChannel4Debug2),
+      0,
+      'APBH CH4 DEBUG2 must clear remaining bytes after WAIT4ENDCMD completes',
+    );
+    assert.equal(
+      await machine.readl(apbhChannel4Semaphore),
+      0,
+      'APBH CH4 semaphore must be consumed after the terminal descriptor runs',
+    );
+    assert.notEqual(
+      await machine.readl(APBH_BASE + 0x010) & (1 << 4),
+      0,
+      'APBH CH4 CMDCMPLT_IRQ must be set after the terminal descriptor completes',
+    );
+    await machine.setIrqIn('/machine/soc/gpmi', 'rdy-busy', 0, 0);
+  });
+}
+
 async function testEcc8CompletionResultContract() {
   await withMachine(async (machine) => {
     const payload = SRAM_BASE + 0x1000;
@@ -5705,6 +5792,7 @@ const tests = [
   ['GPMI ECC register contract', testGpmiEccRegisterContract],
   ['GPMI compare and DMA sense contract', testGpmiCompareSenseContract],
   ['GPMI WAIT_FOR_READY contract', testGpmiWaitForReadyContract],
+  ['APBH DMA DEBUG2 remaining byte contract', testApbhDmaDebug2RemainingByteContract],
   ['ECC8 completion result contract', testEcc8CompletionResultContract],
   ['ECC8 register contract', testEcc8RegisterContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
