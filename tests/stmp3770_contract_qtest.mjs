@@ -3735,6 +3735,115 @@ async function testGpmiDataFifoContract() {
   });
 }
 
+async function testGpmiRunWordLengthXferCountContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const wordLengthBit = 1 << 23;
+    const commandWrite = 0 << 24;
+    const commandRead = 1 << 24;
+    const commandWaitForReady = 3 << 24;
+    const addressData = 0 << 17;
+    const addressCLE = 1 << 17;
+    const addressIncrement = 1 << 16;
+
+    /* Release GPMI from reset and turn on its clock. */
+    await machine.writel(CLKCTRL_BASE + 0x080, 0x00000001);
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    await machine.setIrqIn('/machine/soc/gpmi', 'rdy-busy', 0, 0);
+
+    /* Start a WAIT_FOR_READY in 8-bit mode; RUN stays asserted. */
+    const waitCtrl0 = runBit | commandWaitForReady | wordLengthBit;
+    await machine.writel(GPMI_BASE + 0x000, waitCtrl0);
+    assert.notEqual(
+      (await machine.readl(GPMI_BASE + 0x0c0)) & (1 << 7),
+      0,
+      'GPMI DEBUG must be busy while WAIT_FOR_READY is pending',
+    );
+
+    /* Attempt to clear WORD_LENGTH while RUN is still set. */
+    await machine.writel(GPMI_BASE + 0x000, waitCtrl0 & ~wordLengthBit);
+    assert.notEqual(
+      await machine.readl(GPMI_BASE + 0x000) & wordLengthBit,
+      0,
+      'GPMI WORD_LENGTH must be ignored while RUN is set',
+    );
+    assert.notEqual(
+      (await machine.readl(GPMI_BASE + 0x0c0)) & (1 << 7),
+      0,
+      'GPMI must remain busy while RUN is set',
+    );
+
+    /* Complete the WAIT_FOR_READY. */
+    await machine.setIrqIn('/machine/soc/gpmi', 'rdy-busy', 0, 1);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x000) & runBit,
+      0,
+      'GPMI RUN must clear after WAIT_FOR_READY completes',
+    );
+    assert.equal(
+      (await machine.readl(GPMI_BASE + 0x0c0)) & (1 << 7),
+      0,
+      'GPMI DEBUG must clear BUSY after WAIT_FOR_READY completes',
+    );
+
+    /* With RUN clear, WORD_LENGTH can be changed to 16-bit mode. */
+    await machine.writel(GPMI_BASE + 0x000, 0);
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x000) & wordLengthBit,
+      0,
+      'GPMI WORD_LENGTH must be writable when RUN is clear',
+    );
+
+    /* 16-bit WRITE XFER_COUNT=3 must consume 6 bytes (3 halfwords). */
+    await machine.writew(GPMI_BASE + 0x0a0, 0x3412);
+    await machine.writew(GPMI_BASE + 0x0a0, 0x7856);
+    await machine.writew(GPMI_BASE + 0x0a0, 0xbc9a);
+    const writeCtrl0 = runBit | commandWrite | addressData | 3;
+    await machine.writel(GPMI_BASE + 0x000, writeCtrl0);
+    assert.equal(
+      (await machine.readl(GPMI_BASE + 0x0b0)) & 0x30,
+      0x20,
+      'GPMI 16-bit WRITE XFER_COUNT=3 must consume 6 bytes',
+    );
+    assert.equal(
+      await machine.readl(GPMI_BASE + 0x000) & runBit,
+      0,
+      'GPMI RUN must clear after a PIO WRITE command completes',
+    );
+
+    /* Send READ ID command (0x90 0x00) using 16-bit XFER_COUNT=1 (one halfword). */
+    await machine.writew(GPMI_BASE + 0x0a0, 0x0090);
+    const readIdCtrl0 = runBit | commandWrite | addressCLE | addressIncrement | 1;
+    await machine.writel(GPMI_BASE + 0x000, readIdCtrl0);
+
+    /* 16-bit READ XFER_COUNT=2 must return 4 bytes (2 halfwords). */
+    const read16Ctrl0 = runBit | commandRead | addressData | 2;
+    await machine.writel(GPMI_BASE + 0x000, read16Ctrl0);
+    const half0 = await machine.readw(GPMI_BASE + 0x0a0);
+    const half1 = await machine.readw(GPMI_BASE + 0x0a0);
+    assert.equal(
+      (await machine.readl(GPMI_BASE + 0x0b0)) & 0x30,
+      0x20,
+      'GPMI 16-bit READ must leave FIFO empty after consuming 2 halfwords',
+    );
+
+    /* 8-bit READ XFER_COUNT=4 must return the same 4 bytes. */
+    const read8Ctrl0 = runBit | wordLengthBit | commandRead | addressData | 4;
+    await machine.writel(GPMI_BASE + 0x000, read8Ctrl0);
+    const word = await machine.readl(GPMI_BASE + 0x0a0);
+    assert.equal(
+      (await machine.readl(GPMI_BASE + 0x0b0)) & 0x30,
+      0x20,
+      'GPMI 8-bit READ must leave FIFO empty after consuming 4 bytes',
+    );
+    assert.equal(
+      ((half1 << 16) | half0) >>> 0,
+      word,
+      'GPMI READ must interpret XFER_COUNT as words whose width follows WORD_LENGTH',
+    );
+  });
+}
+
 async function testApbxDma64KAndAhbErrorContract() {
   await withMachine(async (machine) => {
     const apbxCh2Nxtcmdar = APBX_BASE + 0x130;
@@ -6225,6 +6334,7 @@ const tests = [
   ['ECC8 completion result contract', testEcc8CompletionResultContract],
   ['ECC8 register contract', testEcc8RegisterContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
+  ['GPMI RUN WORD_LENGTH XFER_COUNT contract', testGpmiRunWordLengthXferCountContract],
   ['APBX DMA 64 KiB and AHB error contract', testApbxDma64KAndAhbErrorContract],
   ['APBX DMA SENSE reserved contract', testApbxDmaSenseReservedContract],
   ['DMA CTRL1 and DEVSEL writable mask contract', testDmaCtrl1AndDevselContract],

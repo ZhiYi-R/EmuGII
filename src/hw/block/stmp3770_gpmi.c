@@ -114,7 +114,7 @@ static void gpmi_update_busy(STMP3770GPMIState *s)
         }
     }
 
-    if (pending) {
+    if (pending || (s->ctrl0 & GPMI_CTRL0_RUN)) {
         s->debug |= GPMI_DEBUG_BUSY;
     } else {
         s->debug &= ~GPMI_DEBUG_BUSY;
@@ -185,6 +185,7 @@ static void gpmi_complete_wait_for_ready(STMP3770GPMIState *s,
     wait->timeout = timeout;
     gpmi_cancel_wait_timer(s, channel);
     s->nand_state = NAND_STATE_IDLE;
+    s->ctrl0 &= ~GPMI_CTRL0_RUN;
 
     if (timeout) {
         s->ctrl1 |= GPMI_CTRL1_TIMEOUT_IRQ;
@@ -1046,49 +1047,65 @@ static void gpmi_execute_command(STMP3770GPMIState *s)
     unsigned int channel = s->active_dma_channel >= 0 ?
                            s->active_dma_channel : cs;
     uint32_t count = s->ctrl0 & GPMI_CTRL0_XFER_COUNT_MASK;
+    unsigned int word_size;
+    uint32_t num_bytes;
+    uint32_t i;
 
     if (count == 0) {
         count = 1U << 16;
     }
 
+    word_size = (s->ctrl0 & GPMI_CTRL0_WORD_LENGTH) ? 1 : 2;
+    num_bytes = count * word_size;
+
     if (!gpmi_enabled(s)) {
+        s->ctrl0 &= ~GPMI_CTRL0_RUN;
+        gpmi_update_busy(s);
         return;
     }
 
-    /* Clear RUN bit after command execution */
-    s->ctrl0 &= ~GPMI_CTRL0_RUN;
+    /* RUN stays asserted for WAIT_FOR_READY and is cleared by completion. */
+    s->ctrl0 |= GPMI_CTRL0_RUN;
+    gpmi_update_busy(s);
 
     switch (mode) {
     case GPMI_COMMAND_MODE_WRITE:
         if (address == GPMI_ADDRESS_CLE) {
-            /* Command byte(s).  When the data is supplied by DMA, the FIFO is
-             * empty here and the bytes are routed through gpmi_handle_write_byte()
-             * as they arrive.  Only process PIO-supplied bytes immediately. */
-            if (s->fifo_count > 0) {
-                uint8_t byte;
+            uint8_t byte;
 
-                gpmi_fifo_pop_byte(s, &byte);
-                if (s->nand_state == NAND_STATE_CMD &&
-                    (s->nand_cmd == NAND_CMD_READ_1ST ||
-                     s->nand_cmd == NAND_CMD_PROGRAM_1ST ||
-                     s->nand_cmd == NAND_CMD_ERASE_1ST)) {
-                    /* Second cycle command */
-                    gpmi_nand_second_command(s, byte);
-                } else {
-                    gpmi_nand_command(s, byte);
+            /*
+             * Each CLE command sequence starts with a fresh command byte;
+             * the following bytes (when ADDRESS_INCREMENT is set) are address
+             * cycles.  The FIFO may contain fewer than num_bytes, in which
+             * case we consume everything available.
+             */
+            s->write_cmd_sent = false;
+            for (i = 0; i < num_bytes; i++) {
+                if (!gpmi_fifo_pop_byte(s, &byte)) {
+                    break;
                 }
+                gpmi_handle_write_byte(s, byte);
             }
         } else if (address == GPMI_ADDRESS_ALE) {
-            if (s->fifo_count > 0) {
-                uint8_t byte;
+            uint8_t byte;
 
-                gpmi_fifo_pop_byte(s, &byte);
+            for (i = 0; i < num_bytes; i++) {
+                if (!gpmi_fifo_pop_byte(s, &byte)) {
+                    break;
+                }
                 gpmi_nand_address(s, byte);
             }
         } else if (address == GPMI_ADDRESS_DATA) {
-            /* PIO data write - used mainly for programming */
-            uint32_t i;
-            for (i = 0; i < count; i++) {
+            /*
+             * PIO data writes must terminate at the programmed word count.
+             * For a PROGRAM_1ST command, update data_count so the program
+             * confirm (0x10) is accepted after the requested byte count.
+             */
+            if (s->nand_cmd == NAND_CMD_PROGRAM_1ST && s->data_dir_write) {
+                s->data_count = MIN(num_bytes, s->page_buf_size);
+            }
+
+            for (i = 0; i < num_bytes; i++) {
                 uint8_t byte;
 
                 if (!gpmi_fifo_pop_byte(s, &byte)) {
@@ -1106,18 +1123,18 @@ static void gpmi_execute_command(STMP3770GPMIState *s)
                  * into guest memory. */
                 gpmi_nand_load_page(s);
                 gpmi_bch_complete_read(s);
-            } else if (count <= ARRAY_SIZE(s->data_fifo)) {
-                /* Small PIO read: fill the FIFO so software can pop bytes. */
-                uint32_t i;
-
+            } else if (num_bytes <= ARRAY_SIZE(s->data_fifo)) {
+                /* Small PIO/DMA read: fill the FIFO so software can pop bytes. */
                 gpmi_fifo_clear(s);
-                for (i = 0; i < count; i++) {
+                s->data_count = num_bytes;
+                s->data_ptr = 0;
+                for (i = 0; i < num_bytes; i++) {
                     gpmi_fifo_push_byte(s, gpmi_nand_read_data_byte(s));
                 }
             } else {
                 /* Large DMA read: leave data in the page buffer; the DMA
                  * handler will copy it out directly. */
-                s->data_count = count;
+                s->data_count = num_bytes;
                 s->data_ptr = 0;
             }
         }
@@ -1147,12 +1164,10 @@ static void gpmi_execute_command(STMP3770GPMIState *s)
     }
 
     gpmi_update_ready_views(s);
-    gpmi_update_busy(s);
-
-    /* Trigger DMA completion interrupt if requested */
-    if (s->dma) {
-        /* The APBH DMA engine will handle its own IRQ based on descriptor */
+    if (mode != GPMI_COMMAND_MODE_WAIT_FOR_READY) {
+        s->ctrl0 &= ~GPMI_CTRL0_RUN;
     }
+    gpmi_update_busy(s);
 }
 
 static uint64_t gpmi_read(void *opaque, hwaddr offset, unsigned size)
@@ -1231,16 +1246,43 @@ static void gpmi_write(void *opaque, hwaddr offset,
 
     switch (base) {
     case GPMI_CTRL0:
-        gpmi_apply_sct(&s->ctrl0, (uint32_t)value, sct);
-        /* Hardware ties CLKGATE to SFTRST */
-        if (s->ctrl0 & GPMI_CTRL0_SFTRST) {
-            s->ctrl0 |= GPMI_CTRL0_CLKGATE;
-            gpmi_nand_reset_state(s);
-        } else {
-            s->ctrl0 &= ~GPMI_CTRL0_CLKGATE;
-        }
-        if (s->ctrl0 & GPMI_CTRL0_RUN) {
-            gpmi_execute_command(s);
+        {
+            uint32_t old_ctrl0 = s->ctrl0;
+            uint32_t new_ctrl0 = s->ctrl0;
+
+            gpmi_apply_sct(&new_ctrl0, (uint32_t)value, sct);
+
+            /*
+             * WORD_LENGTH can only be changed while RUN is clear; ignore
+             * any change if a previous command is still busy.
+             */
+            if (old_ctrl0 & GPMI_CTRL0_RUN) {
+                new_ctrl0 = (new_ctrl0 & ~GPMI_CTRL0_WORD_LENGTH) |
+                            (old_ctrl0 & GPMI_CTRL0_WORD_LENGTH);
+            }
+
+            s->ctrl0 = new_ctrl0;
+
+            /* Hardware ties CLKGATE to SFTRST */
+            if (s->ctrl0 & GPMI_CTRL0_SFTRST) {
+                s->ctrl0 = GPMI_CTRL0_SFTRST | GPMI_CTRL0_CLKGATE;
+                gpmi_nand_reset_state(s);
+            } else {
+                s->ctrl0 &= ~GPMI_CTRL0_CLKGATE;
+            }
+
+            /*
+             * Only start a new command on the rising edge of RUN.  This
+             * prevents re-executing when gpmi_execute_command itself leaves
+             * RUN asserted for a pending WAIT_FOR_READY.
+             */
+            if ((s->ctrl0 & GPMI_CTRL0_RUN) &&
+                !(old_ctrl0 & GPMI_CTRL0_RUN)) {
+                gpmi_execute_command(s);
+            }
+
+            gpmi_update_busy(s);
+            gpmi_update_irq(s);
         }
         break;
     case GPMI_COMPARE:
@@ -1572,13 +1614,16 @@ static int stmp3770_gpmi_dma_handler(STMP3770DMAState *dma,
         unsigned int address = (s->ctrl0 >> GPMI_CTRL0_ADDRESS_SHIFT) &
                                GPMI_CTRL0_ADDRESS_MASK;
         uint32_t count = s->ctrl0 & GPMI_CTRL0_XFER_COUNT_MASK;
+        unsigned int word_size = (s->ctrl0 & GPMI_CTRL0_WORD_LENGTH) ? 1 : 2;
+        uint32_t word_count = count ? count : (1U << 16);
+        uint32_t byte_count = word_count * word_size;
         size_t n;
 
         if (mode == GPMI_COMMAND_MODE_WRITE &&
             address == GPMI_ADDRESS_DATA &&
             s->nand_cmd == NAND_CMD_PROGRAM_1ST &&
-            s->data_dir_write && count > s->data_count) {
-            s->data_count = MIN(count, s->page_buf_size);
+            s->data_dir_write) {
+            s->data_count = MIN(byte_count, s->page_buf_size);
         }
 
         for (n = 0; n < len; n++) {
