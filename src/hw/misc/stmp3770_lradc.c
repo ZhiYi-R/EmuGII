@@ -63,6 +63,10 @@ struct STMP3770LRADCState {
 
     /* Touch detection: set by external (UI) input; gated by TOUCH_DETECT_ENABLE */
     bool touch_detect;
+
+    /* CTRL3 analog power/discard state */
+    bool analog_powered;
+    uint8_t discard_remaining;
 };
 
 #define LRADC_VERSION   0x01010000
@@ -116,6 +120,8 @@ struct STMP3770LRADCState {
 #define CTRL2_TEMPSENSE_PWD (1U << 15)
 #define CTRL2_TEMP_SENSOR_IENABLE0 (1U << 8)
 #define CTRL2_TEMP_SENSOR_IENABLE1 (1U << 9)
+#define CTRL3_FORCE_ANALOG_PWUP (1U << 23)
+#define CTRL3_FORCE_ANALOG_PWDN (1U << 22)
 #define DELAY_KICK       (1U << 20)
 #define DELAY_TICK_NS    500000
 
@@ -186,13 +192,22 @@ static void lradc_start_delay(STMP3770LRADCState *s, int n, bool reload_loop);
 static void lradc_stop_delay(STMP3770LRADCState *s, int n);
 static void lradc_stop_all_delays(STMP3770LRADCState *s);
 static void lradc_resume_all_delays(STMP3770LRADCState *s);
-static void lradc_handle_clockgate(STMP3770LRADCState *s);
+static void lradc_update_analog_power(STMP3770LRADCState *s);
 static void lradc_update_delay_remaining(STMP3770LRADCState *s);
 
 static uint32_t lradc_sample_value(STMP3770LRADCState *s, int ch)
 {
     uint32_t physical = (s->ctrl4 >> (ch * 4)) & 0xF;
     uint32_t value = 0;
+
+    if (!s->analog_powered) {
+        return 0;
+    }
+
+    if (s->discard_remaining > 0) {
+        s->discard_remaining--;
+        return 0;
+    }
 
     if (physical < 8) {
         if (physical == 0 && (s->ctrl2 & CTRL2_TEMP_SENSOR_IENABLE0)) {
@@ -429,6 +444,21 @@ static void lradc_handle_clockgate(STMP3770LRADCState *s)
     }
 }
 
+static void lradc_update_analog_power(STMP3770LRADCState *s)
+{
+    bool new_powered = !(s->ctrl0 & (CTRL0_SFTRST | CTRL0_CLKGATE)) &&
+                       ((s->ctrl3 & CTRL3_FORCE_ANALOG_PWUP) ||
+                        !(s->ctrl3 & CTRL3_FORCE_ANALOG_PWDN));
+
+    if (new_powered && !s->analog_powered) {
+        static const uint8_t discard_count[4] = {0, 1, 2, 3};
+        s->discard_remaining = discard_count[(s->ctrl3 >> 24) & 0x3];
+    }
+
+    s->analog_powered = new_powered;
+    lradc_handle_clockgate(s);
+}
+
 static uint64_t lradc_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770LRADCState *s = opaque;
@@ -515,7 +545,7 @@ static void lradc_write(void *opaque, hwaddr offset,
         if (s->ctrl0 & CTRL0_SFTRST) {
             lradc_reset(DEVICE(s));
         }
-        lradc_handle_clockgate(s);
+        lradc_update_analog_power(s);
         /* Complete any scheduled conversions once the clock is running */
         if (!(s->ctrl0 & CTRL0_CLKGATE) && (s->ctrl0 & CTRL0_SCHEDULE_MASK)) {
             lradc_complete_scheduled(s);
@@ -534,6 +564,7 @@ static void lradc_write(void *opaque, hwaddr offset,
     case REG_CTRL3:
         lradc_apply_sct(&s->ctrl3, (uint32_t)value, sct, offset, size);
         s->ctrl3 &= CTRL3_RW_MASK;
+        lradc_update_analog_power(s);
         break;
     case REG_CTRL4:
         lradc_apply_sct(&s->ctrl4, (uint32_t)value, sct, offset, size);
@@ -618,6 +649,9 @@ static void lradc_reset(DeviceState *dev)
     s->touch_detect = false;
     s->debug0 = 0x43210000;
     s->debug1 = 0;
+    s->analog_powered = false;
+    s->discard_remaining = 0;
+    lradc_update_analog_power(s);
     lradc_update_irq(s);
 }
 
@@ -652,7 +686,7 @@ static int lradc_post_load(void *opaque, int version_id)
     STMP3770LRADCState *s = STMP3770_LRADC(opaque);
 
     lradc_update_pwm2_analog_enable(s);
-    lradc_resume_all_delays(s);
+    lradc_update_analog_power(s);
     lradc_update_irq(s);
     return 0;
 }
@@ -686,6 +720,8 @@ static const VMStateDescription vmstate_lradc = {
         VMSTATE_INT64_ARRAY(delay_remaining_ns, STMP3770LRADCState, 4),
         VMSTATE_UINT8_ARRAY(sample_count, STMP3770LRADCState, 8),
         VMSTATE_BOOL(touch_detect, STMP3770LRADCState),
+        VMSTATE_BOOL(analog_powered, STMP3770LRADCState),
+        VMSTATE_UINT8(discard_remaining, STMP3770LRADCState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -709,6 +745,8 @@ static void lradc_init(Object *obj)
     memset(s->delay_remaining_ns, 0, sizeof(s->delay_remaining_ns));
     memset(s->sample_count, 0, sizeof(s->sample_count));
     s->touch_detect = false;
+    s->analog_powered = false;
+    s->discard_remaining = 0;
     lradc_update_status(s);
     s->debug0 = 0x43210000;
     s->debug1 = 0;

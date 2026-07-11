@@ -1369,6 +1369,117 @@ async function testLradcTempCurrentContract() {
   });
 }
 
+async function testLradcCtrl3PowerAndDiscardContract() {
+  await withMachine(async (machine) => {
+    /* Bring LRADC out of reset; CH0 maps to physical 0 by default */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+
+    /* Normal operation: CH0 should read the generic input value 0xabc */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'CH0 must read 0xabc when analog is powered normally',
+    );
+
+    /* FORCE_ANALOG_PWDN (bit 22) forces analog down: conversion returns 0 */
+    await machine.writel(LRADC_BASE + 0x030, 0x00400000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'FORCE_ANALOG_PWDN must force LRADC conversion to 0',
+    );
+
+    /* FORCE_ANALOG_PWUP (bit 23) overrides PWDN and powers the analog back up */
+    await machine.writel(LRADC_BASE + 0x030, 0x00c00000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'FORCE_ANALOG_PWUP must override PWDN and restore 0xabc',
+    );
+
+    /* Clear force bits to return to normal operation */
+    await machine.writel(LRADC_BASE + 0x038, 0x00c00000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'clearing force bits must restore normal 0xabc',
+    );
+
+    /* DISCARD = 0x1 (discard 1 sample after analog power-up). Gate and ungate clock. */
+    await machine.writel(LRADC_BASE + 0x030, 0x01000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x40000000); /* CLKGATE */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000); /* ungate */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* first sample discarded */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=1 first sample after power-up must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* second sample valid */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'DISCARD=1 second sample after power-up must be 0xabc',
+    );
+
+    /* DISCARD = 0x2 (discard 2 samples). Gate and ungate clock again. */
+    await machine.writel(LRADC_BASE + 0x030, 0x02000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x40000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=2 first sample must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=2 second sample must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'DISCARD=2 third sample must be 0xabc',
+    );
+
+    /* DISCARD = 0x3 discards 3 samples. */
+    await machine.writel(LRADC_BASE + 0x030, 0x03000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x40000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=3 first sample must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=3 second sample must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'DISCARD=3 third sample must be discarded',
+    );
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001);
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'DISCARD=3 fourth sample must be 0xabc',
+    );
+  });
+}
+
 async function testI2cRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -5215,6 +5326,7 @@ const tests = [
   ['LRADC touch/temperature contract', testLradcTouchTemperatureContract],
   ['LRADC divide-by-two contract', testLradcDivideByTwoContract],
   ['LRADC temperature current source contract', testLradcTempCurrentContract],
+  ['LRADC CTRL3 power and discard contract', testLradcCtrl3PowerAndDiscardContract],
   ['I2C register contract', testI2cRegisterContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],
