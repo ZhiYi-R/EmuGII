@@ -205,6 +205,8 @@ static void hp39gii_apply_keyboard_columns(STMP3770PINCTRLState *s,
     }
 }
 
+static void stmp3770_pinctrl_sample_din(STMP3770PINCTRLState *s);
+
 void stmp3770_pinctrl_set_key(STMP3770PINCTRLState *s,
                               unsigned int key, bool down)
 {
@@ -217,6 +219,8 @@ void stmp3770_pinctrl_set_key(STMP3770PINCTRLState *s,
     } else {
         s->key_state[key >> 6] &= ~(1ULL << (key & 63));
     }
+
+    stmp3770_pinctrl_sample_din(s);
 }
 
 void stmp3770_pinctrl_set_pwm_output(STMP3770PINCTRLState *s,
@@ -226,6 +230,7 @@ void stmp3770_pinctrl_set_pwm_output(STMP3770PINCTRLState *s,
         return;
     }
     s->pwm_output[channel] = level;
+    stmp3770_pinctrl_sample_din(s);
 }
 
 static inline int bank_from_offset(unsigned offset)
@@ -273,6 +278,42 @@ static void stmp3770_pinctrl_update_irq(STMP3770PINCTRLState *s)
     /* Update IRQOUT bits in CTRL (read-only view) */
     s->ctrl &= ~(CTRL_IRQOUT0 | CTRL_IRQOUT1 | CTRL_IRQOUT2 | CTRL_IRQOUT3);
     s->ctrl |= irqout & 0xF;
+}
+
+static uint32_t stmp3770_pinctrl_read_din(STMP3770PINCTRLState *s, int bank);
+
+static void stmp3770_pinctrl_sample_din(STMP3770PINCTRLState *s)
+{
+    int i;
+
+    for (i = 0; i < STMP3770_PINCTRL_NUM_BANKS; i++) {
+        uint32_t mask = bank_pin_mask[i];
+        uint32_t now = stmp3770_pinctrl_read_din(s, i) & mask;
+        uint32_t prev = s->prev_din[i] & mask;
+        uint32_t changed = now ^ prev;
+        uint32_t active_now, active_prev;
+        uint32_t level_mask, edge_mask;
+        uint32_t edge_set;
+
+        active_now = (now & s->irqpol[i]) | (~now & ~s->irqpol[i]);
+        active_prev = (prev & s->irqpol[i]) | (~prev & ~s->irqpol[i]);
+        active_now &= mask;
+        active_prev &= mask;
+
+        level_mask = mask & s->irqlevel[i] & s->pin2irq[i];
+        edge_mask = mask & ~s->irqlevel[i] & s->pin2irq[i];
+
+        /* Level-sensitive IRQSTAT tracks the live input state */
+        s->irqstat[i] = (s->irqstat[i] & ~level_mask) | (level_mask & active_now);
+
+        /* Edge-sensitive IRQSTAT latches on the active transition */
+        edge_set = edge_mask & active_now & ~active_prev & changed;
+        s->irqstat[i] |= edge_set;
+
+        s->prev_din[i] = now;
+    }
+
+    stmp3770_pinctrl_update_irq(s);
 }
 
 static uint32_t stmp3770_pinctrl_read_din(STMP3770PINCTRLState *s, int bank)
@@ -335,6 +376,7 @@ static void stmp3770_pinctrl_reset(DeviceState *dev)
         s->dout[i] = 0;
         s->din[i] = 0;
         s->doe[i] = 0;
+        s->prev_din[i] = 0;
         s->pin2irq[i] = 0;
         s->irqen[i] = 0;
         s->irqlevel[i] = 0;
@@ -487,6 +529,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         bank = (offset - REG_MUXSEL0) >> 4;
         stmp3770_pinctrl_apply_write(&s->muxsel[bank], 0xFFFFFFFF,
                                      value, is_set, is_clr, is_tog);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_DRIVE0 ... REG_DRIVE14:
@@ -507,6 +550,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->dout[bank], mask,
                                      value, is_set, is_clr, is_tog);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_DIN0 ... REG_DIN3:
@@ -518,6 +562,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->doe[bank], mask,
                                      value, is_set, is_clr, is_tog);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_PIN2IRQ0 ... REG_PIN2IRQ3:
@@ -525,7 +570,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->pin2irq[bank], mask,
                                      value, is_set, is_clr, is_tog);
-        stmp3770_pinctrl_update_irq(s);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_IRQEN0 ... REG_IRQEN3:
@@ -533,7 +578,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->irqen[bank], mask,
                                      value, is_set, is_clr, is_tog);
-        stmp3770_pinctrl_update_irq(s);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_IRQLEVEL0 ... REG_IRQLEVEL3:
@@ -541,6 +586,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->irqlevel[bank], mask,
                                      value, is_set, is_clr, is_tog);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_IRQPOL0 ... REG_IRQPOL3:
@@ -548,6 +594,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
         mask = bank_pin_mask[bank];
         stmp3770_pinctrl_apply_write(&s->irqpol[bank], mask,
                                      value, is_set, is_clr, is_tog);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     case REG_IRQSTAT0 ... REG_IRQSTAT3:
@@ -563,7 +610,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
             /* Regular write: 1s set, 0s ignored */
             s->irqstat[bank] |= (value & mask);
         }
-        stmp3770_pinctrl_update_irq(s);
+        stmp3770_pinctrl_sample_din(s);
         break;
 
     default:
@@ -624,6 +671,7 @@ static const VMStateDescription vmstate_stmp3770_pinctrl = {
         VMSTATE_UINT32_ARRAY(dout, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(din, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(doe, STMP3770PINCTRLState, 4),
+        VMSTATE_UINT32_ARRAY(prev_din, STMP3770PINCTRLState, 4),
         VMSTATE_UINT8_ARRAY_V(pwm_output, STMP3770PINCTRLState, 5, 2),
         VMSTATE_UINT32_ARRAY(pin2irq, STMP3770PINCTRLState, 4),
         VMSTATE_UINT32_ARRAY(irqen, STMP3770PINCTRLState, 4),

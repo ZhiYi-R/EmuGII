@@ -45,6 +45,7 @@ struct STMP3770PINCTRLState {
     uint32_t dout[4];
     uint32_t din[4];
     uint32_t doe[4];
+    uint32_t prev_din[4];
     uint8_t pwm_output[5];
 
     /* GPIO interrupts */

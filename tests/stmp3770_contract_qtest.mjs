@@ -3251,6 +3251,64 @@ async function testPinctrlDriveAndPullMasks() {
   });
 }
 
+async function testPinctrlGpioIrqstatContract() {
+  await withMachine(async (machine) => {
+    /* Drive Bank 0 pin 0 via DOUT/DOE to simulate the looped-back input. */
+    await machine.writel(PINCTRL_BASE + 0x600, 0x00000001); /* DOE0 */
+    await machine.writel(PINCTRL_BASE + 0x700, 0x00000001); /* PIN2IRQ0 */
+    await machine.writel(PINCTRL_BASE + 0x800, 0x00000001); /* IRQEN0 */
+    await machine.writel(PINCTRL_BASE + 0x900, 0x00000001); /* IRQLEVEL0 level */
+    await machine.writel(PINCTRL_BASE + 0xA00, 0x00000001); /* IRQPOL0 active high */
+
+    /* Level-sensitive: IRQSTAT follows the input state. */
+    await machine.writel(PINCTRL_BASE + 0x400, 0x00000001); /* DOUT0 high */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x1,
+      'PINCTRL IRQSTAT level-sensitive must set when active high input is asserted',
+    );
+
+    /* Software clear must be ignored while the level-active condition remains. */
+    await machine.writel(PINCTRL_BASE + 0xB08, 0x00000001); /* IRQSTAT0_CLR */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x1,
+      'PINCTRL IRQSTAT level-sensitive must remain set while input stays active',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x400, 0x00000000); /* DOUT0 low */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x0,
+      'PINCTRL IRQSTAT level-sensitive must clear when input returns inactive',
+    );
+
+    /* Edge-sensitive: IRQSTAT latches on the active transition. */
+    await machine.writel(PINCTRL_BASE + 0x900, 0x00000000); /* IRQLEVEL0 edge */
+    await machine.writel(PINCTRL_BASE + 0xB08, 0x00000001); /* clear IRQSTAT */
+    await machine.writel(PINCTRL_BASE + 0x400, 0x00000001); /* DOUT0 high -> rising edge */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x1,
+      'PINCTRL IRQSTAT edge-sensitive must set on active high rising edge',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x400, 0x00000000); /* DOUT0 low */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x1,
+      'PINCTRL IRQSTAT edge-sensitive must remain latched after input deasserts',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0xB08, 0x00000001); /* clear IRQSTAT */
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0xB00) & 0x1,
+      0x0,
+      'PINCTRL IRQSTAT edge-sensitive must clear on software clear',
+    );
+  });
+}
+
 async function testIcollCoreContract() {
   await withMachine(async (machine) => {
     const ctrlReset = await machine.readl(ICOLL_BASE + 0x020);
@@ -4649,6 +4707,7 @@ const tests = [
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['PINCTRL drive and pull masks', testPinctrlDriveAndPullMasks],
+  ['PINCTRL GPIO IRQSTAT edge/level contract', testPinctrlGpioIrqstatContract],
   ['ICOLL core contract', testIcollCoreContract],
   ['ICOLL same-level priority contract', testIcollSameLevelPriorityContract],
   ['ICOLL BYPASS same-level priority contract', testIcollBypassSameLevelPriorityContract],
