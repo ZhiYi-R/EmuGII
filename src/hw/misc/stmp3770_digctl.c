@@ -101,12 +101,27 @@
 
 /* CTRL register bits (7.4.1) */
 #define CTRL_LATCH_ENTROPY      (1 << 0)
-#define CTRL_DEBUG_DISABLE      (1 << 3)
-#define CTRL_USB_CLKGATE        (1 << 2)
+#define CTRL_JTAG_SHIELD        (1U << 1)
+#define CTRL_USB_CLKGATE        (1U << 2)
+#define CTRL_DEBUG_DISABLE      (1U << 3)
+#define CTRL_TRAP_ENABLE        (1U << 4)
+#define CTRL_TRAP_IN_RANGE      (1U << 5)
+#define CTRL_USE_SERIAL_JTAG    (1U << 6)
+#define CTRL_DCP_BIST_START     (1U << 22)
+#define CTRL_DCP_BIST_CLKEN     (1U << 23)
 #define CTRL_RW_MASK            0x20FFF87FU
 
-/* STATUS register reset (7.4.2) - USB features present */
+/* STATUS register bits (7.4.2) */
 #define STATUS_USB_FEATURES     ((1U << 31) | (1U << 30) | (1U << 29) | (1U << 28))
+#define STATUS_DCP_BIST_DONE    (1U << 8)
+#define STATUS_DCP_BIST_PASS    (1U << 9)
+#define STATUS_DCP_BIST_FAIL    (1U << 10)
+#define STATUS_JTAG_IN_USE      (1U << 4)
+#define STATUS_PACKAGE_TYPE_MASK 0x0000000EU
+#define STATUS_WRITTEN          (1U << 0)
+#define STATUS_R_MASK           (STATUS_USB_FEATURES | \
+                                 STATUS_DCP_BIST_DONE | STATUS_DCP_BIST_PASS | STATUS_DCP_BIST_FAIL | \
+                                 STATUS_JTAG_IN_USE | STATUS_PACKAGE_TYPE_MASK | STATUS_WRITTEN)
 
 /* WRITEONCE reset (7.4.7) */
 #define WRITEONCE_RESET         0xA5A5A5A5
@@ -324,7 +339,7 @@ static uint64_t stmp3770_digctl_read(void *opaque, hwaddr offset, unsigned size)
         break;
 
     case REG_STATUS:
-        value = s->status;
+        value = s->status & STATUS_R_MASK;
         break;
 
     case REG_HCLKCOUNT:
@@ -633,6 +648,12 @@ static void stmp3770_digctl_write(void *opaque, hwaddr offset,
                  !(old_ctrl & CTRL_LATCH_ENTROPY) &&
                  (s->ctrl & CTRL_LATCH_ENTROPY))) {
                 latch_entropy = true;
+            }
+
+            if ((s->ctrl & (CTRL_DCP_BIST_START | CTRL_DCP_BIST_CLKEN)) ==
+                (CTRL_DCP_BIST_START | CTRL_DCP_BIST_CLKEN)) {
+                s->status |= STATUS_DCP_BIST_DONE | STATUS_DCP_BIST_PASS;
+                s->status &= ~STATUS_DCP_BIST_FAIL;
             }
         }
 

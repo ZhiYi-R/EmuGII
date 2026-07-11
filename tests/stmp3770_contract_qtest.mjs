@@ -4796,6 +4796,51 @@ async function testDigctlReadOnlyStatusContract() {
   });
 }
 
+async function testDigctlDcpBistStatusContract() {
+  await withMachine(async (machine) => {
+    /* STATUS reset: USB features present, no DCP BIST, no JTAG, package type 0 */
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x010),
+      0xf0000000,
+      'DIGCTL STATUS must reset with USB features present and DCP BIST not done',
+    );
+
+    /* Enable DCP BIST clock and start it */
+    await machine.writel(DIGCTL_BASE + 0x000, 0x00c00004);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00c00004,
+      'DIGCTL CTRL must accept DCP_BIST_CLKEN and DCP_BIST_START',
+    );
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x010),
+      0xf0000300,
+      'DIGCTL STATUS must report DCP BIST done and pass after start',
+    );
+
+    /* Clear DCP_BIST_START (leave clock enabled and USB clock gate intact) */
+    await machine.writel(DIGCTL_BASE + 0x008, 0x00400000);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x000),
+      0x00800004,
+      'DIGCTL CTRL DCP_BIST_START must clear via CLR alias',
+    );
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x010),
+      0xf0000300,
+      'DIGCTL STATUS DCP BIST done/pass must remain sticky after start bit clears',
+    );
+
+    /* STATUS is read-only and rejects write attempts */
+    await machine.writel(DIGCTL_BASE + 0x010, 0xffffffff);
+    assert.equal(
+      await machine.readl(DIGCTL_BASE + 0x010),
+      0xf0000300,
+      'DIGCTL STATUS must be read-only and preserve DCP BIST sticky bits',
+    );
+  });
+}
+
 async function testClkctrlResetContract() {
   await withMachine(async (machine) => {
     const pllctrl0 = await machine.readl(CLKCTRL_BASE + 0x000);
@@ -5450,6 +5495,7 @@ const tests = [
   ['DIGCTL writeonce resets with dig reset', testDigctlWriteonceResetsWithDigReset],
   ['DIGCTL HCLK counter contract', testDigctlHclkCountContract],
   ['DIGCTL read-only status contract', testDigctlReadOnlyStatusContract],
+  ['DIGCTL DCP BIST status contract', testDigctlDcpBistStatusContract],
   ['CLKCTRL reset contract', testClkctrlResetContract],
   ['CLKCTRL gated divider contract', testClkctrlGatedDividerContract],
   ['CLKCTRL writable field masks', testClkctrlWritableFieldMasks],
