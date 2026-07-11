@@ -2653,6 +2653,143 @@ async function testGpmiDataFifoContract() {
   });
 }
 
+async function testApbxDma64KAndAhbErrorContract() {
+  await withMachine(async (machine) => {
+    const apbxCh2Nxtcmdar = APBX_BASE + 0x130;
+    const apbxCh2Cmd = APBX_BASE + 0x140;
+    const apbxCh2Bar = APBX_BASE + 0x150;
+    const apbxCh2Sema = APBX_BASE + 0x160;
+
+    /* Release DMA from reset and clock gate. */
+    await machine.writel(APBX_BASE + 0x008, 0xc0000000);
+
+    /* 64-KiB transfer: XFER_COUNT=0 with a valid SRAM byte address. */
+    const okDescriptor = 0x00000500;
+    await machine.writel(okDescriptor + 0x00, 0);
+    await machine.writel(okDescriptor + 0x04, (1 << 6) | 1); /* SEMAPHORE, DMA_WRITE */
+    await machine.writel(okDescriptor + 0x08, 0x00010000);
+    await machine.writel(okDescriptor + 0x0c, 0);
+
+    await machine.writel(0x00010000, 0xdeadbeef);
+    await machine.writel(apbxCh2Nxtcmdar, okDescriptor);
+    await machine.writel(apbxCh2Sema, 1);
+    assert.equal(
+      await machine.readl(0x00010000),
+      0,
+      'APBX XFER_COUNT=0 must transfer 64 KiB bytes to the byte address in BAR',
+    );
+    assert.equal(
+      await machine.readl(apbxCh2Bar),
+      0x00010000,
+      'APBX CH2 BAR must reflect the loaded descriptor buffer address',
+    );
+    assert.equal(
+      await machine.readl(apbxCh2Cmd) & 0x0000ffff,
+      0x41,
+      'APBX CH2 CMD must preserve the loaded descriptor command word',
+    );
+
+    /* AHB error: XFER_COUNT=0 with an unmapped byte address. */
+    const errDescriptor = 0x00000510;
+    await machine.writel(errDescriptor + 0x00, 0);
+    await machine.writel(errDescriptor + 0x04, (1 << 6) | 1); /* SEMAPHORE, DMA_WRITE */
+    await machine.writel(errDescriptor + 0x08, 0xdead0000);
+    await machine.writel(errDescriptor + 0x0c, 0);
+
+    await machine.writel(apbxCh2Nxtcmdar, errDescriptor);
+    await machine.writel(apbxCh2Sema, 1);
+    assert.equal(
+      (await machine.readl(APBX_BASE + 0x010)) & (1 << 18),
+      1 << 18,
+      'APBX CH2 AHB_ERROR_IRQ status must be set on a bus error',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 9),
+      0,
+      'APBX CH2 AHB error must assert the SPDIF_DMA ICOLL source (raw bit 9)',
+    );
+  });
+}
+
+async function testDmaCtrl1AndDevselContract() {
+  await withMachine(async (machine) => {
+    /* Release both DMAs from reset and clock gate. */
+    await machine.writel(APBH_BASE + 0x008, 0xc0000000);
+    await machine.writel(APBX_BASE + 0x008, 0xc0000000);
+
+    /* CTRL1: bits 31:24 are RSVD RO, bits 23:0 are all RW. */
+    /* Write all-1s to CTRL1 base; RSVD bits must stay 0. */
+    await machine.writel(APBH_BASE + 0x010, 0xffffffff);
+    assert.equal(
+      await machine.readl(APBH_BASE + 0x010),
+      0x00ffffff,
+      'APBH CTRL1 must not accept writes to RSVD bits 31:24',
+    );
+
+    /* Clear all sticky/enable bits via CLR. */
+    await machine.writel(APBH_BASE + 0x018, 0x00ffffff);
+    assert.equal(
+      await machine.readl(APBH_BASE + 0x010),
+      0,
+      'APBH CTRL1 CLR must clear all writable bits',
+    );
+
+    /* SET must be able to set AHB_ERROR_IRQ sticky bits (not just enables). */
+    await machine.writel(APBH_BASE + 0x014, (1 << 16));
+    assert.equal(
+      (await machine.readl(APBH_BASE + 0x010)) & (1 << 16),
+      1 << 16,
+      'APBH CTRL1 SET must be able to set CH0_AHB_ERROR_IRQ',
+    );
+    await machine.writel(APBH_BASE + 0x018, (1 << 16));
+
+    /* APBH DEVSEL: all fields RO, writes must be ignored. */
+    await machine.writel(APBH_BASE + 0x020, 0xffffffff);
+    assert.equal(
+      await machine.readl(APBH_BASE + 0x020),
+      0,
+      'APBH DEVSEL must be entirely read-only',
+    );
+
+    /* APBX DEVSEL: only CH7 (31:28), CH6 (27:24), CH2 (11:8) are RW. */
+    await machine.writel(APBX_BASE + 0x020, 0xffffffff);
+    const apbxDevsel = await machine.readl(APBX_BASE + 0x020);
+    assert.equal(
+      apbxDevsel,
+      0xff000f00,
+      'APBX DEVSEL must only accept writes to CH7/CH6/CH2 fields',
+    );
+
+    /* CLR APBX DEVSEL back to 0. */
+    await machine.writel(APBX_BASE + 0x028, 0xffffffff);
+    assert.equal(
+      await machine.readl(APBX_BASE + 0x020),
+      0,
+      'APBX DEVSEL CLR must clear all writable fields',
+    );
+
+    /* APBX CTRL0: bits 15:8 (CLKGATE_CHANNEL) are RSVD RO, unlike APBH. */
+    /* First, clear SFTRST/CLKGATE so other bits are writable. */
+    await machine.writel(APBX_BASE + 0x008, 0xc0000000);
+    /* Write all-1s to CTRL0; APBX must not accept bits 15:8. */
+    await machine.writel(APBX_BASE + 0x000, 0x0000ff00);
+    assert.equal(
+      (await machine.readl(APBX_BASE + 0x000)) & 0x0000ff00,
+      0,
+      'APBX CTRL0 bits 15:8 (CLKGATE_CHANNEL) must be read-only',
+    );
+    /* APBH CTRL0 bits 15:8 (CLKGATE_CHANNEL) must be writable. */
+    await machine.writel(APBH_BASE + 0x008, 0xc0000000);
+    await machine.writel(APBH_BASE + 0x000, 0x0000ff00);
+    assert.notEqual(
+      (await machine.readl(APBH_BASE + 0x000)) & 0x0000ff00,
+      0,
+      'APBH CTRL0 bits 15:8 (CLKGATE_CHANNEL) must be writable',
+    );
+    await machine.writel(APBH_BASE + 0x008, 0x0000ff00);
+  });
+}
+
 async function testOnChipRomAndSramMirrorContract() {
   await withMachine(async (machine) => {
     await machine.writel(SRAM_BASE + 0x1234, 0x11223344);
@@ -4482,6 +4619,8 @@ const tests = [
   ['ECC8 completion result contract', testEcc8CompletionResultContract],
   ['ECC8 register contract', testEcc8RegisterContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
+  ['APBX DMA 64 KiB and AHB error contract', testApbxDma64KAndAhbErrorContract],
+  ['DMA CTRL1 and DEVSEL writable mask contract', testDmaCtrl1AndDevselContract],
   ['on-chip ROM and SRAM mirror contract', testOnChipRomAndSramMirrorContract],
   ['DCP register and memcopy contract', testDcpRegisterAndMemcopyContract],
   ['DCP channel register map contract', testDcpChannelRegisterMapContract],

@@ -1272,7 +1272,7 @@ static void gpmi_write(void *opaque, hwaddr offset,
         gpmi_write_ctrl1(s, (uint32_t)value, sct);
         break;
     case GPMI_TIMING0:
-        s->timing0 = (uint32_t)value;
+        gpmi_apply_sct(&s->timing0, (uint32_t)value & 0x00FFFFFFU, sct);
         break;
     case GPMI_TIMING1:
         s->timing1 = (uint32_t)value & 0xFFFF0000U;

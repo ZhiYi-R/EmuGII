@@ -71,6 +71,12 @@
 #define DEVSEL_CH6_SHIFT    24
 #define DEVSEL_CH2_SHIFT    8
 
+/*
+ * APBX DEVSEL writable mask: CH7 (31:28), CH6 (27:24), CH2 (11:8).
+ * APBH DEVSEL is entirely read-only.
+ */
+#define DEVSEL_APBX_WRITABLE_MASK  0xFF000F00u
+
 /* Channel command word bits */
 #define CMD_XFER_COUNT_SHIFT    16
 #define CMD_XFER_COUNT_MASK     0xFFFF
@@ -119,9 +125,10 @@ static inline bool stmp3770_dma_enabled(STMP3770DMAState *s)
 
 static void stmp3770_dma_update_irq(STMP3770DMAState *s, int ch)
 {
-    bool pending = (s->ctrl1 & (1U << ch)) &&
-                   (s->ctrl1 & (1U << (ch + CTRL1_CMDCMPLT_IRQ_EN_SHIFT)));
-    qemu_set_irq(s->irq[ch], pending);
+    bool cmdcmplt = (s->ctrl1 & (1U << ch)) &&
+                    (s->ctrl1 & (1U << (ch + CTRL1_CMDCMPLT_IRQ_EN_SHIFT)));
+    bool ahb_error = (s->ctrl1 & (1U << (ch + CTRL1_AHB_ERROR_IRQ_SHIFT))) != 0;
+    qemu_set_irq(s->irq[ch], cmdcmplt || ahb_error);
 }
 
 static void stmp3770_dma_update_all_irqs(STMP3770DMAState *s)
@@ -278,7 +285,7 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
         return;
     }
 
-    if (command == COMMAND_DMA_SENSE) {
+    if (command == COMMAND_DMA_SENSE && !s->is_apbx) {
         bool sense = false;
 
         if (s->ch_handler[ch_idx].sense_capable) {
@@ -300,7 +307,15 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
         uint32_t xfer_count = (cmd >> CMD_XFER_COUNT_SHIFT) & CMD_XFER_COUNT_MASK;
         hwaddr bar = ch->loaded_bar;
 
-        if (xfer_count > 0 && bar != 0) {
+        /*
+         * XFER_COUNT is a 16-bit byte count; a value of zero requests a
+         * 64-Kbyte transfer.  BAR is a byte address, so zero is valid.
+         */
+        if (xfer_count == 0) {
+            xfer_count = 1U << 16;
+        }
+
+        if (xfer_count > 0) {
             g_autofree uint8_t *buf = g_malloc0(xfer_count);
             bool transfer_ok = false;
 
@@ -345,6 +360,8 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
             }
 
             if (!transfer_ok) {
+                s->ctrl1 |= (1U << (ch_idx + CTRL1_AHB_ERROR_IRQ_SHIFT));
+                stmp3770_dma_update_irq(s, ch_idx);
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "%s: channel %d failed to %s %u bytes at "
                               HWADDR_FMT_plx "\n",
@@ -354,14 +371,6 @@ static void stmp3770_dma_run_channel(STMP3770DMAState *s, int ch_idx)
                               command == COMMAND_DMA_WRITE ? "write" : "read",
                               xfer_count, bar);
             }
-        } else if (xfer_count > 0) {
-            qemu_log_mask(LOG_UNIMP,
-                          "%s: channel %d %s transfer of %u bytes stubbed "
-                          "(null BAR)\n",
-                          s->is_apbx ? "stmp3770-apbx-dma" : "stmp3770-apbh-dma",
-                          ch_idx,
-                          command == COMMAND_DMA_WRITE ? "write" : "read",
-                          xfer_count);
         }
     }
 
@@ -566,10 +575,26 @@ static void stmp3770_dma_write(void *opaque, hwaddr offset,
     int ch_idx;
 
     switch (base) {
-    case REG_CTRL0:
-        cur = (s->ctrl0 >> shift) & mask;
-        stmp3770_dma_apply_sct(&cur, (uint32_t)value, sct);
-        s->ctrl0 = (s->ctrl0 & ~full_mask) | ((cur & mask) << shift);
+    case REG_CTRL0: {
+        /*
+         * APBH: SFTRST(31), CLKGATE(30), RESET_CHANNEL(23:16),
+         *        CLKGATE_CHANNEL(15:8), FREEZE_CHANNEL(7:0)
+         * APBX: SFTRST(31), CLKGATE(30), RESET_CHANNEL(23:16),
+         *        RSVD(15:8), FREEZE_CHANNEL(7:0)
+         */
+        uint32_t ctrl0_writable = CTRL0_SFTRST | CTRL0_CLKGATE |
+                                  (CTRL0_RESET_CHANNEL_MASK <<
+                                   CTRL0_RESET_CHANNEL_SHIFT) |
+                                  (CTRL0_FREEZE_CHANNEL_MASK <<
+                                   CTRL0_FREEZE_CHANNEL_SHIFT);
+        if (!s->is_apbx) {
+            ctrl0_writable |= (CTRL0_CLKGATE_CHANNEL_MASK <<
+                               CTRL0_CLKGATE_CHANNEL_SHIFT);
+        }
+        uint32_t wmask = ctrl0_writable & full_mask;
+        cur = s->ctrl0;
+        stmp3770_dma_apply_sct(&cur, (uint32_t)value << shift, sct);
+        s->ctrl0 = (s->ctrl0 & ~wmask) | (cur & wmask);
         /*
          * Hardware ties CLKGATE to SFTRST: asserting reset automatically
          * gates the clock, so firmware polls CLKGATE after setting SFTRST.
@@ -580,28 +605,33 @@ static void stmp3770_dma_write(void *opaque, hwaddr offset,
             s->ctrl0 &= ~CTRL0_CLKGATE;
         }
         return;
-    case REG_CTRL1:
-        if (sct == SCT_SET || sct == SCT_TOG) {
-            uint32_t en_mask = CTRL1_CMDCMPLT_IRQ_EN_MASK <<
-                               CTRL1_CMDCMPLT_IRQ_EN_SHIFT;
-            uint32_t v = ((uint32_t)value << shift) & en_mask & full_mask;
-            if (sct == SCT_SET) {
-                s->ctrl1 |= v;
-            } else {
-                s->ctrl1 ^= v;
-            }
-        } else {
-            cur = (s->ctrl1 >> shift) & mask;
-            stmp3770_dma_apply_sct(&cur, (uint32_t)value, sct);
-            s->ctrl1 = (s->ctrl1 & ~full_mask) | ((cur & mask) << shift);
-        }
+    }
+    case REG_CTRL1: {
+        /*
+         * Per PDF Table 346: bits 31:24 are RSVD RO, bits 23:0 are all RW
+         * (AHB_ERROR_IRQ + CMDCMPLT_IRQ_EN + CMDCMPLT_IRQ).
+         */
+        uint32_t ctrl1_writable = (CTRL1_AHB_ERROR_IRQ_MASK <<
+                                   CTRL1_AHB_ERROR_IRQ_SHIFT) |
+                                  (CTRL1_CMDCMPLT_IRQ_EN_MASK <<
+                                   CTRL1_CMDCMPLT_IRQ_EN_SHIFT) |
+                                  (CTRL1_CMDCMPLT_IRQ_MASK <<
+                                   CTRL1_CMDCMPLT_IRQ_SHIFT);
+        uint32_t wmask = ctrl1_writable & full_mask;
+        cur = s->ctrl1;
+        stmp3770_dma_apply_sct(&cur, (uint32_t)value << shift, sct);
+        s->ctrl1 = (s->ctrl1 & ~wmask) | (cur & wmask);
         stmp3770_dma_update_all_irqs(s);
         return;
-    case REG_DEVSEL:
-        cur = (s->devsel >> shift) & mask;
-        stmp3770_dma_apply_sct(&cur, (uint32_t)value, sct);
-        s->devsel = (s->devsel & ~full_mask) | ((cur & mask) << shift);
+    }
+    case REG_DEVSEL: {
+        uint32_t devsel_writable = s->is_apbx ? DEVSEL_APBX_WRITABLE_MASK : 0;
+        uint32_t wmask = devsel_writable & full_mask;
+        cur = s->devsel;
+        stmp3770_dma_apply_sct(&cur, (uint32_t)value << shift, sct);
+        s->devsel = (s->devsel & ~wmask) | (cur & wmask);
         return;
+    }
     default:
         break;
     }
