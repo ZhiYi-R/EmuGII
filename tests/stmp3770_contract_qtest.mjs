@@ -1252,6 +1252,52 @@ async function testLradcTouchTemperatureContract() {
   });
 }
 
+async function testLradcDivideByTwoContract() {
+  await withMachine(async (machine) => {
+    /* Bring LRADC out of reset; CH0 maps to physical 0 by default */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000000);
+
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0xabc,
+      'CH0 physical 0 must be 0xabc without divide-by-two',
+    );
+
+    await machine.writel(LRADC_BASE + 0x020, 0x01000000); /* DIVIDE_BY_TWO for CH0 */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x55e,
+      'CH0 physical 0 must be halved to 0x55e when DIVIDE_BY_TWO is set',
+    );
+
+    await machine.writel(LRADC_BASE + 0x140, 0x76543218); /* CH0 -> physical 8 */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x200,
+      'CH0 physical 8 must be 0x200 with DIVIDE_BY_TWO and TEMPSENSE enabled',
+    );
+
+    await machine.writel(LRADC_BASE + 0x140, 0x76543219); /* CH0 -> physical 9 */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0x400,
+      'CH0 physical 9 must be 0x400 with DIVIDE_BY_TWO and TEMPSENSE enabled',
+    );
+
+    await machine.writel(LRADC_BASE + 0x020, 0x01008000); /* DIVIDE_BY_TWO + TEMPSENSE_PWD */
+    await machine.writel(LRADC_BASE + 0x000, 0x00000001); /* schedule CH0 */
+    assert.equal(
+      (await machine.readl(LRADC_BASE + 0x050)) & 0x3ffff,
+      0,
+      'CH0 physical 9 must read 0 when TEMPSENSE_PWD is set even with DIVIDE_BY_TWO',
+    );
+  });
+}
+
 async function testI2cRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -5096,6 +5142,7 @@ const tests = [
   ['LRADC IRQ contract', testLradcIrqContract],
   ['LRADC scheduler contract', testLradcSchedulerContract],
   ['LRADC touch/temperature contract', testLradcTouchTemperatureContract],
+  ['LRADC divide-by-two contract', testLradcDivideByTwoContract],
   ['I2C register contract', testI2cRegisterContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['Application UART register contract', testAppUartRegisterContract],

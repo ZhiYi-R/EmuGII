@@ -190,19 +190,23 @@ static void lradc_update_delay_remaining(STMP3770LRADCState *s);
 static uint32_t lradc_sample_value(STMP3770LRADCState *s, int ch)
 {
     uint32_t physical = (s->ctrl4 >> (ch * 4)) & 0xF;
+    uint32_t value = 0;
 
     if (physical < 8) {
-        return 0xABC;
-    }
-
-    if (physical == 8 || physical == 9) {
+        value = 0xABC;
+    } else if (physical == 8 || physical == 9) {
         if (s->ctrl2 & CTRL2_TEMPSENSE_PWD) {
             return 0;
         }
-        return (physical == 8) ? 0x400 : 0x800;
+        value = (physical == 8) ? 0x400 : 0x800;
     }
 
-    return 0;
+    /* CTRL2.DIVIDE_BY_TWO applies to the selected logical channel */
+    if ((s->ctrl2 >> (24 + ch)) & 1) {
+        value >>= 1;
+    }
+
+    return value;
 }
 
 static void lradc_complete_channel(STMP3770LRADCState *s, int ch)
