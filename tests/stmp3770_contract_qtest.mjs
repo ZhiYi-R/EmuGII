@@ -3931,6 +3931,65 @@ async function testApbxDma64KAndAhbErrorContract() {
   });
 }
 
+async function testApbhDma64KAndAhbErrorContract() {
+  await withMachine(async (machine) => {
+    const apbhCh0Nxt = APBH_BASE + 0x050;
+    const apbhCh0Cmd = APBH_BASE + 0x060;
+    const apbhCh0Bar = APBH_BASE + 0x070;
+    const apbhCh0Sema = APBH_BASE + 0x080;
+
+    /* Release APBH from reset and clock gate. */
+    await machine.writel(APBH_BASE + 0x008, 0xc0000000);
+
+    /* 64-KiB transfer: XFER_COUNT=0 with a valid SRAM byte address. */
+    const okDescriptor = 0x00000500;
+    const testBar = 0x00018000;
+    await machine.writel(okDescriptor + 0x00, 0);
+    await machine.writel(okDescriptor + 0x04, (1 << 6) | 1); /* SEMAPHORE, DMA_WRITE */
+    await machine.writel(okDescriptor + 0x08, testBar);
+    await machine.writel(okDescriptor + 0x0c, 0);
+
+    await machine.writel(testBar, 0xdeadbeef);
+    await machine.writel(apbhCh0Nxt, okDescriptor);
+    await machine.writel(apbhCh0Sema, 1);
+    assert.equal(
+      await machine.readl(testBar),
+      0,
+      'APBH CH0 XFER_COUNT=0 must transfer 64 KiB bytes to the byte address in BAR',
+    );
+    assert.equal(
+      await machine.readl(apbhCh0Bar),
+      testBar,
+      'APBH CH0 BAR must reflect the loaded descriptor buffer address',
+    );
+    assert.equal(
+      await machine.readl(apbhCh0Cmd) & 0x0000ffff,
+      0x41,
+      'APBH CH0 CMD must preserve the loaded descriptor command word',
+    );
+
+    /* AHB error: XFER_COUNT=0 with an unmapped byte address. */
+    const errDescriptor = 0x00000510;
+    await machine.writel(errDescriptor + 0x00, 0);
+    await machine.writel(errDescriptor + 0x04, (1 << 6) | 1); /* SEMAPHORE, DMA_WRITE */
+    await machine.writel(errDescriptor + 0x08, 0xdead0000);
+    await machine.writel(errDescriptor + 0x0c, 0);
+
+    await machine.writel(apbhCh0Nxt, errDescriptor);
+    await machine.writel(apbhCh0Sema, 1);
+    assert.equal(
+      (await machine.readl(APBH_BASE + 0x010)) & (1 << 16),
+      1 << 16,
+      'APBH CH0 AHB_ERROR_IRQ status must be set on a bus error',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x050)) & (1 << 13),
+      0,
+      'APBH CH0 AHB error must assert the LCDIF_DMA ICOLL source (raw bit 45)',
+    );
+  });
+}
+
 async function testApbxDmaSenseReservedContract() {
   await withMachine(async (machine) => {
     const apbxCh0Cur = APBX_BASE + 0x040;
@@ -6364,6 +6423,7 @@ const tests = [
   ['ECC8 register contract', testEcc8RegisterContract],
   ['GPMI DATA FIFO contract', testGpmiDataFifoContract],
   ['GPMI RUN WORD_LENGTH XFER_COUNT contract', testGpmiRunWordLengthXferCountContract],
+  ['APBH DMA 64 KiB and AHB error contract', testApbhDma64KAndAhbErrorContract],
   ['APBX DMA 64 KiB and AHB error contract', testApbxDma64KAndAhbErrorContract],
   ['APBX DMA SENSE reserved contract', testApbxDmaSenseReservedContract],
   ['DMA CTRL1 and DEVSEL writable mask contract', testDmaCtrl1AndDevselContract],
