@@ -26,21 +26,20 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 
-#define AUDIO_VERSION   0x01000000
+#define AUDIO_VERSION   0x01010000
 
 #define REG_CTRL0       0x000
 #define REG_CTRL0_SET   0x004
 #define REG_CTRL0_CLR   0x008
 #define REG_CTRL0_TOG   0x00C
 #define REG_STAT        0x010
-#define REG_VERSION     0x1F0
+#define REG_VERSION     0x200
 
 #define CTRL0_SFTRST    (1U << 31)
 #define CTRL0_CLKGATE   (1U << 30)
 #define CTRL0_RUN       (1U << 0)
 
-#define STAT_FIFO_EMPTY (1U << 0)
-#define STAT_FIFO_FULL  (1U << 1)
+#define STAT_PRESENT    (1U << 31)
 
 #define SAMPLE_RATE     44100
 #define SAMPLE_FORMAT   AUDIO_FORMAT_S16
@@ -89,7 +88,7 @@ static uint64_t audio_dac_read(void *opaque, hwaddr offset, unsigned size)
     case REG_CTRL0:
         return s->ctrl0;
     case REG_STAT:
-        return STAT_FIFO_EMPTY;
+        return STAT_PRESENT;
     case REG_VERSION:
         return AUDIO_VERSION;
     default:
@@ -254,7 +253,7 @@ static uint64_t audio_adc_read(void *opaque, hwaddr offset, unsigned size)
     case REG_CTRL0:
         return s->ctrl0;
     case REG_STAT:
-        return STAT_FIFO_EMPTY;
+        return STAT_PRESENT;
     case REG_VERSION:
         return AUDIO_VERSION;
     default:
