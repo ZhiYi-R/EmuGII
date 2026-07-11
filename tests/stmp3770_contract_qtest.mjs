@@ -3195,6 +3195,11 @@ async function testPinctrlDriveAndPullMasks() {
       0x00444444,
       'PINCTRL DRIVE14 must reset every documented voltage-select field high',
     );
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x230),
+      0x00444444,
+      'PINCTRL DRIVE3 must reset every documented voltage-select field high',
+    );
 
     await machine.writel(PINCTRL_BASE + 0x270, 0xffffffff);
     assert.equal(
@@ -3215,6 +3220,13 @@ async function testPinctrlDriveAndPullMasks() {
       await machine.readl(PINCTRL_BASE + 0x2e0),
       0x00777777,
       'PINCTRL DRIVE14 must hide bits 31:24 and each reserved pad bit',
+    );
+
+    await machine.writel(PINCTRL_BASE + 0x230, 0xffffffff);
+    assert.equal(
+      await machine.readl(PINCTRL_BASE + 0x230),
+      0x00777777,
+      'PINCTRL DRIVE3 must hide bits 31:24 and each reserved pad bit',
     );
 
     await machine.writel(PINCTRL_BASE + 0x300, 0xffffffff);
@@ -3248,6 +3260,33 @@ async function testPinctrlDriveAndPullMasks() {
       0,
       'PINCTRL DRIVE7_CLR is write-only and must read back zero',
     );
+  });
+}
+
+async function testPinctrlMuxselDefaultAndMask() {
+  await withMachine(async (machine) => {
+    /* Reset: every documented pin defaults to 0b11 (GPIO) with reserved bits zero. */
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x100), 0xffffffff, 'PINCTRL MUXSEL0 must reset to GPIO for all 16 pins');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x110), 0x0fffffff, 'PINCTRL MUXSEL1 must reset to GPIO for pins 16-29');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x120), 0xffffffff, 'PINCTRL MUXSEL2 must reset to GPIO for all 16 pins');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x130), 0x03ffffff, 'PINCTRL MUXSEL3 must reset to GPIO for pins 16-28');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x140), 0xffffffff, 'PINCTRL MUXSEL4 must reset to GPIO for all 16 pins');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x150), 0xffffffff, 'PINCTRL MUXSEL5 must reset to GPIO for all 16 pins');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x160), 0xffffffff, 'PINCTRL MUXSEL6 must reset to GPIO for all 16 pins');
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x170), 0x00000fff, 'PINCTRL MUXSEL7 must reset to GPIO for pins 16-21');
+
+    /* Reserved bits must be write-zero and not writable. */
+    await machine.writel(PINCTRL_BASE + 0x110, 0xffffffff);
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x110), 0x0fffffff, 'PINCTRL MUXSEL1 must preserve reserved bits 31:28');
+
+    await machine.writel(PINCTRL_BASE + 0x130, 0xffffffff);
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x130), 0x03ffffff, 'PINCTRL MUXSEL3 must preserve reserved bits 31:26');
+
+    await machine.writel(PINCTRL_BASE + 0x170, 0xffffffff);
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x170), 0x00000fff, 'PINCTRL MUXSEL7 must preserve reserved bits 31:12');
+
+    await machine.writel(PINCTRL_BASE + 0x100, 0xffffffff);
+    assert.equal(await machine.readl(PINCTRL_BASE + 0x100), 0xffffffff, 'PINCTRL MUXSEL0 must accept all bits');
   });
 }
 
@@ -4707,6 +4746,7 @@ const tests = [
   ['LCDIF data access contract', testLcdifDataAccessContract],
   ['PINCTRL Bank 3 absence', testPinctrlBank3Absent],
   ['PINCTRL drive and pull masks', testPinctrlDriveAndPullMasks],
+  ['PINCTRL MUXSEL default and reserved mask', testPinctrlMuxselDefaultAndMask],
   ['PINCTRL GPIO IRQSTAT edge/level contract', testPinctrlGpioIrqstatContract],
   ['ICOLL core contract', testIcollCoreContract],
   ['ICOLL same-level priority contract', testIcollSameLevelPriorityContract],

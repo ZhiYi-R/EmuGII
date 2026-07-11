@@ -127,10 +127,25 @@ static const uint32_t bank_pin_mask[STMP3770_PINCTRL_NUM_BANKS] = {
 
 /* Each pad drive field has three writable bits; its fourth bit is reserved. */
 static const uint32_t drive_mask[15] = {
-    0x77777777, 0x77777777, 0x77777777, 0x77777777,
+    0x77777777, 0x77777777, 0x77777777, 0x00777777,
     0x77777777, 0x77777777, 0x77777777, 0x00077777,
     0x77777777, 0x77777777, 0x77777777, 0x77777777,
     0x77777777, 0x77777777, 0x00777777,
+};
+
+/*
+ * MUXSEL registers are 2 bits per pin.  Some registers have fewer than 16
+ * documented pins, so the unused upper bits must be reserved (read zero).
+ */
+static const uint32_t muxsel_mask[8] = {
+    0xFFFFFFFF,  /* MUXSEL0: Bank 0 pins 0-15  (16 pins) */
+    0x0FFFFFFF,  /* MUXSEL1: Bank 0 pins 16-29 (14 pins) */
+    0xFFFFFFFF,  /* MUXSEL2: Bank 1 pins 0-15  (16 pins) */
+    0x03FFFFFF,  /* MUXSEL3: Bank 1 pins 16-28 (13 pins) */
+    0xFFFFFFFF,  /* MUXSEL4: Bank 2 pins 0-15  (16 pins) */
+    0xFFFFFFFF,  /* MUXSEL5: Bank 2 pins 16-31 (16 pins) */
+    0xFFFFFFFF,  /* MUXSEL6: Bank 3 pins 0-15  (16 pins) */
+    0x00000FFF,  /* MUXSEL7: Bank 3 pins 16-21 (6 pins)  */
 };
 
 /* PULL0..2 implement only the pads documented in Tables 1206, 1208 and 1210. */
@@ -361,7 +376,7 @@ static void stmp3770_pinctrl_reset(DeviceState *dev)
               CTRL_PRESENT0 | CTRL_PRESENT1 | CTRL_PRESENT2;
 
     for (i = 0; i < ARRAY_SIZE(s->muxsel); i++) {
-        s->muxsel[i] = 0;
+        s->muxsel[i] = muxsel_mask[i];
     }
 
     /* PDF Tables 1176-1204 reset each documented pad to 3.3 V / 4 mA. */
@@ -527,7 +542,7 @@ static void stmp3770_pinctrl_write(void *opaque, hwaddr offset,
 
     case REG_MUXSEL0 ... REG_MUXSEL7:
         bank = (offset - REG_MUXSEL0) >> 4;
-        stmp3770_pinctrl_apply_write(&s->muxsel[bank], 0xFFFFFFFF,
+        stmp3770_pinctrl_apply_write(&s->muxsel[bank], muxsel_mask[bank],
                                      value, is_set, is_clr, is_tog);
         stmp3770_pinctrl_sample_din(s);
         break;
