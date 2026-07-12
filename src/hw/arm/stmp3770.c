@@ -654,6 +654,8 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(s->uartapp), 0,
                        qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_UART_ERROR));
 
+    stmp3770_uartapp_set_dma(s->uartapp, s->apbx_dma, 7, 6);
+
     /*
      * Child devices get their own reset during realize, but the SoC-local
      * DFLPT sparse-window state lives on this container device.

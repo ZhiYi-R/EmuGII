@@ -1884,6 +1884,146 @@ async function testAppUartRegisterContract() {
   });
 }
 
+async function testAppUartFifoIflsContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(APPUART_BASE + 0x030, 0x10);
+    await machine.writel(APPUART_BASE + 0x020, 0x00220381);
+    await machine.writel(APPUART_BASE + 0x050, 0x00200020);
+
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x00200020,
+      'UARTAPP TXIS must be set when TX FIFO is empty below the default threshold',
+    );
+
+    await machine.writel(APPUART_BASE + 0x060, 0x5a);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x00200020,
+      'UARTAPP TXIS must remain the only active status after the first four bytes',
+    );
+
+    await machine.writel(APPUART_BASE + 0x060, 0x5a);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x00200030,
+      'UARTAPP RXIS must be set when RX FIFO reaches the half-level threshold',
+    );
+
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x060),
+      0x0000005a,
+      'UARTAPP LBE must return the looped-back TX data on DATA read',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x00200020,
+      'UARTAPP RXIS must clear after RX FIFO drops below the half-level threshold',
+    );
+
+    await machine.writel(APPUART_BASE + 0x020, 0x00000381);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050),
+      0x00200030,
+      'UARTAPP RXIS and TXIS must both be set at the one-eighth threshold',
+    );
+  });
+}
+
+async function testAppUartDmaFifoContract() {
+  await withMachine(async (machine) => {
+    const tx_descriptor = 0x00000600;
+    const rx_descriptor = 0x00000620;
+    const tx_buffer = 0x00001000;
+    const rx_buffer = 0x00001010;
+    const ch7Nxtcmdar = APBX_BASE + 0x360;
+    const ch7Sema = APBX_BASE + 0x390;
+    const ch6Nxtcmdar = APBX_BASE + 0x2f0;
+    const ch6Sema = APBX_BASE + 0x320;
+
+    const tx_cmd =
+      (4 << 16) | /* XFER_COUNT */
+      (1 << 12) | /* CMDWORDS */
+      (1 << 7) |  /* WAIT4ENDCMD */
+      (1 << 6) |  /* SEMAPHORE */
+      (1 << 3) |  /* IRQONCMPLT */
+      2;          /* DMA_READ */
+    const tx_pio = (1 << 28) | 4; /* RUN + XFER_COUNT */
+
+    const rx_cmd =
+      (4 << 16) | /* XFER_COUNT */
+      (1 << 12) | /* CMDWORDS */
+      (1 << 7) |  /* WAIT4ENDCMD */
+      (1 << 6) |  /* SEMAPHORE */
+      (1 << 3) |  /* IRQONCMPLT */
+      1;          /* DMA_WRITE */
+    const rx_pio = (1 << 29) | 4; /* RUN + XFER_COUNT */
+
+    await machine.writel(APBX_BASE + 0x008, 0xc0000000);
+    await machine.writel(APBX_BASE + 0x014, 0x0000c000);
+
+    await machine.writel(APPUART_BASE + 0x030, 0x10);
+    await machine.writel(APPUART_BASE + 0x020, 0x00220381);
+
+    await machine.writel(tx_buffer, 0x05040302);
+    await machine.writel(tx_descriptor + 0x00, 0);
+    await machine.writel(tx_descriptor + 0x04, tx_cmd);
+    await machine.writel(tx_descriptor + 0x08, tx_buffer);
+    await machine.writel(tx_descriptor + 0x0c, tx_pio);
+
+    await machine.writel(rx_descriptor + 0x00, 0);
+    await machine.writel(rx_descriptor + 0x04, rx_cmd);
+    await machine.writel(rx_descriptor + 0x08, rx_buffer);
+    await machine.writel(rx_descriptor + 0x0c, rx_pio);
+
+    await machine.writel(ch7Nxtcmdar, tx_descriptor);
+    await machine.writel(ch7Sema, 1);
+
+
+
+    assert.equal(
+      await machine.readl(ch7Sema),
+      0,
+      'APBX UART TX channel semaphore must be decremented on completion',
+    );
+    assert.equal(
+      await machine.readl(APBX_BASE + 0x010) & (1 << 7),
+      1 << 7,
+      'APBX UART TX channel CMDCMPLT status must be set',
+    );
+
+    await machine.writel(ch6Nxtcmdar, rx_descriptor);
+    await machine.writel(ch6Sema, 1);
+
+    assert.equal(
+      await machine.readl(ch6Sema),
+      0,
+      'APBX UART RX channel semaphore must be decremented on completion',
+    );
+    assert.equal(
+      await machine.readl(APBX_BASE + 0x010) & (1 << 6),
+      1 << 6,
+      'APBX UART RX channel CMDCMPLT status must be set',
+    );
+
+    assert.equal(
+      await machine.readl(rx_buffer),
+      0x05040302,
+      'APBX UART RX DMA must read back the looped-back TX bytes',
+    );
+    assert.notEqual(
+      await machine.readl(ICOLL_BASE + 0x040) & (1 << 23),
+      0,
+      'APBX UART TX DMA completion must assert ICOLL source 23',
+    );
+    assert.notEqual(
+      await machine.readl(ICOLL_BASE + 0x040) & (1 << 25),
+      0,
+      'APBX UART RX DMA completion must assert ICOLL source 25',
+    );
+  });
+}
+
 async function testDebugUartRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -6690,6 +6830,8 @@ const tests = [
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['I2C DMA FIFO data contract', testI2cDmaFifoContract],
   ['Application UART register contract', testAppUartRegisterContract],
+  ['Application UART FIFO IFLS threshold contract', testAppUartFifoIflsContract],
+  ['Application UART DMA FIFO data contract', testAppUartDmaFifoContract],
   ['Debug UART register contract', testDebugUartRegisterContract],
   ['Debug UART FIFO IFLS threshold contract', testDebugUartFifoIflsContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],

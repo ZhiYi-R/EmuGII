@@ -130,6 +130,12 @@ static void stmp3770_board_init(MachineState *machine)
         qdev_prop_set_chr(DEVICE(s->soc.uartdbg), "chardev", chr);
     }
 
+    /* Connect application UART to the second serial chardev if provided */
+    chr = serial_hd(1);
+    if (chr) {
+        qdev_prop_set_chr(DEVICE(s->soc.uartapp), "chardev", chr);
+    }
+
     /* Connect NAND drive to GPMI if one was provided with -drive if=none */
     {
         DriveInfo *dinfo = drive_get(IF_NONE, 0, 0);
