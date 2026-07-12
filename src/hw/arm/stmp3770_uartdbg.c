@@ -74,6 +74,39 @@ static void uartdbg_update_irq(STMP3770UARTDebugState *s)
     qemu_set_irq(s->irq, (s->ris & s->imsc) != 0);
 }
 
+static unsigned uartdbg_fifo_threshold(unsigned iflsel)
+{
+    if (iflsel == 0 || iflsel > 4) {
+        return 1;
+    }
+    if (iflsel == 4) {
+        return 14;
+    }
+    return iflsel * 4;
+}
+
+static void uartdbg_update_ris(STMP3770UARTDebugState *s)
+{
+    unsigned rx_iflsel = (s->ifls >> 3) & 0x7;
+    unsigned tx_iflsel = s->ifls & 0x7;
+    unsigned rx_threshold = uartdbg_fifo_threshold(rx_iflsel);
+    unsigned tx_threshold = uartdbg_fifo_threshold(tx_iflsel);
+
+    s->ris &= ~(UARTDBG_INT_RX | UARTDBG_INT_TX);
+    if ((s->cr & (UARTDBG_CR_UARTEN | UARTDBG_CR_RXE)) ==
+            (UARTDBG_CR_UARTEN | UARTDBG_CR_RXE) &&
+        s->rx_count >= rx_threshold) {
+        s->ris |= UARTDBG_INT_RX;
+    }
+    if ((s->cr & (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE)) ==
+            (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE) &&
+        s->tx_count < tx_threshold) {
+        s->ris |= UARTDBG_INT_TX;
+    }
+
+    uartdbg_update_irq(s);
+}
+
 static void uartdbg_reset_fifo(STMP3770UARTDebugState *s)
 {
     s->rx_pos = 0;
@@ -95,8 +128,7 @@ static void uartdbg_put_rx(STMP3770UARTDebugState *s, uint16_t value)
     slot = (s->rx_pos + s->rx_count) & (depth - 1);
     s->rx_fifo[slot] = value;
     s->rx_count++;
-    s->ris |= UARTDBG_INT_RX;
-    uartdbg_update_irq(s);
+    uartdbg_update_ris(s);
 }
 
 static uint32_t uartdbg_get_rx(STMP3770UARTDebugState *s)
@@ -109,10 +141,7 @@ static uint32_t uartdbg_get_rx(STMP3770UARTDebugState *s)
         s->rx_pos = (s->rx_pos + 1) & (depth - 1);
         s->rx_count--;
         s->rsr = (value & UARTDBG_DR_ERROR_MASK) >> 8;
-        if (s->rx_count == 0) {
-            s->ris &= ~UARTDBG_INT_RX;
-        }
-        uartdbg_update_irq(s);
+        uartdbg_update_ris(s);
         qemu_chr_fe_accept_input(&s->chr);
     }
 
@@ -163,8 +192,9 @@ static void uartdbg_reset(DeviceState *dev)
     s->imsc = 0;
     s->ris = 0;
     s->dmacr = 0;
+    s->tx_count = 0;
     uartdbg_reset_fifo(s);
-    uartdbg_update_irq(s);
+    uartdbg_update_ris(s);
 }
 
 static uint64_t uartdbg_read(void *opaque, hwaddr offset, unsigned size)
@@ -235,8 +265,7 @@ static void uartdbg_write(void *opaque, hwaddr offset, uint64_t value,
                 qemu_chr_fe_write_all(&s->chr, &ch, 1);
             }
         }
-        s->ris |= UARTDBG_INT_TX;
-        uartdbg_update_irq(s);
+        uartdbg_update_ris(s);
         break;
     case UARTDBG_RSR:
         s->rsr = 0;
@@ -252,12 +281,15 @@ static void uartdbg_write(void *opaque, hwaddr offset, uint64_t value,
             uartdbg_reset_fifo(s);
         }
         s->lcr = value & 0xff;
+        uartdbg_update_ris(s);
         break;
     case UARTDBG_CR:
         s->cr = value & UARTDBG_CR_RW_MASK;
+        uartdbg_update_ris(s);
         break;
     case UARTDBG_IFLS:
         s->ifls = value & UARTDBG_IFLS_RW_MASK;
+        uartdbg_update_ris(s);
         break;
     case UARTDBG_IMSC:
         s->imsc = value & UARTDBG_IMSC_RW_MASK;
@@ -265,7 +297,7 @@ static void uartdbg_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case UARTDBG_ICR:
         s->ris &= ~(value & UARTDBG_IMSC_RW_MASK);
-        uartdbg_update_irq(s);
+        uartdbg_update_ris(s);
         break;
     case UARTDBG_DMACR:
         s->dmacr = value & UARTDBG_DMACR_RW_MASK;
@@ -325,6 +357,7 @@ static const VMStateDescription vmstate_uartdbg = {
                              UARTDBG_FIFO_DEPTH),
         VMSTATE_UINT8(rx_pos, STMP3770UARTDebugState),
         VMSTATE_UINT8(rx_count, STMP3770UARTDebugState),
+        VMSTATE_UINT8(tx_count, STMP3770UARTDebugState),
         VMSTATE_END_OF_LIST()
     }
 };

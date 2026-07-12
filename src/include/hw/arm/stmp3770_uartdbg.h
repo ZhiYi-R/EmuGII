@@ -37,6 +37,7 @@ struct STMP3770UARTDebugState {
     uint16_t rx_fifo[16];
     uint8_t rx_pos;
     uint8_t rx_count;
+    uint8_t tx_count;
 };
 
 #endif

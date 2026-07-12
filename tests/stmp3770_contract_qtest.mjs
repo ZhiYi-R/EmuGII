@@ -1932,6 +1932,60 @@ async function testDebugUartRegisterContract() {
   });
 }
 
+async function testDebugUartFifoIflsContract() {
+  await withMachine(async (machine) => {
+    await machine.writel(DBGUART_BASE + 0x030, 0x00000381);
+    await machine.writel(DBGUART_BASE + 0x02c, 0x00000010);
+    await machine.writel(DBGUART_BASE + 0x034, 0x0000000a);
+    await machine.writel(DBGUART_BASE + 0x038, 0x00000030);
+
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040),
+      0x00000020,
+      'UARTDBG MIS must reflect TXRIS only while RX FIFO is below one-quarter',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000041);
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000042);
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000043);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040),
+      0x00000020,
+      'UARTDBG MIS must still reflect only TXRIS with three RX entries',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000044);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040),
+      0x00000030,
+      'UARTDBG MIS must set RXRIS once one-quarter FIFO threshold is reached',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x044, 0x00000030);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x03c),
+      0x00000030,
+      'UARTDBG RIS must reassert RXRIS while RX FIFO remains at one-quarter',
+    );
+
+    await machine.readl(DBGUART_BASE + 0x000);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040),
+      0x00000020,
+      'UARTDBG MIS must clear RXRIS once RX FIFO drops below one-quarter',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x034, 0x00000000);
+    await machine.writel(DBGUART_BASE + 0x044, 0x00000030);
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000055);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040),
+      0x00000030,
+      'UARTDBG MIS must set RXRIS immediately at RXIFLSEL=NOT_EMPTY',
+    );
+  });
+}
+
 async function testLcdifCtrl1Layout() {
   await withMachine(async (machine) => {
     await machine.writel(LCDIF_BASE + 0x008, 0xc0000000);
@@ -6637,6 +6691,7 @@ const tests = [
   ['I2C DMA FIFO data contract', testI2cDmaFifoContract],
   ['Application UART register contract', testAppUartRegisterContract],
   ['Debug UART register contract', testDebugUartRegisterContract],
+  ['Debug UART FIFO IFLS threshold contract', testDebugUartFifoIflsContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['LCDIF register map contract', testLcdifRegisterMapContract],
   ['LCDIF clock gate contract', testLcdifClockGateContract],
