@@ -150,12 +150,16 @@ static void usbphy_write(void *opaque, hwaddr offset,
     }
 
     if ((offset & ~0xC) == REG_TX) {
-        usbphy_apply_sct(&s->tx, (uint32_t)value & TX_WRITABLE_MASK, sct);
+        if (sct != 3) {
+            usbphy_apply_sct(&s->tx, (uint32_t)value & TX_WRITABLE_MASK, sct);
+        }
         return;
     }
 
     if ((offset & ~0xC) == REG_RX) {
-        usbphy_apply_sct(&s->rx, (uint32_t)value & RX_WRITABLE_MASK, sct);
+        if (sct != 3) {
+            usbphy_apply_sct(&s->rx, (uint32_t)value & RX_WRITABLE_MASK, sct);
+        }
         return;
     }
 
@@ -181,8 +185,7 @@ static void usbphy_write(void *opaque, hwaddr offset,
     }
 
     if (offset == REG_STATUS) {
-        s->status = (s->status & ~STATUS_OTGID_STATUS) |
-                    ((uint32_t)value & STATUS_OTGID_STATUS);
+        /* STATUS is read-only; writes are ignored. */
         return;
     }
 

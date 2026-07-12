@@ -2805,12 +2805,29 @@ async function testUsbPhyRegisterContract() {
       );
     }
 
+    /* STATUS is read-only; writes must be ignored. OTGID_STATUS is bit 8. */
     await machine.writel(USBPHY_BASE + 0x040, 0xffffffff);
     assert.equal(
       await machine.readl(USBPHY_BASE + 0x040),
-      0x00000100,
-      'USBPHY STATUS must expose OTGID_STATUS as its sole writable field',
+      0x00000000,
+      'USBPHY STATUS must be read-only and reset to 0 (OTGID_STATUS is bit 8)',
     );
+
+    /* TX and RX do not have TOG aliases; TOG writes must be ignored. */
+    const noTog = [
+      [0x010, 0x1faf2f8f, 'TX'],
+      [0x020, 0x00400033, 'RX'],
+    ];
+    for (const [offset, expected, name] of noTog) {
+      await machine.writel(USBPHY_BASE + offset, 0);
+      await machine.writel(USBPHY_BASE + offset + 0x004, 0xffffffff);
+      await machine.writel(USBPHY_BASE + offset + 0x00c, 0xffffffff);
+      assert.equal(
+        await machine.readl(USBPHY_BASE + offset),
+        expected,
+        `USBPHY ${name} must not support TOG alias`,
+      );
+    }
 
     await machine.writel(USBPHY_BASE + 0x050, 0);
     await machine.writel(USBPHY_BASE + 0x038, 0x80000000);
