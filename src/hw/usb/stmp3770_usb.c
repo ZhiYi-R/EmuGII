@@ -67,11 +67,23 @@
 
 #define USBCMD_RST          (1U << 1)
 #define USBCMD_RUN          (1U << 0)
+#define USBCMD_PSE          (1U << 4)
+#define USBCMD_ASE          (1U << 5)
+#define USBCMD_IAA          (1U << 6)
 #define USBCMD_WRITABLE_MASK        0x00FFEB7FU
 
 #define USBSTS_W1C_MASK             0x030D05FF
 #define USBINTR_WRITABLE_MASK        0x030D05FF
 #define USBSTS_URI                  (1U << 6)
+#define USBSTS_SRI                  (1U << 7)
+#define USBSTS_FRI                  (1U << 3)
+#define USBSTS_HCH                  (1U << 12)
+#define USBSTS_RCL                  (1U << 13)
+#define USBSTS_PS                   (1U << 14)
+#define USBSTS_AS                   (1U << 15)
+#define FRINDEX_MASK                0x3FFFU
+#define FRINDEX_PERIOD_US           125
+
 #define GPTIMER_RUN                  (1U << 31)
 #define GPTIMER_RESET                (1U << 30)
 #define GPTIMER_REPEAT               (1U << 24)
@@ -174,6 +186,35 @@ static void usb_update_irq(STMP3770USBState *s)
     uint32_t otgsc_irq = (otgsc_status & otgsc_en) & 0x7FU;
 
     qemu_set_irq(s->irq, (usb_irq | otgsc_irq) != 0);
+}
+
+static bool usb_host_mode(const STMP3770USBState *s)
+{
+    return (s->usbmode & 0x3) == 0x3;
+}
+
+static void usb_update_frindex_timer(STMP3770USBState *s)
+{
+    ptimer_transaction_begin(s->frindex_ptimer);
+    if (usb_host_mode(s) && (s->usbcmd & USBCMD_RUN)) {
+        ptimer_run(s->frindex_ptimer, 0);
+    } else {
+        ptimer_stop(s->frindex_ptimer);
+    }
+    ptimer_transaction_commit(s->frindex_ptimer);
+}
+
+static void usb_frindex_tick(void *opaque)
+{
+    STMP3770USBState *s = opaque;
+    uint32_t next = (s->frindex + 1) & FRINDEX_MASK;
+
+    if (next == 0) {
+        s->usbsts |= USBSTS_FRI;
+    }
+    s->frindex = next;
+    s->usbsts |= USBSTS_SRI;
+    usb_update_irq(s);
 }
 
 static void usb_port_reset_timeout(void *opaque)
@@ -285,6 +326,10 @@ static void usb_controller_reset(STMP3770USBState *s)
     ptimer_set_limit(s->otgsc_1ms_ptimer, 1000, 1);
     ptimer_run(s->otgsc_1ms_ptimer, 0);
     ptimer_transaction_commit(s->otgsc_1ms_ptimer);
+
+    ptimer_transaction_begin(s->frindex_ptimer);
+    ptimer_stop(s->frindex_ptimer);
+    ptimer_transaction_commit(s->frindex_ptimer);
 }
 
 static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
@@ -361,7 +406,30 @@ static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
     case REG_USBCMD:
         return s->usbcmd;
     case REG_USBSTS:
-        return s->usbsts;
+    {
+        uint32_t v = s->usbsts;
+        if (usb_host_mode(s)) {
+            if (s->usbcmd & USBCMD_RUN) {
+                v &= ~USBSTS_HCH;
+                if (s->usbcmd & USBCMD_PSE) {
+                    v |= USBSTS_PS;
+                } else {
+                    v &= ~USBSTS_PS;
+                }
+                if (s->usbcmd & USBCMD_ASE) {
+                    v |= USBSTS_AS;
+                } else {
+                    v &= ~USBSTS_AS;
+                }
+            } else {
+                v |= USBSTS_HCH;
+                v &= ~(USBSTS_PS | USBSTS_AS);
+            }
+        } else {
+            v &= ~(USBSTS_HCH | USBSTS_PS | USBSTS_AS | USBSTS_RCL);
+        }
+        return v;
+    }
     case REG_USBINTR:
         return s->usbintr;
     case REG_FRINDEX:
@@ -434,6 +502,7 @@ static void usb_write(void *opaque, hwaddr offset,
         if (s->usbcmd & USBCMD_RST) {
             usb_controller_reset(s);
         }
+        usb_update_frindex_timer(s);
         usb_update_irq(s);
         break;
     case REG_USBSTS:
@@ -446,7 +515,9 @@ static void usb_write(void *opaque, hwaddr offset,
         usb_update_irq(s);
         break;
     case REG_FRINDEX:
-        s->frindex = (uint32_t)value & 0x3FFF;
+        if (usb_host_mode(s)) {
+            s->frindex = (uint32_t)value & FRINDEX_MASK;
+        }
         break;
     case REG_DEVICEADDR:
         s->device_addr = (uint32_t)value & USBCTRL_DEVICEADDR_WRITABLE_MASK;
@@ -536,6 +607,7 @@ static void usb_write(void *opaque, hwaddr offset,
         if (!s->usbmode_written) {
             s->usbmode = (uint32_t)value & USBCTRL_USBMODE_WRITABLE_MASK;
             s->usbmode_written = true;
+            usb_update_frindex_timer(s);
         }
         break;
     case REG_ENDPTSETUPSTAT:
@@ -639,12 +711,13 @@ static void usb_finalize(Object *obj)
     g_free(s->gptimer_cb_info);
     ptimer_free(s->port_reset_ptimer);
     ptimer_free(s->otgsc_1ms_ptimer);
+    ptimer_free(s->frindex_ptimer);
 }
 
 static const VMStateDescription vmstate_usb = {
     .name = "stmp3770-usb",
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(usbcmd, STMP3770USBState),
         VMSTATE_UINT32(usbsts, STMP3770USBState),
@@ -676,6 +749,7 @@ static const VMStateDescription vmstate_usb = {
                                            vmstate_ptimer, ptimer_state),
         VMSTATE_PTIMER(port_reset_ptimer, STMP3770USBState),
         VMSTATE_PTIMER(otgsc_1ms_ptimer, STMP3770USBState),
+        VMSTATE_PTIMER(frindex_ptimer, STMP3770USBState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -713,6 +787,14 @@ static void usb_init(Object *obj)
     ptimer_set_freq(s->otgsc_1ms_ptimer, 1000000);
     ptimer_set_limit(s->otgsc_1ms_ptimer, 0, 1);
     ptimer_transaction_commit(s->otgsc_1ms_ptimer);
+
+    s->frindex_ptimer = ptimer_init(usb_frindex_tick, s,
+                                    PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                    PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    ptimer_transaction_begin(s->frindex_ptimer);
+    ptimer_set_freq(s->frindex_ptimer, 1000000);
+    ptimer_set_limit(s->frindex_ptimer, FRINDEX_PERIOD_US, 1);
+    ptimer_transaction_commit(s->frindex_ptimer);
 
     usb_controller_reset(s);
 }

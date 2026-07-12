@@ -61,6 +61,7 @@ struct STMP3770USBState {
 
     ptimer_state *port_reset_ptimer;
     ptimer_state *otgsc_1ms_ptimer;
+    ptimer_state *frindex_ptimer;
 };
 
 #endif /* STMP3770_USB_H */

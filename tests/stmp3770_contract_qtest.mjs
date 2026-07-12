@@ -3114,7 +3114,7 @@ async function testUsbPortsc1AndOtgscContract() {
     );
     assert.equal(
       await machine.readl(USB_BASE + 0x144),
-      0x00000004,
+      0x00001004,
       'USBCTRL USBSTS.PCI must be set after port reset',
     );
     assert.notEqual(
@@ -3125,7 +3125,7 @@ async function testUsbPortsc1AndOtgscContract() {
     await machine.writel(USB_BASE + 0x144, 0x00000004);
     assert.equal(
       await machine.readl(USB_BASE + 0x144),
-      0x00000000,
+      0x00001000,
       'USBCTRL USBSTS.PCI must be W1C',
     );
     assert.equal(
@@ -3360,6 +3360,72 @@ async function testUsbGptimerContract() {
       0,
       'USBCTRL GPTIMER1 repeat mode must automatically reload after expiry',
     );
+  });
+}
+
+async function testUsbFrindexAndStatusContract() {
+  await withMachine(async (machine) => {
+    const USBCMD = USB_BASE + 0x140;
+    const USBSTS = USB_BASE + 0x144;
+    const USBINTR = USB_BASE + 0x148;
+    const FRINDEX = USB_BASE + 0x14c;
+    const USBMODE = USB_BASE + 0x1a8;
+
+    /* Reset controller and set host mode. */
+    await machine.writel(USBCMD, 0x00000002);
+    assert.equal(await machine.readl(USBCMD), 0x00080000);
+    await machine.writel(USBMODE, 0x00000003);
+    assert.equal(await machine.readl(USBMODE), 0x00000003);
+
+    /* Host controller is halted while RS is clear. */
+    assert.equal(await machine.readl(USBSTS), 0x00001000);
+
+    /* FRINDEX is writable in host mode and stops when RS is clear. */
+    await machine.writel(FRINDEX, 0x00001234);
+    assert.equal(await machine.readl(FRINDEX), 0x00001234);
+    await machine.clockStep(125_000);
+    assert.equal(await machine.readl(FRINDEX), 0x00001234);
+
+    /* Set SRI/FRI interrupt enables and start the controller. */
+    await machine.writel(USBINTR, 0x00000088);
+    await machine.writel(USBCMD, 0x00080001);
+    assert.equal(await machine.readl(USBSTS), 0x00000000);
+
+    /* FRINDEX increments and SRI sets every 125 us; SRI drives ICOLL source 11. */
+    await machine.clockStep(125_000);
+    assert.equal(await machine.readl(FRINDEX), 0x00001235);
+    assert.equal(await machine.readl(USBSTS), 0x00000080);
+    assert.notEqual((await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11), 0);
+
+    /* W1C-clear SRI and deassert the USB interrupt. */
+    await machine.writel(USBSTS, 0x00000080);
+    assert.equal(await machine.readl(USBSTS), 0x00000000);
+    assert.equal((await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11), 0);
+
+    /* Another microframe reasserts SRI. */
+    await machine.clockStep(125_000);
+    assert.equal(await machine.readl(FRINDEX), 0x00001236);
+    assert.equal(await machine.readl(USBSTS), 0x00000080);
+
+    /* Frame-list rollover at FRINDEX wrap-around. */
+    await machine.writel(FRINDEX, 0x00003fff);
+    await machine.writel(USBSTS, 0x00000088);
+    await machine.clockStep(125_000);
+    assert.equal(await machine.readl(FRINDEX), 0x00000000);
+    assert.equal(await machine.readl(USBSTS), 0x00000088);
+
+    /* Stopping the controller reasserts HCH and clears PS/AS. */
+    await machine.writel(USBSTS, 0x00000088);
+    await machine.writel(USBCMD, 0x00080031);
+    assert.equal(await machine.readl(USBSTS), 0x0000c000);
+    await machine.writel(USBCMD, 0x00000000);
+    assert.equal(await machine.readl(USBSTS), 0x00001000);
+
+    /* FRINDEX is read-only in device mode. */
+    await machine.writel(USBCMD, 0x00000002);
+    await machine.writel(USBMODE, 0x00000002);
+    await machine.writel(FRINDEX, 0x00001234);
+    assert.equal(await machine.readl(FRINDEX), 0x00000000);
   });
 }
 
@@ -8121,6 +8187,7 @@ const tests = [
   ['USBCTRL PORTSC1 and OTGSC contract', testUsbPortsc1AndOtgscContract],
   ['USBCTRL endpoint register contract', testUsbEndpointRegisterContract],
   ['USBCTRL GPTIMER contract', testUsbGptimerContract],
+  ['USBCTRL FRINDEX and host status contract', testUsbFrindexAndStatusContract],
   ['SSP register layout and reset contract', testSspRegisterLayoutAndResetContract],
   ['SSP soft reset and clock gate contract', testSspSoftResetAndClockGateContract],
   ['SSP soft reset hold contract', testSspSoftResetHoldContract],
