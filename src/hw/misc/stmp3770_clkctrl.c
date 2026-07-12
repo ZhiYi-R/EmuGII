@@ -144,8 +144,8 @@ struct STMP3770CLKCTRLState {
 
     STMP3770CLKCTRLDigResetFn dig_reset_cb;
     void *dig_reset_opaque;
-    STMP3770CLKCTRLHclkRateFn hclk_rate_cb[3];
-    void *hclk_rate_opaque[3];
+    STMP3770CLKCTRLHclkRateFn hclk_rate_cb[4];
+    void *hclk_rate_opaque[4];
     size_t hclk_rate_cb_count;
     STMP3770CLKCTRLGpmiRateFn gpmi_rate_cb;
     void *gpmi_rate_opaque;

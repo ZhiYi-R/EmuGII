@@ -23,6 +23,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 
 /* SET/CLR/TOG sub-offsets */
 #define SCT_SET 0x4
@@ -34,6 +35,9 @@
 #define SSP_TIMING_CLOCK_DIVIDE_SHIFT 8
 #define SSP_TIMING_CLOCK_DIVIDE_MASK 0x0000FF00U
 #define SSP_TIMING_CLOCK_RATE_MASK 0x000000FFU
+
+/* SPI receive timeout: 128 HCLK cycles (Reference Manual Table 775) */
+#define SSP_RECV_TIMEOUT_HCLK 128
 
 static inline bool stmp3770_ssp_enabled(STMP3770SSPState *s)
 {
@@ -89,11 +93,48 @@ static unsigned int stmp3770_ssp_bytes_per_word(STMP3770SSPState *s)
     return bytes_per_word ? bytes_per_word : 1;
 }
 
+static void stmp3770_ssp_cancel_recv_timeout(STMP3770SSPState *s)
+{
+    timer_del(s->recv_timeout_timer);
+}
+
+static void stmp3770_ssp_start_recv_timeout(STMP3770SSPState *s)
+{
+    if (s->hclk_hz == 0 || s->fifo_count != 1 ||
+        !(s->ctrl0 & SSP_CTRL0_RUN) || !stmp3770_ssp_enabled(s) ||
+        (s->status & SSP_STATUS_RECV_TIMEOUT_STAT)) {
+        return;
+    }
+
+    uint64_t ns = ((uint64_t)SSP_RECV_TIMEOUT_HCLK * NANOSECONDS_PER_SECOND +
+                   s->hclk_hz - 1) / s->hclk_hz;
+
+    timer_mod(s->recv_timeout_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+}
+
+static void stmp3770_ssp_recv_timeout_expired(void *opaque)
+{
+    STMP3770SSPState *s = STMP3770_SSP(opaque);
+
+    if (s->fifo_count != 1 || !(s->ctrl0 & SSP_CTRL0_RUN) ||
+        !stmp3770_ssp_enabled(s) ||
+        (s->status & SSP_STATUS_RECV_TIMEOUT_STAT)) {
+        return;
+    }
+
+    s->status |= SSP_STATUS_RECV_TIMEOUT_STAT;
+    s->ctrl1 |= SSP_CTRL1_RECV_TIMEOUT_IRQ;
+    stmp3770_ssp_update_irq(s);
+}
+
 static void stmp3770_ssp_fifo_set_empty(STMP3770SSPState *s)
 {
     s->fifo_count = 0;
     s->status |= SSP_STATUS_FIFO_EMPTY;
     s->status &= ~SSP_STATUS_FIFO_FULL;
+    s->status &= ~SSP_STATUS_RECV_TIMEOUT_STAT;
+    stmp3770_ssp_cancel_recv_timeout(s);
 }
 
 static void stmp3770_ssp_fifo_load(STMP3770SSPState *s)
@@ -153,6 +194,7 @@ static void stmp3770_ssp_reset(DeviceState *dev)
     s->sspclk_rate = 0;
     s->fifo_count = 0;
 
+    stmp3770_ssp_cancel_recv_timeout(s);
     stmp3770_ssp_update_irq(s);
 }
 
@@ -267,7 +309,13 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
                 } else {
                     s->status |= SSP_STATUS_FIFO_EMPTY;
                 }
+                stmp3770_ssp_start_recv_timeout(s);
             }
+        } else if ((old_ctrl0 & SSP_CTRL0_RUN) &&
+                   !(s->ctrl0 & SSP_CTRL0_RUN)) {
+            s->status &= ~(SSP_STATUS_BUSY | SSP_STATUS_CMD_BUSY |
+                           SSP_STATUS_DATA_BUSY);
+            stmp3770_ssp_cancel_recv_timeout(s);
         }
         break;
     }
@@ -338,12 +386,22 @@ static void stmp3770_ssp_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     s->sspclk_rate = 0;
+    s->hclk_hz = 0;
+    s->recv_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         stmp3770_ssp_recv_timeout_expired, s);
 
     memory_region_init_io(&s->iomem, obj, &stmp3770_ssp_ops, s,
                           TYPE_STMP3770_SSP, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq_dma);
     sysbus_init_irq(sbd, &s->irq_error);
+}
+
+static void stmp3770_ssp_finalize(Object *obj)
+{
+    STMP3770SSPState *s = STMP3770_SSP(obj);
+
+    timer_free(s->recv_timeout_timer);
 }
 
 static int stmp3770_ssp_post_load(void *opaque, int version_id)
@@ -356,6 +414,7 @@ static int stmp3770_ssp_post_load(void *opaque, int version_id)
     if (version_id < 4) {
         s->fifo_count = (s->status & SSP_STATUS_FIFO_FULL) ? 1 : 0;
     }
+    stmp3770_ssp_start_recv_timeout(s);
     stmp3770_ssp_update_irq(s);
 
     return 0;
@@ -363,7 +422,7 @@ static int stmp3770_ssp_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_stmp3770_ssp = {
     .name = "stmp3770-ssp",
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_load = stmp3770_ssp_post_load,
     .fields = (const VMStateField[]) {
@@ -381,6 +440,8 @@ static const VMStateDescription vmstate_stmp3770_ssp = {
         VMSTATE_UINT32_V(words_remaining, STMP3770SSPState, 2),
         VMSTATE_UINT32_V(sspclk_rate, STMP3770SSPState, 3),
         VMSTATE_UINT8_V(fifo_count, STMP3770SSPState, 4),
+        VMSTATE_UINT32_V(hclk_hz, STMP3770SSPState, 5),
+        VMSTATE_TIMER_PTR(recv_timeout_timer, STMP3770SSPState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -398,6 +459,7 @@ static const TypeInfo stmp3770_ssp_type_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770SSPState),
     .instance_init = stmp3770_ssp_init,
+    .instance_finalize = stmp3770_ssp_finalize,
     .class_init    = stmp3770_ssp_class_init,
 };
 
@@ -483,6 +545,13 @@ static int stmp3770_ssp_dma_handler(STMP3770DMAState *dma, int channel,
 void stmp3770_ssp_set_clk_rate(STMP3770SSPState *s, uint32_t sspclk_hz)
 {
     s->sspclk_rate = sspclk_hz;
+}
+
+void stmp3770_ssp_set_hclk_rate(STMP3770SSPState *s, uint32_t hclk_hz)
+{
+    s->hclk_hz = hclk_hz;
+    stmp3770_ssp_cancel_recv_timeout(s);
+    stmp3770_ssp_start_recv_timeout(s);
 }
 
 void stmp3770_ssp_set_dma(STMP3770SSPState *s, STMP3770DMAState *dma,

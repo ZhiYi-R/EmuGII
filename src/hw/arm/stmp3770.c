@@ -203,6 +203,16 @@ static void stmp3770_ssp_rate_update(void *opaque, uint32_t ssp_hz)
     stmp3770_ssp_set_clk_rate(STMP3770_SSP(opaque), ssp_hz);
 }
 
+static void stmp3770_ssp_hclk_rate_update(void *opaque, uint32_t hclk_hz)
+{
+    STMP3770State *s = STMP3770(opaque);
+    int i;
+
+    for (i = 0; i < STMP3770_NUM_SSPS; i++) {
+        stmp3770_ssp_set_hclk_rate(s->ssp[i], hclk_hz);
+    }
+}
+
 static void stmp3770_init(Object *obj)
 {
     STMP3770State *s = STMP3770(obj);
@@ -646,6 +656,11 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
     stmp3770_clkctrl_set_ssp_rate_callback(s->clkctrl,
                                            stmp3770_ssp_rate_update,
                                            s->ssp[1]);
+
+    /* Propagate HCLK rate changes to SSP controllers for SPI receive timeout. */
+    stmp3770_clkctrl_set_hclk_rate_callback(s->clkctrl,
+                                            stmp3770_ssp_hclk_rate_update,
+                                            s);
 
     /* APBX DMA channel IRQs */
     sysbus_connect_irq(SYS_BUS_DEVICE(s->apbx_dma), 0,

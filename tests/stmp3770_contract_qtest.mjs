@@ -3722,6 +3722,97 @@ async function testSspCtrl1RunLockContract() {
   });
 }
 
+async function testSspRecvTimeoutContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const fifoFullBit = 1 << 8;
+    const recvTimeoutStatBit = 1 << 11;
+    const recvTimeoutIrqBit = 1 << 17;
+    const recvTimeoutEnBit = 1 << 16;
+    const fifoUnderrunIrqBit = 1 << 21;
+
+    // release SFTRST/CLKGATE and clear default FIFO_UNDERRUN_IRQ status
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+    await machine.writel(SSP1_BASE + 0x068, fifoUnderrunIrqBit);
+
+    // enable RECV_TIMEOUT_IRQ
+    await machine.writel(SSP1_BASE + 0x064, recvTimeoutEnBit);
+
+    // preload DATA with RUN not set so FIFO becomes full
+    await machine.writel(SSP1_BASE + 0x070, 0x12345678);
+    let status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & fifoFullBit,
+      fifoFullBit,
+      'SSP FIFO must be full after DATA write with RUN not set',
+    );
+    assert.equal(
+      status & recvTimeoutStatBit,
+      0,
+      'SSP RECV_TIMEOUT_STAT must not be set before RUN',
+    );
+
+    // set RUN with XFER_COUNT=1, this starts the 128 HCLK receive timeout
+    await machine.writel(SSP1_BASE + 0x000, 0x20000001 | runBit);
+    status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & fifoFullBit,
+      fifoFullBit,
+      'SSP FIFO must remain full right after RUN rise',
+    );
+    assert.equal(
+      status & recvTimeoutStatBit,
+      0,
+      'SSP RECV_TIMEOUT_STAT must remain clear right after RUN rise',
+    );
+
+    // 128 HCLK cycles at 24 MHz is ~5.3 us; step 10 us to be safe
+    await machine.clockStep(10000);
+
+    status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & recvTimeoutStatBit,
+      recvTimeoutStatBit,
+      'SSP RECV_TIMEOUT_STAT must set after 128 HCLK cycles without FIFO read',
+    );
+    const ctrl1 = await machine.readl(SSP1_BASE + 0x060);
+    assert.equal(
+      ctrl1 & recvTimeoutIrqBit,
+      recvTimeoutIrqBit,
+      'SSP RECV_TIMEOUT_IRQ must be set on timeout',
+    );
+    const raw0 = await machine.readl(ICOLL_BASE + 0x040);
+    assert.notEqual(
+      raw0 & (1 << 15),
+      0,
+      'SSP1 error must assert ICOLL source 15 when RECV_TIMEOUT_IRQ is enabled',
+    );
+
+    // reading DATA consumes the FIFO and clears RECV_TIMEOUT_STAT
+    const data = await machine.readl(SSP1_BASE + 0x070);
+    assert.equal(
+      data,
+      0x12345678,
+      'SSP DATA read must return the preloaded value',
+    );
+    status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & recvTimeoutStatBit,
+      0,
+      'SSP RECV_TIMEOUT_STAT must clear after FIFO read',
+    );
+
+    // clear RECV_TIMEOUT_IRQ and deassert the error interrupt
+    await machine.writel(SSP1_BASE + 0x068, recvTimeoutIrqBit);
+    const raw0After = await machine.readl(ICOLL_BASE + 0x040);
+    assert.equal(
+      raw0After & (1 << 15),
+      0,
+      'SSP1 error must deassert after clearing RECV_TIMEOUT_IRQ',
+    );
+  });
+}
+
 async function testGpmiTiming2Contract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x080, 0xffffffff);
@@ -7494,6 +7585,7 @@ const tests = [
   ['SSP XFER_COUNT word-width contract', testSspXferCountWordWidthContract],
   ['SSP FIFO occupancy contract', testSspFifoOccupancyContract],
   ['SSP CTRL1 RUN lock contract', testSspCtrl1RunLockContract],
+  ['SSP RECV_TIMEOUT contract', testSspRecvTimeoutContract],
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
   ['GPMI ECC register contract', testGpmiEccRegisterContract],
