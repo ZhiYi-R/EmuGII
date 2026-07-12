@@ -3813,6 +3813,146 @@ async function testSspRecvTimeoutContract() {
   });
 }
 
+async function testSspDebugAndDmaStatusContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const enableBit = 1 << 16;
+    const dataXferBit = 1 << 24;
+    const readBit = 1 << 25;
+    const dmaReqBit = 1 << 19;
+    const dmaEndBit = 1 << 18;
+    const dmaTermBit = 1 << 20;
+    const busyBit = 1 << 0;
+    const dataBusyBit = 1 << 2;
+    const cmdBusyBit = 1 << 3;
+    const fifoFullBit = 1 << 8;
+
+    const debugCmdSmShift = 10;
+    const debugMmcSmShift = 12;
+    const debugDatSmShift = 24;
+    const debugDmaSmShift = 16;
+    const debugCmdOeBit = 1 << 19;
+
+    // release SFTRST/CLKGATE
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+
+    // SD/MMC mode: 8-bit word, DMA enabled, command + data write
+    await machine.writel(SSP1_BASE + 0x060, 0x00002073);
+    await machine.writel(SSP1_BASE + 0x070, 0x12345678);
+    await machine.writel(
+      SSP1_BASE + 0x000,
+      runBit | dataXferBit | enableBit | 1,
+    );
+
+    let debug = await machine.readl(SSP1_BASE + 0x100);
+    assert.equal(
+      (debug >> debugCmdSmShift) & 0x3,
+      0x1,
+      'SSP CMD_SM must be INDEX in SD/MMC command phase',
+    );
+    assert.equal(
+      (debug >> debugMmcSmShift) & 0xf,
+      0x5,
+      'SSP MMC_SM must be TX in SD/MMC data write',
+    );
+    assert.equal(
+      (debug >> debugDatSmShift) & 0x7,
+      0x2,
+      'SSP DAT_SM must be WORD during SD/MMC data transfer',
+    );
+    assert.equal(
+      (debug >> debugDmaSmShift) & 0x7,
+      0x4,
+      'SSP DMA_SM must be BUSY when DMA_ENABLE is set and RUN is active',
+    );
+    assert.notEqual(
+      debug & debugCmdOeBit,
+      0,
+      'SSP CMD_OE must be asserted during SD/MMC command',
+    );
+
+    let status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & (busyBit | cmdBusyBit | dataBusyBit),
+      busyBit | cmdBusyBit | dataBusyBit,
+      'SSP BUSY/CMD_BUSY/DATA_BUSY must be set during SD/MMC transfer',
+    );
+    assert.equal(
+      status & fifoFullBit,
+      fifoFullBit,
+      'SSP FIFO must be full after preloading DATA',
+    );
+    assert.equal(
+      status & dmaReqBit,
+      dmaReqBit,
+      'SSP DMAREQ must be asserted while RUN is active with DMA_ENABLE',
+    );
+    assert.equal(
+      status & (dmaEndBit | dmaTermBit),
+      0,
+      'SSP DMAEND/DMATERM must be clear while RUN is active',
+    );
+
+    // clear RUN, DMA command ends/terminates
+    await machine.writel(SSP1_BASE + 0x008, runBit);
+
+    debug = await machine.readl(SSP1_BASE + 0x100);
+    assert.equal(
+      (debug >> debugDmaSmShift) & 0x7,
+      0x5,
+      'SSP DMA_SM must be DONE after RUN fall',
+    );
+    assert.equal(
+      debug & debugCmdOeBit,
+      0,
+      'SSP CMD_OE must be deasserted after RUN fall',
+    );
+
+    status = await machine.readl(SSP1_BASE + 0x0c0);
+    assert.equal(
+      status & dmaReqBit,
+      0,
+      'SSP DMAREQ must clear after RUN fall',
+    );
+    assert.equal(
+      status & (dmaEndBit | dmaTermBit),
+      dmaEndBit | dmaTermBit,
+      'SSP DMAEND and DMATERM must set after RUN fall',
+    );
+
+    // MS mode: command-only (no DATA_XFER) should not show DAT_SM
+    await machine.writel(SSP1_BASE + 0x060, 0x00002074);
+    await machine.writel(SSP1_BASE + 0x000, runBit | enableBit | 1);
+
+    debug = await machine.readl(SSP1_BASE + 0x100);
+    assert.equal(
+      (debug >> debugMmcSmShift) & 0xf,
+      0x0,
+      'SSP MMC_SM must be idle in MS mode',
+    );
+    assert.equal(
+      (debug >> debugDatSmShift) & 0x7,
+      0x0,
+      'SSP DAT_SM must be idle in MS command-only transfer',
+    );
+    assert.equal(
+      debug & debugCmdOeBit,
+      debugCmdOeBit,
+      'SSP CMD_OE must be asserted during MS command phase',
+    );
+
+    // reset and verify DEBUG returns to idle
+    await machine.writel(SSP1_BASE + 0x000, 0x80000000);
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+    debug = await machine.readl(SSP1_BASE + 0x100);
+    assert.equal(
+      debug,
+      0x0,
+      'SSP DEBUG must return to idle after soft reset',
+    );
+  });
+}
+
 async function testGpmiTiming2Contract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x080, 0xffffffff);
@@ -7586,6 +7726,7 @@ const tests = [
   ['SSP FIFO occupancy contract', testSspFifoOccupancyContract],
   ['SSP CTRL1 RUN lock contract', testSspCtrl1RunLockContract],
   ['SSP RECV_TIMEOUT contract', testSspRecvTimeoutContract],
+  ['SSP DEBUG and DMA status contract', testSspDebugAndDmaStatusContract],
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
   ['GPMI ECC register contract', testGpmiEccRegisterContract],

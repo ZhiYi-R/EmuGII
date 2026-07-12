@@ -128,6 +128,97 @@ static void stmp3770_ssp_recv_timeout_expired(void *opaque)
     stmp3770_ssp_update_irq(s);
 }
 
+/* DEBUG/DMA state machine values */
+#define SSP_DEBUG_CSM_INDEX  (1U << 10)
+#define SSP_DEBUG_MMC_CMD    (1U << 12)
+#define SSP_DEBUG_MMC_RESP   (3U << 12)
+#define SSP_DEBUG_MMC_TX     (5U << 12)
+#define SSP_DEBUG_MMC_RX     (7U << 12)
+#define SSP_DEBUG_DMA_IDLE   (0U << 16)
+#define SSP_DEBUG_DMA_BUSY   (4U << 16)
+#define SSP_DEBUG_DMA_DONE   (5U << 16)
+#define SSP_DEBUG_CMD_OE     (1U << 19)
+#define SSP_DEBUG_MSTK_TPC   (3U << 20)
+#define SSP_DEBUG_MSTK_RW    (7U << 20)
+#define SSP_DEBUG_DSM_WORD   (2U << 24)
+
+static void stmp3770_ssp_update_debug(STMP3770SSPState *s)
+{
+    uint32_t debug = 0;
+    bool run = s->ctrl0 & SSP_CTRL0_RUN;
+    bool enable = s->ctrl0 & SSP_CTRL0_ENABLE;
+    bool data_xfer = s->ctrl0 & SSP_CTRL0_DATA_XFER;
+    bool dma_enable = s->ctrl1 & SSP_CTRL1_DMA_ENABLE;
+    unsigned int ssp_mode = s->ctrl1 & SSP_CTRL1_SSP_MODE_MASK;
+    bool is_sd_mmc = (ssp_mode == 0x3U || ssp_mode == 0x7U);
+    bool is_ms = (ssp_mode == 0x4U);
+
+    if (run && enable && (is_sd_mmc || is_ms)) {
+        debug |= SSP_DEBUG_CSM_INDEX;
+        debug |= SSP_DEBUG_CMD_OE;
+    }
+
+    if (is_sd_mmc && run && enable) {
+        if (data_xfer) {
+            if (s->ctrl0 & SSP_CTRL0_READ) {
+                debug |= SSP_DEBUG_MMC_RX;
+            } else {
+                debug |= SSP_DEBUG_MMC_TX;
+            }
+        } else if (s->ctrl0 & SSP_CTRL0_GET_RESP) {
+            debug |= SSP_DEBUG_MMC_RESP;
+        } else {
+            debug |= SSP_DEBUG_MMC_CMD;
+        }
+    }
+
+    if (is_ms && run && enable) {
+        if (data_xfer) {
+            debug |= SSP_DEBUG_MSTK_RW;
+        } else {
+            debug |= SSP_DEBUG_MSTK_TPC;
+        }
+    }
+
+    if ((is_sd_mmc || is_ms) && run && data_xfer) {
+        debug |= SSP_DEBUG_DSM_WORD;
+        if (s->fifo_count == 0 && s->words_remaining > 0) {
+            debug |= (1U << 27); /* DATA_STALL */
+        }
+    }
+
+    if (dma_enable) {
+        if (run && s->words_remaining > 0) {
+            debug |= SSP_DEBUG_DMA_BUSY;
+        } else {
+            debug |= SSP_DEBUG_DMA_DONE;
+        }
+    } else {
+        debug |= SSP_DEBUG_DMA_IDLE;
+    }
+
+    s->debug = debug;
+}
+
+static void stmp3770_ssp_update_dma_status(STMP3770SSPState *s)
+{
+    uint32_t dma_bits = 0;
+    bool run = s->ctrl0 & SSP_CTRL0_RUN;
+    bool dma_enable = s->ctrl1 & SSP_CTRL1_DMA_ENABLE;
+
+    if (dma_enable) {
+        if (run) {
+            dma_bits |= SSP_STATUS_DMAREQ;
+        } else {
+            dma_bits |= (SSP_STATUS_DMAEND | SSP_STATUS_DMATERM);
+        }
+    }
+
+    s->status &= ~(SSP_STATUS_DMASENSE | SSP_STATUS_DMATERM |
+                   SSP_STATUS_DMAREQ | SSP_STATUS_DMAEND);
+    s->status |= dma_bits;
+}
+
 static void stmp3770_ssp_fifo_set_empty(STMP3770SSPState *s)
 {
     s->fifo_count = 0;
@@ -165,6 +256,9 @@ static void stmp3770_ssp_complete_data_word(STMP3770SSPState *s)
         s->status &= ~(SSP_STATUS_BUSY | SSP_STATUS_CMD_BUSY |
                        SSP_STATUS_DATA_BUSY);
     }
+
+    stmp3770_ssp_update_debug(s);
+    stmp3770_ssp_update_dma_status(s);
 }
 
 static bool stmp3770_ssp_has_sct_alias(hwaddr offset)
@@ -195,6 +289,8 @@ static void stmp3770_ssp_reset(DeviceState *dev)
     s->fifo_count = 0;
 
     stmp3770_ssp_cancel_recv_timeout(s);
+    stmp3770_ssp_update_debug(s);
+    stmp3770_ssp_update_dma_status(s);
     stmp3770_ssp_update_irq(s);
 }
 
@@ -251,6 +347,7 @@ static uint64_t stmp3770_ssp_read(void *opaque, hwaddr offset, unsigned size)
     case SSP_STATUS:
         return s->status;
     case SSP_DEBUG:
+        stmp3770_ssp_update_debug(s);
         return s->debug;
     case SSP_VERSION:
         return SSP_VERSION_VALUE;
@@ -317,6 +414,9 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
                            SSP_STATUS_DATA_BUSY);
             stmp3770_ssp_cancel_recv_timeout(s);
         }
+
+        stmp3770_ssp_update_debug(s);
+        stmp3770_ssp_update_dma_status(s);
         break;
     }
     case SSP_CTRL1:
@@ -328,6 +428,8 @@ static void stmp3770_ssp_write(void *opaque, hwaddr offset,
             s->ctrl1 = (s->ctrl1 & ~0xFFU) | (old_ctrl1 & 0xFFU);
         }
         stmp3770_ssp_update_irq(s);
+        stmp3770_ssp_update_debug(s);
+        stmp3770_ssp_update_dma_status(s);
         break;
     }
     case SSP_CMD0:
@@ -415,6 +517,8 @@ static int stmp3770_ssp_post_load(void *opaque, int version_id)
         s->fifo_count = (s->status & SSP_STATUS_FIFO_FULL) ? 1 : 0;
     }
     stmp3770_ssp_start_recv_timeout(s);
+    stmp3770_ssp_update_debug(s);
+    stmp3770_ssp_update_dma_status(s);
     stmp3770_ssp_update_irq(s);
 
     return 0;
