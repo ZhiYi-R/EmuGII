@@ -15,6 +15,7 @@
 #define STMP3770_I2C_H
 
 #include "hw/sysbus.h"
+#include "hw/i2c/i2c.h"
 
 #define TYPE_STMP3770_I2C "stmp3770-i2c"
 
@@ -68,6 +69,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770I2CState, STMP3770_I2C)
 #define I2C_VERSION_VALUE 0x01010000
 
 #define I2C_FIFO_DEPTH 8
+#define I2C_FIFO_THRESHOLD (I2C_FIFO_DEPTH / 2)
 
 struct STMP3770DMAState;
 
@@ -94,6 +96,26 @@ struct STMP3770I2CState {
     uint32_t xfer_count;
     bool data_engine_busy;
     bool dma_wait4endcmd;
+
+    I2CBus *bus;
+    QEMUTimer *xfer_timer;
+    QEMUTimer *bus_free_timer;
+    bool xfer_timer_active;
+    bool bus_free_timer_active;
+    bool bus_busy;
+    bool bus_free_irq_pending;
+    uint8_t last_addr;
+    uint8_t current_addr;
+    bool current_is_recv;
+    uint32_t ack_error;
+
+    bool slave_found;
+    bool slave_searching;
+    bool slave_busy;
+    bool slave_hold_clk;
+    uint16_t slave_state;
+    uint8_t rcvd_slave_addr;
+    bool slave_addr_eq_zero;
 
     struct STMP3770DMAState *dma;
     int dma_channel;

@@ -20,6 +20,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/boards.h"
 #include "hw/char/pl011.h"
+#include "hw/i2c/smbus_eeprom.h"
 #include "hw/misc/unimp.h"
 #include "chardev/char-fe.h"
 #include "system/system.h"
@@ -523,6 +524,9 @@ static void stmp3770_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(s->icoll), STMP3770_IRQ_I2C_ERROR));
 
     stmp3770_i2c_set_dma(s->i2c, s->apbx_dma, 3);
+
+    /* Attach a small SMBus EEPROM for regression I2C master tests. */
+    smbus_eeprom_init_one(s->i2c->bus, 0x50, g_malloc0(256));
 
     /* Realize LCDIF */
     if (!sysbus_realize(SYS_BUS_DEVICE(s->lcdif), errp)) {

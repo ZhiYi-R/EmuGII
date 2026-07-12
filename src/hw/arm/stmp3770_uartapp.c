@@ -48,6 +48,7 @@
 #define UARTAPP_CTRL2_UARTEN     (1U << 0)
 #define UARTAPP_CTRL2_SIREN      (1U << 1)
 #define UARTAPP_CTRL2_SIRLP      (1U << 2)
+#define UARTAPP_CTRL2_USE_LCR2   (1U << 6)
 #define UARTAPP_CTRL2_LBE        (1U << 7)
 #define UARTAPP_CTRL2_TXE        (1U << 8)
 #define UARTAPP_CTRL2_RXE        (1U << 9)
@@ -93,6 +94,8 @@
 #define UARTAPP_INTR_RTIS   (1U << 6)
 
 #define UARTAPP_STAT_WRITABLE_MASK 0x00F70000U
+
+#define UARTAPP_UARTCLK_HZ 24000000ULL
 
 static void uartapp_apply_sct(uint32_t *reg, uint32_t value, int sct,
                               uint32_t writable_mask)
@@ -184,6 +187,18 @@ static void uartapp_reset_fifo(STMP3770UARTAppState *s)
     s->overrun = false;
 }
 
+static void uartapp_rx_dma_complete_check(STMP3770UARTAppState *s)
+{
+    if (s->rx_dma_active && s->rx_xfer_count == 0 && s->rx_dma_wait4endcmd) {
+        s->rx_dma_wait4endcmd = false;
+        s->rx_dma_active = false;
+        s->ctrl0 &= ~UARTAPP_CTRL0_RUN;
+        if (s->dma) {
+            stmp3770_dma_complete_channel_command(s->dma, s->rx_dma_channel);
+        }
+    }
+}
+
 static bool uartapp_tx_push(STMP3770UARTAppState *s, uint8_t byte)
 {
     unsigned depth = uartapp_fifo_depth(s);
@@ -219,6 +234,10 @@ static bool uartapp_rx_push(STMP3770UARTAppState *s, uint8_t byte)
     s->rx_fifo[s->rx_wptr] = byte;
     s->rx_wptr = (s->rx_wptr + 1) % UARTAPP_FIFO_DEPTH;
     s->rx_count++;
+    if (s->rx_dma_active && s->rx_xfer_count > 0) {
+        s->rx_xfer_count--;
+        uartapp_rx_dma_complete_check(s);
+    }
     return true;
 }
 
@@ -233,37 +252,74 @@ static bool uartapp_rx_pop(STMP3770UARTAppState *s, uint8_t *byte)
     return true;
 }
 
-static void uartapp_tx_process(STMP3770UARTAppState *s)
+static uint32_t uartapp_tx_linectrl(const STMP3770UARTAppState *s)
+{
+    return (s->ctrl2 & UARTAPP_CTRL2_USE_LCR2) ? s->linectrl2 : s->linectrl;
+}
+
+static uint64_t uartapp_bit_time_ns(uint32_t linectrl)
+{
+    uint32_t divint = (linectrl >> UARTAPP_LINECTRL_BAUD_DIVINT_SHIFT) &
+                      UARTAPP_LINECTRL_BAUD_DIVINT_MASK;
+    uint32_t divfrac = (linectrl >> UARTAPP_LINECTRL_BAUD_DIVFRAC_SHIFT) &
+                       UARTAPP_LINECTRL_BAUD_DIVFRAC_MASK;
+    uint32_t divisor = (divint << 6) | divfrac;
+
+    if (divisor == 0) {
+        return 0;
+    }
+    return (uint64_t)divisor * NANOSECONDS_PER_SECOND /
+           (UARTAPP_UARTCLK_HZ * 32);
+}
+
+static uint64_t uartapp_byte_time_ns(uint32_t linectrl)
+{
+    uint64_t bit_time = uartapp_bit_time_ns(linectrl);
+    unsigned wlen_field;
+    unsigned wlen;
+    unsigned parity;
+    unsigned stop_bits;
+    unsigned frame_bits;
+
+    if (bit_time == 0) {
+        return 0;
+    }
+
+    wlen_field = (linectrl >> UARTAPP_LINECTRL_WLEN_SHIFT) &
+                 UARTAPP_LINECTRL_WLEN_MASK;
+    wlen = 5 + wlen_field;
+    parity = (linectrl & UARTAPP_LINECTRL_PEN) ? 1 : 0;
+    stop_bits = (linectrl & UARTAPP_LINECTRL_STP2) ? 2 : 1;
+    frame_bits = 1 + wlen + parity + stop_bits;
+
+    return bit_time * frame_bits;
+}
+
+static bool uartapp_tx_send_next(STMP3770UARTAppState *s)
 {
     uint8_t byte;
 
     if (!s->tx_count) {
-        return;
+        return false;
     }
 
     if ((s->ctrl2 & (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) !=
             (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) {
-        return;
+        return false;
     }
 
-    while (s->tx_count > 0) {
-        if (!uartapp_tx_pop(s, &byte)) {
-            break;
-        }
+    if (!uartapp_tx_pop(s, &byte)) {
+        return false;
+    }
 
-        if (s->ctrl2 & UARTAPP_CTRL2_LBE) {
-            if (uartapp_rx_push(s, byte)) {
-                if (s->rx_dma_active && s->rx_xfer_count > 0) {
-                    s->rx_xfer_count--;
-                }
-            }
-        } else if (qemu_chr_fe_backend_connected(&s->chr)) {
-            qemu_chr_fe_write_all(&s->chr, &byte, 1);
-        }
+    if (s->ctrl2 & UARTAPP_CTRL2_LBE) {
+        uartapp_rx_push(s, byte);
+    } else if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_write_all(&s->chr, &byte, 1);
+    }
 
-        if (s->tx_dma_active && s->tx_xfer_count > 0) {
-            s->tx_xfer_count--;
-        }
+    if (s->tx_dma_active && s->tx_xfer_count > 0) {
+        s->tx_xfer_count--;
     }
 
     if (s->tx_dma_active && s->tx_xfer_count == 0 && s->tx_dma_wait4endcmd) {
@@ -275,6 +331,62 @@ static void uartapp_tx_process(STMP3770UARTAppState *s)
         }
     }
 
+    return true;
+}
+
+static void uartapp_tx_send_all(STMP3770UARTAppState *s)
+{
+    while (uartapp_tx_send_next(s)) {
+    }
+}
+
+static void uartapp_tx_start_timer(STMP3770UARTAppState *s)
+{
+    uint32_t linectrl = uartapp_tx_linectrl(s);
+    uint64_t byte_time = uartapp_byte_time_ns(linectrl);
+
+    if (s->tx_baud_timer_active || s->tx_count == 0) {
+        return;
+    }
+
+    if ((s->ctrl2 & (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) !=
+            (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) {
+        return;
+    }
+
+    if (byte_time == 0) {
+        uartapp_tx_send_all(s);
+        return;
+    }
+
+    s->tx_baud_timer_active = true;
+    timer_mod(s->tx_baud_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + byte_time);
+}
+
+static void uartapp_tx_baud_cb(void *opaque)
+{
+    STMP3770UARTAppState *s = STMP3770_UARTAPP(opaque);
+
+    s->tx_baud_timer_active = false;
+    if (uartapp_tx_send_next(s)) {
+        uartapp_tx_start_timer(s);
+    }
+    uartapp_update_irq_full(s);
+}
+
+static void uartapp_tx_process(STMP3770UARTAppState *s)
+{
+    if (!s->tx_count) {
+        return;
+    }
+
+    if ((s->ctrl2 & (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) !=
+            (UARTAPP_CTRL2_UARTEN | UARTAPP_CTRL2_TXE)) {
+        return;
+    }
+
+    uartapp_tx_start_timer(s);
     uartapp_update_irq_full(s);
 }
 
@@ -292,25 +404,13 @@ static void uartapp_rx_process(STMP3770UARTAppState *s)
             if (!uartapp_tx_pop(s, &byte)) {
                 break;
             }
-            if (uartapp_rx_push(s, byte)) {
-                s->rx_xfer_count--;
-            }
+            uartapp_rx_push(s, byte);
         } else {
-            if (uartapp_rx_push(s, 0xff)) {
-                s->rx_xfer_count--;
-            }
+            uartapp_rx_push(s, 0xff);
         }
     }
 
-    if (s->rx_dma_active && s->rx_xfer_count == 0 && s->rx_dma_wait4endcmd) {
-        s->rx_dma_wait4endcmd = false;
-        s->rx_dma_active = false;
-        s->ctrl0 &= ~UARTAPP_CTRL0_RUN;
-        if (s->dma) {
-            stmp3770_dma_complete_channel_command(s->dma, s->rx_dma_channel);
-        }
-    }
-
+    uartapp_rx_dma_complete_check(s);
     uartapp_update_irq_full(s);
 }
 
@@ -374,7 +474,14 @@ static uint32_t uartapp_read_stat(STMP3770UARTAppState *s)
 {
     uint32_t val = 0xC0000000;
     unsigned depth = uartapp_fifo_depth(s);
+    bool busy = s->tx_count > 0 || s->tx_baud_timer_active || s->tx_dma_active ||
+                s->rx_dma_active ||
+                (s->ctrl0 & UARTAPP_CTRL0_RUN) ||
+                (s->ctrl1 & UARTAPP_CTRL1_RUN);
 
+    if (busy) {
+        val |= 1U << 29; /* BUSY */
+    }
     if (s->tx_count == 0) {
         val |= 1U << 27; /* TXFE */
     }
@@ -449,6 +556,11 @@ static void uartapp_reset(DeviceState *dev)
     s->rx_dma_active = false;
     s->tx_dma_wait4endcmd = false;
     s->rx_dma_wait4endcmd = false;
+    s->tx_baud_timer_active = false;
+
+    if (s->tx_baud_timer) {
+        timer_del(s->tx_baud_timer);
+    }
 
     uartapp_update_irq(s);
 }
@@ -593,11 +705,7 @@ static void uartapp_receive(void *opaque, const uint8_t *buf, int size)
     }
 
     for (i = 0; i < size; i++) {
-        if (uartapp_rx_push(s, buf[i])) {
-            if (s->rx_dma_active && s->rx_xfer_count > 0) {
-                s->rx_xfer_count--;
-            }
-        }
+        uartapp_rx_push(s, buf[i]);
     }
     uartapp_update_irq_full(s);
 }
@@ -620,6 +728,9 @@ static void uartapp_init(Object *obj)
                           TYPE_STMP3770_UARTAPP, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+    s->tx_baud_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, uartapp_tx_baud_cb, s);
+    s->tx_baud_timer_active = false;
 }
 
 static void uartapp_realize(DeviceState *dev, Error **errp)
@@ -630,10 +741,20 @@ static void uartapp_realize(DeviceState *dev, Error **errp)
                              uartapp_event, NULL, s, NULL, true);
 }
 
+static void uartapp_instance_finalize(Object *obj)
+{
+    STMP3770UARTAppState *s = STMP3770_UARTAPP(obj);
+
+    if (s->tx_baud_timer) {
+        timer_free(s->tx_baud_timer);
+        s->tx_baud_timer = NULL;
+    }
+}
+
 static const VMStateDescription vmstate_uartapp = {
     .name = "stmp3770-uartapp",
-    .version_id = 2,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl0, STMP3770UARTAppState),
         VMSTATE_UINT32(ctrl1, STMP3770UARTAppState),
@@ -659,6 +780,8 @@ static const VMStateDescription vmstate_uartapp = {
         VMSTATE_BOOL(rx_dma_active, STMP3770UARTAppState),
         VMSTATE_BOOL(tx_dma_wait4endcmd, STMP3770UARTAppState),
         VMSTATE_BOOL(rx_dma_wait4endcmd, STMP3770UARTAppState),
+        VMSTATE_BOOL(tx_baud_timer_active, STMP3770UARTAppState),
+        VMSTATE_TIMER_PTR(tx_baud_timer, STMP3770UARTAppState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -682,6 +805,7 @@ static const TypeInfo uartapp_type_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770UARTAppState),
     .instance_init = uartapp_init,
+    .instance_finalize = uartapp_instance_finalize,
     .class_init    = uartapp_class_init,
 };
 

@@ -1674,6 +1674,8 @@ async function testI2cDataEngineCompleteIrqContract() {
     await machine.writel(ctrl1Set, 0x00004000);
     await machine.writel(ctrl0Set, 0x20000001);
 
+    await machine.clockStep(100_000);
+
     const stat = await machine.readl(I2C_BASE + 0x050);
     assert.notEqual(
       stat & (1 << 6),
@@ -1761,6 +1763,8 @@ async function testI2cDmaFifoContract() {
     await machine.writel(channel3Nxtcmdar, descriptor);
     await machine.writel(channel3Sema, 1);
 
+    await machine.clockStep(100_000);
+
     assert.equal(
       await machine.readl(channel3Sema),
       0,
@@ -1796,6 +1800,294 @@ async function testI2cDmaFifoContract() {
       await machine.readl(I2C_BASE + 0x050) & (1 << 6),
       1 << 6,
       'I2C STAT must summarize the DATA_ENGINE_CMPLT_IRQ',
+    );
+  });
+}
+
+async function testI2cMasterWriteReadContract() {
+  await withMachine(async (machine) => {
+    const i2cData = I2C_BASE + 0x060;
+    const i2cCtrl0 = I2C_BASE + 0x000;
+    const i2cCtrl1Set = I2C_BASE + 0x044;
+    const i2cCtrl1 = I2C_BASE + 0x040;
+    const i2cStat = I2C_BASE + 0x050;
+
+    /* Enable DATA_ENGINE_CMPLT, BUS_FREE and NO_SLAVE_ACK IRQs. */
+    await machine.writel(i2cCtrl1Set, 0x0000e000);
+    /* Clear SFTRST/CLKGATE. */
+    await machine.writel(I2C_BASE + 0x008, 0xc0000000);
+
+    /* Write to SMBus EEPROM at 0x50: offset 0x00, data 0xAA. */
+    await machine.writeb(i2cData, 0xa0);
+    await machine.writeb(i2cData, 0x00);
+    await machine.writeb(i2cData, 0xaa);
+    const ctrl0Write =
+      (1 << 29) | /* RUN */
+      (1 << 20) | /* POST_SEND_STOP */
+      (1 << 19) | /* PRE_SEND_START */
+      (1 << 17) | /* MASTER_MODE */
+      (1 << 16) | /* DIRECTION: TRANSMIT */
+      3;          /* XFER_COUNT */
+    await machine.writel(i2cCtrl0, ctrl0Write);
+    await machine.clockStep(300_000);
+
+    const ctrl1AfterWrite = await machine.readl(i2cCtrl1);
+    assert.equal(
+      ctrl1AfterWrite & (1 << 6),
+      1 << 6,
+      'I2C write DATA_ENGINE_CMPLT_IRQ must be set',
+    );
+    assert.equal(
+      ctrl1AfterWrite & (1 << 7),
+      1 << 7,
+      'I2C write BUS_FREE_IRQ must be set after STOP',
+    );
+
+    /* Load the EEPROM offset for the subsequent read (no STOP). */
+    await machine.writeb(i2cData, 0xa0);
+    await machine.writeb(i2cData, 0x00);
+    const ctrl0LoadOffset =
+      (1 << 29) | /* RUN */
+      (1 << 19) | /* PRE_SEND_START */
+      (1 << 17) | /* MASTER_MODE */
+      (1 << 16) | /* DIRECTION: TRANSMIT */
+      2;          /* XFER_COUNT */
+    await machine.writel(i2cCtrl0, ctrl0LoadOffset);
+    await machine.clockStep(200_000);
+
+    const ctrl1AfterOffset = await machine.readl(i2cCtrl1);
+    assert.equal(
+      ctrl1AfterOffset & (1 << 6),
+      1 << 6,
+      'I2C offset-load DATA_ENGINE_CMPLT_IRQ must be set',
+    );
+
+    /* Repeated start: send read address and retain the clock. */
+    await machine.writeb(i2cData, 0xa1);
+    const ctrl0ReadAddr =
+      (1 << 29) | /* RUN */
+      (1 << 21) | /* RETAIN_CLOCK */
+      (1 << 19) | /* PRE_SEND_START */
+      (1 << 17) | /* MASTER_MODE */
+      (1 << 16) | /* DIRECTION: TRANSMIT */
+      1;          /* XFER_COUNT */
+    await machine.writel(i2cCtrl0, ctrl0ReadAddr);
+    await machine.clockStep(100_000);
+
+    const ctrl1AfterAddr = await machine.readl(i2cCtrl1);
+    assert.equal(
+      ctrl1AfterAddr & (1 << 6),
+      1 << 6,
+      'I2C read-address DATA_ENGINE_CMPLT_IRQ must be set',
+    );
+
+    /* Receive one byte with NACK and STOP. */
+    const ctrl0ReadData =
+      (1 << 29) | /* RUN */
+      (1 << 25) | /* SEND_NAK_ON_LAST */
+      (1 << 20) | /* POST_SEND_STOP */
+      (1 << 17) | /* MASTER_MODE */
+      1;          /* XFER_COUNT */
+    await machine.writel(i2cCtrl0, ctrl0ReadData);
+    await machine.clockStep(100_000);
+
+    const rxData = await machine.readl(i2cData);
+    assert.equal(
+      rxData & 0xff,
+      0xaa,
+      'I2C read must return the previously written byte',
+    );
+
+    const stat = await machine.readl(i2cStat);
+    assert.equal(
+      stat & (1 << 6),
+      1 << 6,
+      'I2C STAT must summarize DATA_ENGINE_CMPLT_IRQ',
+    );
+    assert.equal(
+      stat & (1 << 7),
+      1 << 7,
+      'I2C STAT must summarize BUS_FREE_IRQ',
+    );
+  });
+}
+
+async function testI2cNoSlaveAckContract() {
+  await withMachine(async (machine) => {
+    const i2cData = I2C_BASE + 0x060;
+    const i2cCtrl0 = I2C_BASE + 0x000;
+    const i2cCtrl1Set = I2C_BASE + 0x044;
+    const i2cCtrl1 = I2C_BASE + 0x040;
+
+    /* Enable NO_SLAVE_ACK and DATA_ENGINE_CMPLT IRQs. */
+    await machine.writel(i2cCtrl1Set, 0x00006000);
+    /* Clear SFTRST/CLKGATE. */
+    await machine.writel(I2C_BASE + 0x008, 0xc0000000);
+
+    /* Address 0x40 (write) has no slave on the bus. */
+    await machine.writeb(i2cData, 0x80);
+    const ctrl0 =
+      (1 << 29) | /* RUN */
+      (1 << 20) | /* POST_SEND_STOP */
+      (1 << 19) | /* PRE_SEND_START */
+      (1 << 17) | /* MASTER_MODE */
+      (1 << 16) | /* DIRECTION: TRANSMIT */
+      1;          /* XFER_COUNT */
+    await machine.writel(i2cCtrl0, ctrl0);
+    await machine.clockStep(100_000);
+
+    const ctrl1 = await machine.readl(i2cCtrl1);
+    assert.equal(
+      ctrl1 & (1 << 5),
+      1 << 5,
+      'I2C NO_SLAVE_ACK_IRQ must be set for missing slave',
+    );
+    assert.equal(
+      ctrl1 & (1 << 6),
+      1 << 6,
+      'I2C DATA_ENGINE_CMPLT_IRQ must be set on NACK',
+    );
+  });
+}
+
+async function testI2cSlaveLocalTestContract() {
+  await withMachine(async (machine) => {
+    const i2cCtrl0 = I2C_BASE + 0x000;
+    const i2cCtrl1Set = I2C_BASE + 0x044;
+    const i2cCtrl1 = I2C_BASE + 0x040;
+    const i2cStat = I2C_BASE + 0x050;
+    const i2cDebug0 = I2C_BASE + 0x070;
+    const i2cDebug1 = I2C_BASE + 0x080;
+
+    /* Clear SFTRST/CLKGATE and enable slave interrupts. */
+    await machine.writel(I2C_BASE + 0x008, 0xc0000000);
+    await machine.writel(i2cCtrl1Set, 0x00000300);
+    /* Enable slave address decoder. */
+    await machine.writel(i2cCtrl0, (1 << 18));
+
+    /* Trigger LOCAL_SLAVE_TEST in MY_WRITE mode (default address 0x86). */
+    await machine.writel(i2cDebug1, (1 << 8) | (1 << 9));
+
+    const statAfterMatch = await machine.readl(i2cStat);
+    assert.notEqual(
+      statAfterMatch & (1 << 14),
+      0,
+      'I2C SLAVE_FOUND must be set after LOCAL_SLAVE_TEST match',
+    );
+    assert.equal(
+      (statAfterMatch >> 16) & 0xff,
+      0x86,
+      'I2C RCVD_SLAVE_ADDR must match the programmed slave address',
+    );
+    assert.notEqual(
+      statAfterMatch & (1 << 8),
+      0,
+      'I2C SLAVE_BUSY must be set after LOCAL_SLAVE_TEST match',
+    );
+
+    const debug0AfterMatch = await machine.readl(i2cDebug0);
+    assert.notEqual(
+      debug0AfterMatch & (1 << 10),
+      0,
+      'I2C SLAVE_HOLD_CLK must be set after LOCAL_SLAVE_TEST match',
+    );
+    assert.equal(
+      debug0AfterMatch & 0x3ff,
+      2,
+      'I2C SLAVE_STATE must be FOUND after LOCAL_SLAVE_TEST match',
+    );
+
+    const ctrl1AfterMatch = await machine.readl(i2cCtrl1);
+    assert.notEqual(
+      ctrl1AfterMatch & (1 << 0),
+      0,
+      'I2C SLAVE_IRQ must be set after LOCAL_SLAVE_TEST match',
+    );
+    assert.notEqual(
+      await machine.readl(ICOLL_BASE + 0x040) & (1 << 27),
+      0,
+      'I2C SLAVE_IRQ must assert ICOLL source 27 when enabled',
+    );
+
+    /* Clear LOCAL_SLAVE_TEST to simulate a stop condition. */
+    await machine.writel(i2cDebug1, 0x00000000);
+
+    const statAfterStop = await machine.readl(i2cStat);
+    assert.equal(
+      statAfterStop & (1 << 14),
+      0,
+      'I2C SLAVE_FOUND must be cleared after LOCAL_SLAVE_TEST cleared',
+    );
+    assert.notEqual(
+      statAfterStop & (1 << 1),
+      0,
+      'I2C SLAVE_STOP_IRQ must be summarized in STAT after LOCAL_SLAVE_TEST cleared',
+    );
+
+    const ctrl1AfterStop = await machine.readl(i2cCtrl1);
+    assert.notEqual(
+      ctrl1AfterStop & (1 << 1),
+      0,
+      'I2C SLAVE_STOP_IRQ must be set after LOCAL_SLAVE_TEST cleared',
+    );
+  });
+}
+
+async function testI2cFifoThresholdContract() {
+  await withMachine(async (machine) => {
+    const i2cCtrl0 = I2C_BASE + 0x000;
+    const i2cCtrl1Set = I2C_BASE + 0x044;
+    const i2cDebug0 = I2C_BASE + 0x070;
+    const i2cStat = I2C_BASE + 0x050;
+
+    /* Clear SFTRST/CLKGATE and enable completion interrupt. */
+    await machine.writel(I2C_BASE + 0x008, 0xc0000000);
+    await machine.writel(i2cCtrl1Set, 0x00004000);
+
+    /* Run a receive of 8 bytes from an empty bus (no external slave). */
+    await machine.writel(i2cCtrl0, (1 << 29) | 8);
+    /* Wait for four bytes to be received (half the FIFO depth). */
+    await machine.clockStep(400_000);
+
+    const debug0 = await machine.readl(i2cDebug0);
+    assert.notEqual(
+      debug0 & (1 << 31),
+      0,
+      'I2C DMAREQ must be set when FIFO reaches half threshold',
+    );
+
+    const stat = await machine.readl(i2cStat);
+    assert.notEqual(
+      stat & (1 << 9),
+      0,
+      'I2C DATA_ENGINE_BUSY must be set during FIFO threshold test',
+    );
+    assert.equal(
+      stat & (1 << 12),
+      0,
+      'I2C DATA_ENGINE_DMA_WAIT must not be set at half threshold',
+    );
+
+    /* Drain the FIFO and check DMAREQ drops. */
+    await machine.readl(I2C_BASE + 0x060);
+    const debug0AfterDrain = await machine.readl(i2cDebug0);
+    assert.equal(
+      debug0AfterDrain & (1 << 31),
+      0,
+      'I2C DMAREQ must drop when FIFO falls below half threshold',
+    );
+
+    /* Let the remaining four bytes complete the transfer. */
+    await machine.clockStep(1_000_000);
+    assert.equal(
+      (await machine.readl(i2cCtrl0)) & (1 << 29),
+      0,
+      'I2C RUN must self-clear after completion',
+    );
+    assert.notEqual(
+      (await machine.readl(I2C_BASE + 0x040)) & (1 << 6),
+      0,
+      'I2C DATA_ENGINE_CMPLT_IRQ must be set after completion',
     );
   });
 }
@@ -2024,6 +2316,59 @@ async function testAppUartDmaFifoContract() {
   });
 }
 
+async function testAppUartSerialTimingContract() {
+  await withMachine(async (machine) => {
+    /* LINECTRL: FEN=1, WLEN=3 (8 bits), BAUD_DIVINT=3, BAUD_DIVFRAC=44
+     * divisor = 3*64 + 44 = 0xEC (3.25 Mbit/s from 24 MHz UARTCLK)
+     */
+    await machine.writel(APPUART_BASE + 0x030, 0x00032c70);
+    await machine.writel(APPUART_BASE + 0x020, 0x00000381);
+    await machine.writel(APPUART_BASE + 0x050, 0x00300000);
+
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x070) & (1 << 29),
+      0,
+      'UARTAPP STAT.BUSY must be low when idle',
+    );
+
+    await machine.writel(APPUART_BASE + 0x060, 0x0000005a);
+    assert.notEqual(
+      await machine.readl(APPUART_BASE + 0x070) & (1 << 29),
+      0,
+      'UARTAPP STAT.BUSY must be high after a DATA write',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x060),
+      0,
+      'UARTAPP DATA must be empty before the first byte-time',
+    );
+
+    await machine.clockStep(5000);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x060),
+      0x0000005a,
+      'UARTAPP LBE data must be received after one byte-time',
+    );
+    assert.notEqual(
+      await machine.readl(APPUART_BASE + 0x070) & (1 << 29),
+      0,
+      'UARTAPP STAT.BUSY must remain high while TX FIFO is not empty',
+    );
+
+    await machine.clockStep(15000);
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x070) & (1 << 29),
+      0,
+      'UARTAPP STAT.BUSY must be low after TX FIFO is empty',
+    );
+    assert.equal(
+      await machine.readl(APPUART_BASE + 0x050) & 0x30,
+      0x30,
+      'UARTAPP TXIS and RXIS must be set once transmission completes',
+    );
+  });
+}
+
 async function testDebugUartRegisterContract() {
   await withMachine(async (machine) => {
     assert.equal(
@@ -2122,6 +2467,55 @@ async function testDebugUartFifoIflsContract() {
       await machine.readl(DBGUART_BASE + 0x040),
       0x00000030,
       'UARTDBG MIS must set RXRIS immediately at RXIFLSEL=NOT_EMPTY',
+    );
+  });
+}
+
+async function testDebugUartSerialTimingContract() {
+  await withMachine(async (machine) => {
+    /* CR: UARTEN, TXE, RXE, LBE; LCR_H: FEN, WLEN=3 (8 bits)
+     * IBRD=1, FBRD=0 => 24 MHz / (16 * 1) = 1.5 Mbit/s, byte ~6.7 us
+     */
+    await machine.writel(DBGUART_BASE + 0x030, 0x00000381);
+    await machine.writel(DBGUART_BASE + 0x02c, 0x00000070);
+    await machine.writel(DBGUART_BASE + 0x024, 0x00000001);
+    await machine.writel(DBGUART_BASE + 0x028, 0x00000000);
+    await machine.writel(DBGUART_BASE + 0x034, 0x00000000);
+    await machine.writel(DBGUART_BASE + 0x038, 0x00000030);
+
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x018) & (1 << 3),
+      0,
+      'UARTDBG FR.BUSY must be low when idle',
+    );
+
+    await machine.writel(DBGUART_BASE + 0x000, 0x00000055);
+    assert.notEqual(
+      await machine.readl(DBGUART_BASE + 0x018) & (1 << 3),
+      0,
+      'UARTDBG FR.BUSY must be high after a DR write',
+    );
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x000),
+      0,
+      'UARTDBG DR must be empty before the first byte-time',
+    );
+
+    await machine.clockStep(10000);
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x040) & 0x30,
+      0x30,
+      'UARTDBG MIS must reflect TXRIS and RXRIS once transmission completes',
+    );
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x000),
+      0x00000055,
+      'UARTDBG LBE data must be received after one byte-time',
+    );
+    assert.equal(
+      await machine.readl(DBGUART_BASE + 0x018) & (1 << 3),
+      0,
+      'UARTDBG FR.BUSY must be low after TX completes',
     );
   });
 }
@@ -6829,11 +7223,17 @@ const tests = [
   ['I2C data engine complete IRQ contract', testI2cDataEngineCompleteIrqContract],
   ['I2C DMA IRQ ownership contract', testI2cDmaIrqOwnershipContract],
   ['I2C DMA FIFO data contract', testI2cDmaFifoContract],
+  ['I2C master write-read contract', testI2cMasterWriteReadContract],
+  ['I2C no slave NACK contract', testI2cNoSlaveAckContract],
+  ['I2C slave local test contract', testI2cSlaveLocalTestContract],
+  ['I2C FIFO DMAREQ threshold contract', testI2cFifoThresholdContract],
   ['Application UART register contract', testAppUartRegisterContract],
   ['Application UART FIFO IFLS threshold contract', testAppUartFifoIflsContract],
   ['Application UART DMA FIFO data contract', testAppUartDmaFifoContract],
+  ['Application UART serial timing contract', testAppUartSerialTimingContract],
   ['Debug UART register contract', testDebugUartRegisterContract],
   ['Debug UART FIFO IFLS threshold contract', testDebugUartFifoIflsContract],
+  ['Debug UART serial timing contract', testDebugUartSerialTimingContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],
   ['LCDIF register map contract', testLcdifRegisterMapContract],
   ['LCDIF clock gate contract', testLcdifClockGateContract],

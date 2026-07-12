@@ -14,6 +14,7 @@
 
 #include "chardev/char-fe.h"
 #include "hw/sysbus.h"
+#include "qemu/timer.h"
 
 #define TYPE_STMP3770_UARTAPP "stmp3770-uartapp"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770UARTAppState, STMP3770_UARTAPP)
@@ -55,6 +56,9 @@ struct STMP3770UARTAppState {
     bool rx_dma_active;
     bool tx_dma_wait4endcmd;
     bool rx_dma_wait4endcmd;
+
+    QEMUTimer *tx_baud_timer;
+    bool tx_baud_timer_active;
 
     struct STMP3770DMAState *dma;
     int tx_dma_channel;

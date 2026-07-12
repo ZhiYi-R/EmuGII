@@ -14,6 +14,7 @@
 
 #include "chardev/char-fe.h"
 #include "hw/sysbus.h"
+#include "qemu/timer.h"
 
 #define TYPE_STMP3770_UARTDBG "stmp3770-uartdbg"
 OBJECT_DECLARE_SIMPLE_TYPE(STMP3770UARTDebugState, STMP3770_UARTDBG)
@@ -38,6 +39,9 @@ struct STMP3770UARTDebugState {
     uint8_t rx_pos;
     uint8_t rx_count;
     uint8_t tx_count;
+    uint8_t tx_byte;
+    bool tx_baud_timer_active;
+    QEMUTimer *tx_baud_timer;
 };
 
 #endif

@@ -24,11 +24,43 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qemu/units.h"
 
 /* SET/CLR/TOG sub-offsets */
 #define SCT_SET 0x4
 #define SCT_CLR 0x8
 #define SCT_TOG 0xC
+
+/* I2C timing is based on the APBX clock, 24 MHz */
+#define I2C_APBX_CLK_HZ 24000000ULL
+
+static uint64_t stmp3770_i2c_byte_time_ns(const STMP3770I2CState *s)
+{
+    uint32_t high_count = (s->timing0 >> 16) & 0x3FF;
+    uint32_t low_count = (s->timing1 >> 16) & 0x3FF;
+    uint64_t cycles = (uint64_t)(high_count + low_count) * 9;
+
+    if (cycles == 0) {
+        cycles = 9;
+    }
+
+    return cycles * NANOSECONDS_PER_SECOND / I2C_APBX_CLK_HZ;
+}
+
+static uint64_t stmp3770_i2c_leadin_time_ns(const STMP3770I2CState *s)
+{
+    uint32_t leadin_count = s->timing2 & 0x3FF;
+
+    return (uint64_t)leadin_count * NANOSECONDS_PER_SECOND / I2C_APBX_CLK_HZ;
+}
+
+static uint64_t stmp3770_i2c_bus_free_time_ns(const STMP3770I2CState *s)
+{
+    uint32_t bus_free_count = (s->timing2 >> 16) & 0x3FF;
+
+    return (uint64_t)bus_free_count * NANOSECONDS_PER_SECOND / I2C_APBX_CLK_HZ;
+}
 
 static inline bool stmp3770_i2c_enabled(STMP3770I2CState *s)
 {
@@ -64,6 +96,8 @@ static void stmp3770_i2c_update_irq(STMP3770I2CState *s)
     qemu_set_irq(s->irq_error, pending != 0);
 }
 
+static void stmp3770_i2c_update_debug0_state(STMP3770I2CState *s);
+
 static bool stmp3770_i2c_fifo_push(STMP3770I2CState *s, uint8_t byte)
 {
     if (s->fifo_count >= I2C_FIFO_DEPTH) {
@@ -73,6 +107,7 @@ static bool stmp3770_i2c_fifo_push(STMP3770I2CState *s, uint8_t byte)
     s->fifo[s->fifo_wptr] = byte;
     s->fifo_wptr = (s->fifo_wptr + 1) % I2C_FIFO_DEPTH;
     s->fifo_count++;
+    stmp3770_i2c_update_debug0_state(s);
     return true;
 }
 
@@ -85,27 +120,158 @@ static bool stmp3770_i2c_fifo_pop(STMP3770I2CState *s, uint8_t *byte)
     *byte = s->fifo[s->fifo_rptr];
     s->fifo_rptr = (s->fifo_rptr + 1) % I2C_FIFO_DEPTH;
     s->fifo_count--;
+    stmp3770_i2c_update_debug0_state(s);
     return true;
 }
 
 static void stmp3770_i2c_update_debug0_state(STMP3770I2CState *s)
 {
-    s->debug0 = (s->debug0 & 0x1C000800) |
-                (s->data_engine_busy ? (0x2U << 16) : 0);
+    bool dma_req;
+    uint32_t debug0;
+
+    debug0 = s->debug0 & ~0x03FF0000; /* clear DMA_STATE */
+    debug0 |= s->data_engine_busy ? (0x2U << 16) : 0;
+
+    dma_req = s->data_engine_busy &&
+              (s->current_is_recv
+                   ? s->fifo_count >= I2C_FIFO_THRESHOLD
+                   : s->fifo_count <= I2C_FIFO_THRESHOLD);
+
+    s->debug0 = (debug0 & ~(1U << 31)) | (dma_req ? (1U << 31) : 0);
+}
+
+static void stmp3770_i2c_update_local_slave_test(STMP3770I2CState *s)
+{
+    bool local_slave_test = (s->debug1 >> 8) & 1;
+    uint8_t lst_mode = (s->debug1 >> 9) & 0x3;
+    bool slave_address_en = (s->ctrl0 & I2C_CTRL0_SLAVE_ADDRESS_EN) != 0;
+    bool bcast_en = (s->ctrl1 >> 24) & 1;
+    uint8_t slave_addr = (s->ctrl1 >> 16) & 0xFF;
+    uint8_t rcvd_addr = 0;
+    bool is_write = false;
+    bool match = false;
+
+    if (!local_slave_test) {
+        if (s->slave_found) {
+            s->ctrl1 |= I2C_CTRL1_SLAVE_STOP_IRQ;
+            stmp3770_i2c_update_irq(s);
+        }
+        s->slave_found = false;
+        s->slave_searching = false;
+        s->slave_busy = false;
+        s->slave_hold_clk = false;
+        s->slave_state = 0;
+        s->rcvd_slave_addr = 0;
+        s->slave_addr_eq_zero = false;
+        s->ctrl0 &= ~I2C_CTRL0_CLOCK_HELD;
+        s->debug0 &= ~0x000007FF;
+        return;
+    }
+
+    if (s->slave_found || s->slave_searching) {
+        return;
+    }
+
+    if (!slave_address_en) {
+        return;
+    }
+
+    switch (lst_mode) {
+    case 0: /* BCAST */
+        if (bcast_en) {
+            rcvd_addr = 0x00;
+            is_write = true;
+            match = true;
+        }
+        break;
+    case 1: /* MY_WRITE */
+        rcvd_addr = slave_addr & 0xFE;
+        is_write = true;
+        match = true;
+        break;
+    case 2: /* MY_READ */
+        rcvd_addr = (slave_addr & 0xFE) | 1;
+        is_write = false;
+        match = true;
+        break;
+    case 3: /* NOT_ME */
+    default:
+        match = false;
+        break;
+    }
+
+    if (!match) {
+        s->slave_searching = false;
+        s->slave_busy = false;
+        s->slave_state = 0;
+        s->debug0 &= ~0x000007FF;
+        return;
+    }
+
+    s->slave_found = true;
+    s->slave_searching = false;
+    s->slave_busy = true;
+    s->slave_hold_clk = true;
+    s->slave_state = 2;
+    s->rcvd_slave_addr = rcvd_addr;
+    s->slave_addr_eq_zero = (rcvd_addr == 0x00);
+
+    s->ctrl0 = (s->ctrl0 & ~I2C_CTRL0_DIRECTION) |
+               (is_write ? 0 : I2C_CTRL0_DIRECTION);
+    s->ctrl0 |= I2C_CTRL0_CLOCK_HELD;
+
+    s->ctrl1 |= I2C_CTRL1_SLAVE_IRQ;
+    stmp3770_i2c_update_irq(s);
+
+    s->debug0 = (s->debug0 & ~0x000003FF) | (s->slave_state & 0x3FF);
+    s->debug0 |= (1U << 10);
 }
 
 static void stmp3770_i2c_complete(STMP3770I2CState *s)
 {
     s->ctrl0 &= ~I2C_CTRL0_RUN;
     s->data_engine_busy = false;
+    s->ack_error = 0;
     stmp3770_i2c_update_debug0_state(s);
     s->ctrl1 |= I2C_CTRL1_DATA_ENGINE_CMPLT_IRQ;
     stmp3770_i2c_update_irq(s);
+
+    if (s->ctrl0 & I2C_CTRL0_POST_SEND_STOP) {
+        i2c_end_transfer(s->bus);
+        s->ctrl0 &= ~I2C_CTRL0_POST_SEND_STOP;
+        s->ctrl0 &= ~I2C_CTRL0_RETAIN_CLOCK;
+
+        if (s->bus_free_timer_active) {
+            timer_del(s->bus_free_timer);
+        }
+        s->bus_free_timer_active = true;
+        timer_mod(s->bus_free_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  stmp3770_i2c_bus_free_time_ns(s));
+    } else if (s->ctrl0 & I2C_CTRL0_RETAIN_CLOCK) {
+        s->ctrl0 |= I2C_CTRL0_CLOCK_HELD;
+        s->ctrl0 &= ~I2C_CTRL0_RETAIN_CLOCK;
+    }
 
     if (s->dma && s->dma_wait4endcmd) {
         s->dma_wait4endcmd = false;
         stmp3770_dma_complete_channel_command(s->dma, s->dma_channel);
     }
+}
+
+static void stmp3770_i2c_complete_with_error(STMP3770I2CState *s,
+                                             uint32_t irq)
+{
+    s->ctrl1 |= irq;
+    stmp3770_i2c_complete(s);
+}
+
+static void stmp3770_i2c_schedule(STMP3770I2CState *s, uint64_t delay_ns)
+{
+    s->xfer_timer_active = true;
+    timer_mod(s->xfer_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    stmp3770_i2c_update_debug0_state(s);
 }
 
 static uint32_t stmp3770_i2c_get_xfer_count(STMP3770I2CState *s)
@@ -115,36 +281,171 @@ static uint32_t stmp3770_i2c_get_xfer_count(STMP3770I2CState *s)
     return count ? count : (1U << 16);
 }
 
-static void stmp3770_i2c_process(STMP3770I2CState *s)
+static int stmp3770_i2c_start_transaction(STMP3770I2CState *s)
 {
-    uint8_t byte;
-
-    if (!s->data_engine_busy || s->xfer_count == 0) {
-        return;
+    if (s->current_is_recv) {
+        return i2c_start_recv(s->bus, s->current_addr) != 0;
     }
 
-    if (s->ctrl0 & I2C_CTRL0_DIRECTION) {
-        /* TRANSMIT: consume bytes from the FIFO */
-        while (s->xfer_count > 0 && s->fifo_count > 0) {
-            stmp3770_i2c_fifo_pop(s, &byte);
-            s->xfer_count--;
-        }
-    } else {
-        /* RECEIVE: produce bytes into the FIFO */
-        while (s->xfer_count > 0 && s->fifo_count < I2C_FIFO_DEPTH) {
-            stmp3770_i2c_fifo_push(s, 0xFF);
-            s->xfer_count--;
-        }
+    return i2c_start_send(s->bus, s->current_addr) != 0;
+}
+
+static void stmp3770_i2c_xfer_cb(void *opaque);
+
+static void stmp3770_i2c_process(STMP3770I2CState *s)
+{
+    uint8_t addr_byte;
+
+    if (!s->data_engine_busy || s->xfer_timer_active) {
+        return;
     }
 
     if (s->xfer_count == 0) {
         stmp3770_i2c_complete(s);
+        return;
     }
+
+    if (s->ctrl0 & I2C_CTRL0_PRE_SEND_START) {
+        if (s->fifo_count > 0) {
+            stmp3770_i2c_fifo_pop(s, &addr_byte);
+            s->current_addr = addr_byte >> 1;
+            s->current_is_recv = (addr_byte & 1) != 0;
+            s->xfer_count--;
+        } else if (s->last_addr != 0) {
+            s->current_addr = s->last_addr;
+            s->current_is_recv = !(s->ctrl0 & I2C_CTRL0_DIRECTION);
+        } else {
+            s->ack_error = I2C_CTRL1_NO_SLAVE_ACK_IRQ;
+            stmp3770_i2c_schedule(s, stmp3770_i2c_byte_time_ns(s));
+            return;
+        }
+
+        s->last_addr = s->current_addr;
+
+        if (stmp3770_i2c_start_transaction(s)) {
+            s->ack_error = I2C_CTRL1_NO_SLAVE_ACK_IRQ;
+            s->bus_busy = true;
+            stmp3770_i2c_schedule(s, stmp3770_i2c_leadin_time_ns(s) +
+                                      stmp3770_i2c_byte_time_ns(s));
+            return;
+        }
+
+        s->bus_busy = true;
+        s->ctrl0 &= ~I2C_CTRL0_PRE_SEND_START;
+        stmp3770_i2c_schedule(s, stmp3770_i2c_leadin_time_ns(s) +
+                                  stmp3770_i2c_byte_time_ns(s));
+        return;
+    }
+
+    /* Continue the current transaction */
+    if (s->current_addr == 0 && s->last_addr != 0) {
+        s->current_addr = s->last_addr;
+    }
+
+    s->current_is_recv = !(s->ctrl0 & I2C_CTRL0_DIRECTION);
+
+    if (s->current_is_recv) {
+        if (s->fifo_count >= I2C_FIFO_DEPTH) {
+            stmp3770_i2c_update_debug0_state(s);
+            return;
+        }
+    } else {
+        if (s->fifo_count == 0) {
+            stmp3770_i2c_update_debug0_state(s);
+            return;
+        }
+    }
+
+    stmp3770_i2c_schedule(s, stmp3770_i2c_byte_time_ns(s));
+}
+
+static void stmp3770_i2c_xfer_cb(void *opaque)
+{
+    STMP3770I2CState *s = STMP3770_I2C(opaque);
+    uint8_t byte;
+
+    s->xfer_timer_active = false;
+
+    if (!s->data_engine_busy) {
+        return;
+    }
+
+    if (s->ack_error) {
+        uint32_t err = s->ack_error;
+
+        s->ack_error = 0;
+        stmp3770_i2c_complete_with_error(s, err);
+        return;
+    }
+
+    if (s->xfer_count == 0) {
+        stmp3770_i2c_complete(s);
+        return;
+    }
+
+    if (s->current_is_recv) {
+        if (s->fifo_count >= I2C_FIFO_DEPTH) {
+            stmp3770_i2c_update_debug0_state(s);
+            return;
+        }
+
+        byte = i2c_recv(s->bus);
+        stmp3770_i2c_fifo_push(s, byte);
+        s->xfer_count--;
+
+        if (s->xfer_count == 0) {
+            if (s->ctrl0 & I2C_CTRL0_SEND_NAK_ON_LAST) {
+                i2c_nack(s->bus);
+            }
+            stmp3770_i2c_complete(s);
+        } else {
+            stmp3770_i2c_schedule(s, stmp3770_i2c_byte_time_ns(s));
+        }
+    } else {
+        if (s->fifo_count == 0) {
+            stmp3770_i2c_update_debug0_state(s);
+            return;
+        }
+
+        stmp3770_i2c_fifo_pop(s, &byte);
+        if (i2c_send(s->bus, byte) != 0) {
+            stmp3770_i2c_complete_with_error(s,
+                                             I2C_CTRL1_NO_SLAVE_ACK_IRQ);
+        } else {
+            s->xfer_count--;
+            if (s->xfer_count == 0) {
+                stmp3770_i2c_complete(s);
+            } else {
+                stmp3770_i2c_schedule(s, stmp3770_i2c_byte_time_ns(s));
+            }
+        }
+    }
+}
+
+static void stmp3770_i2c_bus_free_cb(void *opaque)
+{
+    STMP3770I2CState *s = STMP3770_I2C(opaque);
+
+    s->bus_free_timer_active = false;
+    s->bus_busy = false;
+    s->bus_free_irq_pending = false;
+    s->ctrl1 |= I2C_CTRL1_BUS_FREE_IRQ;
+    stmp3770_i2c_update_irq(s);
 }
 
 static void stmp3770_i2c_reset(DeviceState *dev)
 {
     STMP3770I2CState *s = STMP3770_I2C(dev);
+
+    if (s->bus) {
+        i2c_end_transfer(s->bus);
+    }
+    if (s->xfer_timer_active) {
+        timer_del(s->xfer_timer);
+    }
+    if (s->bus_free_timer_active) {
+        timer_del(s->bus_free_timer);
+    }
 
     s->ctrl0 = I2C_CTRL0_SFTRST | I2C_CTRL0_CLKGATE;
     s->ctrl1 = 0x00860000;
@@ -161,15 +462,32 @@ static void stmp3770_i2c_reset(DeviceState *dev)
     s->xfer_count = 0;
     s->data_engine_busy = false;
     s->dma_wait4endcmd = false;
+    s->xfer_timer_active = false;
+    s->bus_free_timer_active = false;
+    s->bus_busy = false;
+    s->bus_free_irq_pending = false;
+    s->last_addr = 0;
+    s->current_addr = 0;
+    s->current_is_recv = false;
+    s->ack_error = 0;
+
+    s->slave_found = false;
+    s->slave_searching = false;
+    s->slave_busy = false;
+    s->slave_hold_clk = false;
+    s->slave_state = 0;
+    s->rcvd_slave_addr = 0;
+    s->slave_addr_eq_zero = false;
 
     stmp3770_i2c_update_irq(s);
+    stmp3770_i2c_update_debug0_state(s);
 }
 
 static uint64_t stmp3770_i2c_read(void *opaque, hwaddr offset, unsigned size)
 {
     STMP3770I2CState *s = STMP3770_I2C(opaque);
 
-    if (size != 4) {
+    if (size != 4 && (offset & ~0xFULL) != I2C_DATA) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-i2c: unsupported read size %u at offset "
                       HWADDR_FMT_plx "\n", size, offset);
@@ -209,16 +527,28 @@ static uint64_t stmp3770_i2c_read(void *opaque, hwaddr offset, unsigned size)
 
         if (s->data_engine_busy) {
             stat |= (1U << 9)  /* DATA_ENGINE_BUSY */ |
-                    (1U << 10) /* CLK_GEN_BUSY */ |
-                    (1U << 11) /* BUS_BUSY */;
-        }
-        if (s->data_engine_busy) {
-            bool transmit = (s->ctrl0 & I2C_CTRL0_DIRECTION) != 0;
-            if ((transmit && s->fifo_count == 0) ||
-                (!transmit && s->fifo_count == I2C_FIFO_DEPTH)) {
+                    (1U << 10) /* CLK_GEN_BUSY */;
+            if (s->current_is_recv ? s->fifo_count >= I2C_FIFO_DEPTH
+                                    : s->fifo_count == 0) {
                 stat |= (1U << 12); /* DATA_ENGINE_DMA_WAIT */
             }
         }
+        if (s->bus_busy) {
+            stat |= (1U << 11); /* BUS_BUSY */
+        }
+        if (s->slave_busy) {
+            stat |= (1U << 8); /* SLAVE_BUSY */
+        }
+        if (s->slave_searching) {
+            stat |= (1U << 13); /* SLAVE_SEARCHING */
+        }
+        if (s->slave_found) {
+            stat |= (1U << 14); /* SLAVE_FOUND */
+        }
+        if (s->slave_addr_eq_zero) {
+            stat |= (1U << 15); /* SLAVE_ADDR_EQ_ZERO */
+        }
+        stat |= (uint32_t)s->rcvd_slave_addr << 16;
         return stat;
     }
     case I2C_DATA: {
@@ -236,6 +566,8 @@ static uint64_t stmp3770_i2c_read(void *opaque, hwaddr offset, unsigned size)
             }
             val |= (uint32_t)byte << (i * 8);
         }
+
+        stmp3770_i2c_process(s);
         return val;
     }
     case I2C_DEBUG0:
@@ -264,7 +596,7 @@ static void stmp3770_i2c_write(void *opaque, hwaddr offset,
     STMP3770I2CState *s = STMP3770_I2C(opaque);
     int sct = offset & 0xF;
 
-    if (size != 4) {
+    if (size != 4 && (offset & ~0xFULL) != I2C_DATA) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-i2c: unsupported write size %u at offset "
                       HWADDR_FMT_plx "\n", size, offset);
@@ -325,6 +657,7 @@ static void stmp3770_i2c_write(void *opaque, hwaddr offset,
     case I2C_DEBUG1:
         stmp3770_i2c_apply_sct(&s->debug1, (uint32_t)value, sct,
                                 0x0000073F);
+        stmp3770_i2c_update_local_slave_test(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -353,12 +686,33 @@ static void stmp3770_i2c_init(Object *obj)
                           TYPE_STMP3770_I2C, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq_error);
+
+    s->bus = i2c_init_bus(DEVICE(obj), "i2c");
+    s->xfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stmp3770_i2c_xfer_cb, s);
+    s->bus_free_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     stmp3770_i2c_bus_free_cb, s);
+    s->xfer_timer_active = false;
+    s->bus_free_timer_active = false;
+}
+
+static void stmp3770_i2c_instance_finalize(Object *obj)
+{
+    STMP3770I2CState *s = STMP3770_I2C(obj);
+
+    if (s->xfer_timer) {
+        timer_free(s->xfer_timer);
+        s->xfer_timer = NULL;
+    }
+    if (s->bus_free_timer) {
+        timer_free(s->bus_free_timer);
+        s->bus_free_timer = NULL;
+    }
 }
 
 static const VMStateDescription vmstate_stmp3770_i2c = {
     .name = "stmp3770-i2c",
-    .version_id = 2,
-    .minimum_version_id = 1,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl0, STMP3770I2CState),
         VMSTATE_UINT32(ctrl1, STMP3770I2CState),
@@ -375,6 +729,23 @@ static const VMStateDescription vmstate_stmp3770_i2c = {
         VMSTATE_UINT32(xfer_count, STMP3770I2CState),
         VMSTATE_BOOL(data_engine_busy, STMP3770I2CState),
         VMSTATE_BOOL(dma_wait4endcmd, STMP3770I2CState),
+        VMSTATE_BOOL(xfer_timer_active, STMP3770I2CState),
+        VMSTATE_BOOL(bus_free_timer_active, STMP3770I2CState),
+        VMSTATE_BOOL(bus_busy, STMP3770I2CState),
+        VMSTATE_BOOL(bus_free_irq_pending, STMP3770I2CState),
+        VMSTATE_UINT8(last_addr, STMP3770I2CState),
+        VMSTATE_UINT8(current_addr, STMP3770I2CState),
+        VMSTATE_BOOL(current_is_recv, STMP3770I2CState),
+        VMSTATE_UINT32(ack_error, STMP3770I2CState),
+        VMSTATE_BOOL(slave_found, STMP3770I2CState),
+        VMSTATE_BOOL(slave_searching, STMP3770I2CState),
+        VMSTATE_BOOL(slave_busy, STMP3770I2CState),
+        VMSTATE_BOOL(slave_hold_clk, STMP3770I2CState),
+        VMSTATE_UINT16(slave_state, STMP3770I2CState),
+        VMSTATE_UINT8(rcvd_slave_addr, STMP3770I2CState),
+        VMSTATE_BOOL(slave_addr_eq_zero, STMP3770I2CState),
+        VMSTATE_TIMER_PTR(xfer_timer, STMP3770I2CState),
+        VMSTATE_TIMER_PTR(bus_free_timer, STMP3770I2CState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -392,6 +763,7 @@ static const TypeInfo stmp3770_i2c_type_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770I2CState),
     .instance_init = stmp3770_i2c_init,
+    .instance_finalize = stmp3770_i2c_instance_finalize,
     .class_init    = stmp3770_i2c_class_init,
 };
 

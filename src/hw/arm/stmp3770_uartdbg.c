@@ -39,8 +39,10 @@
 #define UARTDBG_DMACR_RW_MASK 0x0007
 
 #define UARTDBG_FR_RXFE (1U << 4)
-#define UARTDBG_FR_TXFE (1U << 7)
+#define UARTDBG_FR_TXFF (1U << 5)
 #define UARTDBG_FR_RXFF (1U << 6)
+#define UARTDBG_FR_TXFE (1U << 7)
+#define UARTDBG_FR_BUSY (1U << 3)
 #define UARTDBG_CR_LBE (1U << 7)
 #define UARTDBG_CR_TXE (1U << 8)
 #define UARTDBG_CR_RXE (1U << 9)
@@ -48,6 +50,8 @@
 #define UARTDBG_LCR_FEN (1U << 4)
 #define UARTDBG_INT_RX (1U << 4)
 #define UARTDBG_INT_TX (1U << 5)
+
+#define UARTDBG_UARTCLK_HZ 24000000ULL
 
 static unsigned uartdbg_fifo_depth(const STMP3770UARTDebugState *s)
 {
@@ -59,6 +63,10 @@ static uint32_t uartdbg_flags(const STMP3770UARTDebugState *s)
     uint32_t flags = UARTDBG_FR_TXFE;
     unsigned depth = uartdbg_fifo_depth(s);
 
+    if (s->tx_count != 0) {
+        flags &= ~UARTDBG_FR_TXFE;
+        flags |= UARTDBG_FR_TXFF | UARTDBG_FR_BUSY;
+    }
     if (s->rx_count == 0) {
         flags |= UARTDBG_FR_RXFE;
     }
@@ -105,6 +113,91 @@ static void uartdbg_update_ris(STMP3770UARTDebugState *s)
     }
 
     uartdbg_update_irq(s);
+}
+
+static uint64_t uartdbg_bit_time_ns(const STMP3770UARTDebugState *s)
+{
+    uint64_t divisor = ((uint64_t)s->ibrd << 6) | s->fbrd;
+
+    if (divisor == 0) {
+        return 0;
+    }
+    return divisor * 16 * NANOSECONDS_PER_SECOND / (64 * UARTDBG_UARTCLK_HZ);
+}
+
+static uint64_t uartdbg_byte_time_ns(const STMP3770UARTDebugState *s)
+{
+    uint64_t bit_time = uartdbg_bit_time_ns(s);
+    unsigned wlen_field;
+    unsigned wlen;
+    unsigned parity;
+    unsigned stop_bits;
+    unsigned frame_bits;
+
+    if (bit_time == 0) {
+        return 0;
+    }
+
+    wlen_field = (s->lcr >> 5) & 0x3;
+    wlen = 5 + wlen_field;
+    parity = (s->lcr & 0x2) ? 1 : 0;
+    stop_bits = (s->lcr & 0x8) ? 2 : 1;
+    frame_bits = 1 + wlen + parity + stop_bits;
+
+    return bit_time * frame_bits;
+}
+
+static void uartdbg_put_rx(STMP3770UARTDebugState *s, uint16_t value);
+
+static void uartdbg_tx_send(STMP3770UARTDebugState *s)
+{
+    uint8_t ch = s->tx_byte;
+
+    s->tx_count = 0;
+
+    if (s->cr & UARTDBG_CR_LBE) {
+        uartdbg_put_rx(s, ch);
+    } else if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_write_all(&s->chr, &ch, 1);
+    }
+}
+
+static void uartdbg_tx_process(STMP3770UARTDebugState *s)
+{
+    uint64_t byte_time;
+
+    if (s->tx_count == 0) {
+        return;
+    }
+
+    if ((s->cr & (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE)) !=
+            (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE)) {
+        return;
+    }
+
+    byte_time = uartdbg_byte_time_ns(s);
+    if (byte_time == 0) {
+        uartdbg_tx_send(s);
+        uartdbg_update_ris(s);
+        return;
+    }
+
+    if (s->tx_baud_timer_active) {
+        return;
+    }
+
+    s->tx_baud_timer_active = true;
+    timer_mod(s->tx_baud_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + byte_time);
+}
+
+static void uartdbg_tx_baud_cb(void *opaque)
+{
+    STMP3770UARTDebugState *s = STMP3770_UARTDBG(opaque);
+
+    s->tx_baud_timer_active = false;
+    uartdbg_tx_send(s);
+    uartdbg_update_ris(s);
 }
 
 static void uartdbg_reset_fifo(STMP3770UARTDebugState *s)
@@ -193,6 +286,10 @@ static void uartdbg_reset(DeviceState *dev)
     s->ris = 0;
     s->dmacr = 0;
     s->tx_count = 0;
+    s->tx_baud_timer_active = false;
+    if (s->tx_baud_timer) {
+        timer_del(s->tx_baud_timer);
+    }
     uartdbg_reset_fifo(s);
     uartdbg_update_ris(s);
 }
@@ -259,10 +356,10 @@ static void uartdbg_write(void *opaque, hwaddr offset, uint64_t value,
         ch = value;
         if ((s->cr & (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE)) ==
             (UARTDBG_CR_UARTEN | UARTDBG_CR_TXE)) {
-            if (s->cr & UARTDBG_CR_LBE) {
-                uartdbg_put_rx(s, ch);
-            } else {
-                qemu_chr_fe_write_all(&s->chr, &ch, 1);
+            if (s->tx_count == 0) {
+                s->tx_count = 1;
+                s->tx_byte = ch;
+                uartdbg_tx_process(s);
             }
         }
         uartdbg_update_ris(s);
@@ -329,6 +426,9 @@ static void uartdbg_init(Object *obj)
                           TYPE_STMP3770_UARTDBG, 0x2000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+    s->tx_baud_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, uartdbg_tx_baud_cb, s);
+    s->tx_baud_timer_active = false;
 }
 
 static void uartdbg_realize(DeviceState *dev, Error **errp)
@@ -339,10 +439,20 @@ static void uartdbg_realize(DeviceState *dev, Error **errp)
                              uartdbg_event, NULL, s, NULL, true);
 }
 
+static void uartdbg_instance_finalize(Object *obj)
+{
+    STMP3770UARTDebugState *s = STMP3770_UARTDBG(obj);
+
+    if (s->tx_baud_timer) {
+        timer_free(s->tx_baud_timer);
+        s->tx_baud_timer = NULL;
+    }
+}
+
 static const VMStateDescription vmstate_uartdbg = {
     .name = "stmp3770-uartdbg",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(rsr, STMP3770UARTDebugState),
         VMSTATE_UINT32(ibrd, STMP3770UARTDebugState),
@@ -358,6 +468,9 @@ static const VMStateDescription vmstate_uartdbg = {
         VMSTATE_UINT8(rx_pos, STMP3770UARTDebugState),
         VMSTATE_UINT8(rx_count, STMP3770UARTDebugState),
         VMSTATE_UINT8(tx_count, STMP3770UARTDebugState),
+        VMSTATE_UINT8(tx_byte, STMP3770UARTDebugState),
+        VMSTATE_BOOL(tx_baud_timer_active, STMP3770UARTDebugState),
+        VMSTATE_TIMER_PTR(tx_baud_timer, STMP3770UARTDebugState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -381,6 +494,7 @@ static const TypeInfo uartdbg_type_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STMP3770UARTDebugState),
     .instance_init = uartdbg_init,
+    .instance_finalize = uartdbg_instance_finalize,
     .class_init = uartdbg_class_init,
 };
 
