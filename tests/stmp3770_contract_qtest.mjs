@@ -3498,6 +3498,85 @@ async function testSspDmaReadWriteContract() {
   });
 }
 
+async function testSspXferCountWordWidthContract() {
+  await withMachine(async (machine) => {
+    const runBit = 1 << 29;
+    const onePioWord = 1 << 12;
+    const chainBit = 1 << 2;
+    const irqOnCompleteBit = 1 << 3;
+    const semaphoreBit = 1 << 6;
+    const dmaWrite = 1;
+    const dmaRead = 2;
+    const wordLength = 0xF; /* 16-bit */
+
+    const writeDescriptor = async (address, next, command, bar, ctrl0 = undefined) => {
+      await machine.writel(address + 0x00, next);
+      await machine.writel(address + 0x04, command);
+      await machine.writel(address + 0x08, bar);
+      if (ctrl0 !== undefined) {
+        await machine.writel(address + 0x0c, ctrl0);
+      }
+    };
+
+    // release APBH reset/clock gate
+    await machine.writel(APBH_BASE + 0x008, 0xc0000000);
+
+    // release SSP clock gate and reset; configure 16-bit word width
+    await machine.writel(CLKCTRL_BASE + 0x070, 0x00000001);
+    await machine.writel(SSP1_BASE + 0x008, 0xc0000000);
+    await machine.writel(SSP1_BASE + 0x060, wordLength << 4);
+    await machine.writel(SSP1_BASE + 0x050, 0x00000200);
+
+    const xferWords = 2;
+    const byteCount = 4;
+    const pioCtrl0 = runBit | xferWords;
+    const desc = SRAM_BASE + 0x4000;
+    const doneDesc = SRAM_BASE + 0x4040;
+    const bar = SRAM_BASE + 0x00010008;
+    const terminal = semaphoreBit | irqOnCompleteBit;
+    const writeCommand = (byteCount << 16) | onePioWord | chainBit | dmaWrite;
+    const readCommand = (byteCount << 16) | onePioWord | chainBit | dmaRead;
+    const readBar = bar + 0x80;
+
+    // DMA_WRITE: 16-bit SSP produces two 16-bit words of the same DATA value
+    await machine.writel(SSP1_BASE + 0x070, 0x12345678);
+    await machine.writel(bar, 0);
+    await writeDescriptor(desc, doneDesc, writeCommand, bar, pioCtrl0);
+    await writeDescriptor(doneDesc, 0, terminal, 0);
+    await machine.writel(APBH_BASE + 0x0c0, desc);
+    await machine.writel(APBH_BASE + 0x0f0, 1);
+
+    assert.equal(
+      await machine.readl(bar),
+      0x56785678,
+      '16-bit SSP DMA_WRITE must transfer XFER_COUNT words, not bytes',
+    );
+    assert.equal(
+      (await machine.readl(SSP1_BASE + 0x000)) & runBit,
+      0,
+      '16-bit SSP DMA_WRITE must clear RUN after XFER_COUNT words',
+    );
+
+    // DMA_READ: 16-bit SSP consumes two 16-bit words and leaves the last in DATA
+    await machine.writel(readBar, 0x04030201);
+    await writeDescriptor(desc + 0x100, doneDesc + 0x100, readCommand, readBar, pioCtrl0);
+    await writeDescriptor(doneDesc + 0x100, 0, terminal, 0);
+    await machine.writel(APBH_BASE + 0x0c0, desc + 0x100);
+    await machine.writel(APBH_BASE + 0x0f0, 1);
+
+    assert.equal(
+      await machine.readl(SSP1_BASE + 0x070),
+      0x0403,
+      '16-bit SSP DMA_READ must leave the last 16-bit word in DATA',
+    );
+    assert.equal(
+      (await machine.readl(SSP1_BASE + 0x000)) & runBit,
+      0,
+      '16-bit SSP DMA_READ must clear RUN after XFER_COUNT words',
+    );
+  });
+}
+
 async function testGpmiTiming2Contract() {
   await withMachine(async (machine) => {
     await machine.writel(GPMI_BASE + 0x080, 0xffffffff);
@@ -7267,6 +7346,7 @@ const tests = [
   ['SSP error IRQ pairing contract', testSspErrorIrqPairingContract],
   ['SSP DATA empty read contract', testSspDataEmptyReadContract],
   ['SSP APBH DMA read/write contract', testSspDmaReadWriteContract],
+  ['SSP XFER_COUNT word-width contract', testSspXferCountWordWidthContract],
   ['GPMI TIMING2 contract', testGpmiTiming2Contract],
   ['GPMI CTRL1 contract', testGpmiCtrl1Contract],
   ['GPMI ECC register contract', testGpmiEccRegisterContract],

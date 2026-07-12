@@ -91,17 +91,11 @@ static unsigned int stmp3770_ssp_bytes_per_word(STMP3770SSPState *s)
 
 static void stmp3770_ssp_complete_data_word(STMP3770SSPState *s)
 {
-    unsigned int bytes_per_word = stmp3770_ssp_bytes_per_word(s);
-
     if (s->words_remaining == 0) {
         return;
     }
 
-    if (s->words_remaining > bytes_per_word) {
-        s->words_remaining -= bytes_per_word;
-    } else {
-        s->words_remaining = 0;
-    }
+    s->words_remaining--;
 
     s->status |= SSP_STATUS_FIFO_EMPTY;
 
@@ -412,7 +406,7 @@ static int stmp3770_ssp_dma_handler(STMP3770DMAState *dma, int channel,
         const uint8_t *src = (const uint8_t *)buf;
 
         for (i = 0; i + bytes_per_word <= len; i += bytes_per_word) {
-            if (s->words_remaining < bytes_per_word) {
+            if (s->words_remaining == 0) {
                 break;
             }
             stmp3770_ssp_dma_load_word(s, &src[i], bytes_per_word);
@@ -430,7 +424,7 @@ static int stmp3770_ssp_dma_handler(STMP3770DMAState *dma, int channel,
         uint8_t *dst = (uint8_t *)buf;
 
         for (i = 0; i + bytes_per_word <= len; i += bytes_per_word) {
-            if (s->words_remaining < bytes_per_word) {
+            if (s->words_remaining == 0) {
                 break;
             }
             stmp3770_ssp_dma_store_word(s, &dst[i], bytes_per_word);
