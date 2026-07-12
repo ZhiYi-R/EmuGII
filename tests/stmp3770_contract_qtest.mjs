@@ -3103,6 +3103,76 @@ async function testUsbPortsc1AndOtgscContract() {
       0x000000ff,
       'USBCTRL OTGSC must ignore status-input and reserved bits on writes',
     );
+
+    /* PORTSC1: PR-initiated port reset completes after 10 ms. */
+    await machine.writel(USB_BASE + 0x148, 0x00000004);
+    await machine.clockStep(10_000_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x184),
+      0x04ffd2cc,
+      'USBCTRL PORTSC1 PR must clear and PE/PEC/PSPD/HSP set after 10 ms reset',
+    );
+    assert.equal(
+      await machine.readl(USB_BASE + 0x144),
+      0x00000004,
+      'USBCTRL USBSTS.PCI must be set after port reset',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL PCI must assert ICOLL source 11',
+    );
+    await machine.writel(USB_BASE + 0x144, 0x00000004);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x144),
+      0x00000000,
+      'USBCTRL USBSTS.PCI must be W1C',
+    );
+    assert.equal(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL PCI clear must deassert ICOLL source 11',
+    );
+
+    /* OTGSC 1 ms toggle: ONEMST toggles and ONEMSS is set each 1 ms. */
+    await machine.writel(USB_BASE + 0x1a4, 0x200000ff);
+    await machine.clockStep(1_000_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x1a4),
+      0x202020ff,
+      'USBCTRL OTGSC ONEMST must toggle and ONEMSS set after 1 ms',
+    );
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL OTGSC ONEMSS must assert ICOLL source 11 when ONEMSE enabled',
+    );
+
+    await machine.clockStep(1_000_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x1a4),
+      0x202000ff,
+      'USBCTRL OTGSC ONEMST must toggle again',
+    );
+
+    await machine.writel(USB_BASE + 0x1a4, 0x202000ff);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x1a4),
+      0x200000ff,
+      'USBCTRL OTGSC ONEMSS must be W1C',
+    );
+    assert.equal(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL OTGSC ONEMSS clear must deassert ICOLL source 11',
+    );
+
+    await machine.clockStep(1_000_000);
+    assert.equal(
+      await machine.readl(USB_BASE + 0x1a4),
+      0x202020ff,
+      'USBCTRL OTGSC ONEMSS must be set again on next 1 ms tick',
+    );
   });
 }
 

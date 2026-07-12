@@ -79,6 +79,12 @@
 #define GPTIMER_COUNT_MASK           0x00FFFFFF
 #define USBSTS_GPTIMER0              (1U << 24)
 #define USBSTS_GPTIMER1              (1U << 25)
+#define USBSTS_PCI                   (1U << 2)
+
+#define OTGSC_ONEMST                 (1U << 13)
+#define OTGSC_ONEMSS                 (1U << 21)
+
+#define PORTSC1_PSPD_HIGH            (1U << 26)
 
 #define USBCTRL_USBCMD_DEVICE_RESET     0x00080000
 #define USBCTRL_BURSTSIZE_RESET         0x00001010
@@ -158,8 +164,39 @@ typedef struct STMP3770USBGPTimerCBInfo {
 
 static void usb_update_irq(STMP3770USBState *s)
 {
-    qemu_set_irq(s->irq, (s->usbsts & s->usbintr &
-                          USBINTR_WRITABLE_MASK) != 0);
+    uint32_t usb_irq = s->usbsts & s->usbintr & USBINTR_WRITABLE_MASK;
+    uint32_t otgsc_status = (s->otgsc & OTGSC_STATUS_MASK) >> 16;
+    uint32_t otgsc_en = (s->otgsc & OTGSC_EN_MASK) >> 24;
+    uint32_t otgsc_irq = (otgsc_status & otgsc_en) & 0x7FU;
+
+    qemu_set_irq(s->irq, (usb_irq | otgsc_irq) != 0);
+}
+
+static void usb_port_reset_timeout(void *opaque)
+{
+    STMP3770USBState *s = opaque;
+
+    s->portsc1 &= ~PORTSC1_PR;
+    s->portsc1 |= PORTSC1_PE | PORTSC1_PEC;
+
+    if (s->portsc1 & PORTSC1_PFSC) {
+        s->portsc1 &= ~(PORTSC1_PSPD | PORTSC1_HSP);
+    } else {
+        s->portsc1 = (s->portsc1 & ~PORTSC1_PSPD) |
+                     PORTSC1_PSPD_HIGH | PORTSC1_HSP;
+    }
+
+    s->usbsts |= USBSTS_PCI;
+    usb_update_irq(s);
+}
+
+static void usb_otgsc_1ms_tick(void *opaque)
+{
+    STMP3770USBState *s = opaque;
+
+    s->otgsc ^= OTGSC_ONEMST;
+    s->otgsc |= OTGSC_ONEMSS;
+    usb_update_irq(s);
 }
 
 static void usb_gptimer_configure(STMP3770USBState *s, unsigned int idx,
@@ -234,6 +271,16 @@ static void usb_controller_reset(STMP3770USBState *s)
         ptimer_set_limit(s->gptimer_ptimer[i], 0, 1);
         ptimer_transaction_commit(s->gptimer_ptimer[i]);
     }
+
+    ptimer_transaction_begin(s->port_reset_ptimer);
+    ptimer_stop(s->port_reset_ptimer);
+    ptimer_transaction_commit(s->port_reset_ptimer);
+
+    ptimer_transaction_begin(s->otgsc_1ms_ptimer);
+    ptimer_stop(s->otgsc_1ms_ptimer);
+    ptimer_set_limit(s->otgsc_1ms_ptimer, 1000, 1);
+    ptimer_run(s->otgsc_1ms_ptimer, 0);
+    ptimer_transaction_commit(s->otgsc_1ms_ptimer);
 }
 
 static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
@@ -334,7 +381,13 @@ static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
     case REG_CONFIGFLAG:
         return 0;
     case REG_PORTSC1:
-        return s->portsc1 & PORTSC1_KNOWN_MASK;
+    {
+        uint32_t v = s->portsc1 & PORTSC1_KNOWN_MASK;
+        if ((v & PORTSC1_PP) == 0) {
+            v &= ~PORTSC1_PR;
+        }
+        return v;
+    }
     case REG_OTGSC:
         return s->otgsc & OTGSC_KNOWN_MASK;
     case REG_USBMODE:
@@ -420,6 +473,7 @@ static void usb_write(void *opaque, hwaddr offset,
         uint32_t writable = PORTSC1_ALWAYS_RW;
         uint32_t old_portsc1 = s->portsc1;
         bool old_pe = (old_portsc1 & PORTSC1_PE) != 0;
+        bool old_pr = (old_portsc1 & PORTSC1_PR) != 0;
 
         if ((s->usbmode & 0x3) == 0x3) {
             /* Host mode: PP/PR/SUSP/PE are writable. */
@@ -440,6 +494,23 @@ static void usb_write(void *opaque, hwaddr offset,
         s->portsc1 &= ~(val & PORTSC1_W1C_MASK);
 
         s->portsc1 &= PORTSC1_KNOWN_MASK;
+
+        /* PR is only meaningful when port power is on. */
+        if ((s->portsc1 & PORTSC1_PP) == 0) {
+            s->portsc1 &= ~PORTSC1_PR;
+        }
+
+        bool new_pr = (s->portsc1 & PORTSC1_PR) != 0;
+        if (!old_pr && new_pr) {
+            ptimer_transaction_begin(s->port_reset_ptimer);
+            ptimer_set_limit(s->port_reset_ptimer, 10000, 1);
+            ptimer_run(s->port_reset_ptimer, 1);
+            ptimer_transaction_commit(s->port_reset_ptimer);
+        } else if (old_pr && !new_pr) {
+            ptimer_transaction_begin(s->port_reset_ptimer);
+            ptimer_stop(s->port_reset_ptimer);
+            ptimer_transaction_commit(s->port_reset_ptimer);
+        }
         break;
     }
     case REG_OTGSC:
@@ -454,6 +525,7 @@ static void usb_write(void *opaque, hwaddr offset,
         s->otgsc |= val & (OTGSC_EN_MASK | OTGSC_CTRL_MASK);
 
         s->otgsc &= OTGSC_KNOWN_MASK;
+        usb_update_irq(s);
         break;
     }
     case REG_USBMODE:
@@ -551,12 +623,14 @@ static void usb_finalize(Object *obj)
         ptimer_free(s->gptimer_ptimer[i]);
     }
     g_free(s->gptimer_cb_info);
+    ptimer_free(s->port_reset_ptimer);
+    ptimer_free(s->otgsc_1ms_ptimer);
 }
 
 static const VMStateDescription vmstate_usb = {
     .name = "stmp3770-usb",
-    .version_id = 4,
-    .minimum_version_id = 1,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(usbcmd, STMP3770USBState),
         VMSTATE_UINT32(usbsts, STMP3770USBState),
@@ -586,6 +660,8 @@ static const VMStateDescription vmstate_usb = {
         VMSTATE_ARRAY_OF_POINTER_TO_STRUCT(gptimer_ptimer,
                                            STMP3770USBState, 2, 4,
                                            vmstate_ptimer, ptimer_state),
+        VMSTATE_PTIMER(port_reset_ptimer, STMP3770USBState),
+        VMSTATE_PTIMER(otgsc_1ms_ptimer, STMP3770USBState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -607,6 +683,23 @@ static void usb_init(Object *obj)
         ptimer_set_limit(s->gptimer_ptimer[i], 0, 1);
         ptimer_transaction_commit(s->gptimer_ptimer[i]);
     }
+
+    s->port_reset_ptimer = ptimer_init(usb_port_reset_timeout, s,
+                                       PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                       PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    ptimer_transaction_begin(s->port_reset_ptimer);
+    ptimer_set_freq(s->port_reset_ptimer, 1000000);
+    ptimer_set_limit(s->port_reset_ptimer, 0, 1);
+    ptimer_transaction_commit(s->port_reset_ptimer);
+
+    s->otgsc_1ms_ptimer = ptimer_init(usb_otgsc_1ms_tick, s,
+                                      PTIMER_POLICY_NO_COUNTER_ROUND_DOWN |
+                                      PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT);
+    ptimer_transaction_begin(s->otgsc_1ms_ptimer);
+    ptimer_set_freq(s->otgsc_1ms_ptimer, 1000000);
+    ptimer_set_limit(s->otgsc_1ms_ptimer, 0, 1);
+    ptimer_transaction_commit(s->otgsc_1ms_ptimer);
+
     usb_controller_reset(s);
 }
 

@@ -58,6 +58,9 @@ struct STMP3770USBState {
     uint32_t gptimer[2];
     ptimer_state *gptimer_ptimer[2];
     struct STMP3770USBGPTimerCBInfo *gptimer_cb_info;
+
+    ptimer_state *port_reset_ptimer;
+    ptimer_state *otgsc_1ms_ptimer;
 };
 
 #endif /* STMP3770_USB_H */
