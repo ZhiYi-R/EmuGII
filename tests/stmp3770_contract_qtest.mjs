@@ -347,16 +347,25 @@ async function testRtcCopyControllerContract() {
 
 async function testRtcClockGateContract() {
   await withMachine(async (machine) => {
+    /* ROM boot init already clears SFTRST and CLKGATE, so we must
+     * re-assert them first to test independent clearing. */
+    await machine.writel(RTC_BASE + 0x004, 0xc0000000);
+    assert.equal(
+      ((await machine.readl(RTC_BASE + 0x000)) & 0xc0000000) >>> 0,
+      0xc0000000,
+      'RTC CTRL_SET must assert both SFTRST and CLKGATE',
+    );
+
     await machine.writel(RTC_BASE + 0x008, 0x80000000);
     assert.equal(
-      (await machine.readl(RTC_BASE + 0x000)) & 0xc0000000,
+      ((await machine.readl(RTC_BASE + 0x000)) & 0xc0000000) >>> 0,
       0x40000000,
       'RTC CTRL_CLR.SFTRST must not clear the independently controlled CLKGATE bit',
     );
 
     await machine.writel(RTC_BASE + 0x008, 0x40000000);
     assert.equal(
-      (await machine.readl(RTC_BASE + 0x000)) & 0xc0000000,
+      ((await machine.readl(RTC_BASE + 0x000)) & 0xc0000000) >>> 0,
       0,
       'RTC CTRL_CLR.CLKGATE must independently enable the digital clock',
     );
@@ -2369,12 +2378,32 @@ async function testAppUartSerialTimingContract() {
   });
 }
 
+async function testRomBootInitContract() {
+  await withMachine(async (machine) => {
+    /* After ROM boot init, the debug UART should be configured for
+     * 115200 baud at 24 MHz XTAL: IBRD=13, FBRD=1, LCR_H=0x70 */
+    const ibrd = await machine.readl(DBGUART_BASE + 0x024);
+    const fbrd = await machine.readl(DBGUART_BASE + 0x028);
+    const lcrh = await machine.readl(DBGUART_BASE + 0x02C);
+    const cr = await machine.readl(DBGUART_BASE + 0x030);
+    if (ibrd !== 0x0000000D || fbrd !== 0x00000001 || lcrh !== 0x00000070) {
+      throw new Error(
+        `ROM boot init mismatch: IBRD=0x${ibrd.toString(16)} FBRD=0x${fbrd.toString(16)} ` +
+        `LCR_H=0x${lcrh.toString(16)} CR=0x${cr.toString(16)} stderr=${machine.stderr}`,
+      );
+    }
+  });
+}
+
 async function testDebugUartRegisterContract() {
   await withMachine(async (machine) => {
+    /* After ROM boot init, CR is 0x301 (UARTEN|TXE|RXE) and IBRD/FBRD/LCR_H
+     * are configured for 115200 baud.  The RW mask test below still works
+     * because writing 0xffffffff masks to the writable bits. */
     assert.equal(
       await machine.readl(DBGUART_BASE + 0x030),
-      0x00000300,
-      'UARTDBG CR must reset with RXE and TXE asserted',
+      0x00000301,
+      'UARTDBG CR must reflect ROM boot init (UARTEN|TXE|RXE)',
     );
     assert.equal(
       await machine.readl(DBGUART_BASE + 0x034),
@@ -2408,6 +2437,9 @@ async function testDebugUartRegisterContract() {
     );
 
     await machine.writel(DBGUART_BASE + 0x030, 0x00000381);
+    /* Clear IBRD/FBRD so byte_time=0 and LBE loopback is synchronous */
+    await machine.writel(DBGUART_BASE + 0x024, 0x00000000);
+    await machine.writel(DBGUART_BASE + 0x028, 0x00000000);
     await machine.writel(DBGUART_BASE + 0x000, 0x0000005a);
     assert.equal(
       await machine.readl(DBGUART_BASE + 0x000),
@@ -2420,6 +2452,9 @@ async function testDebugUartRegisterContract() {
 async function testDebugUartFifoIflsContract() {
   await withMachine(async (machine) => {
     await machine.writel(DBGUART_BASE + 0x030, 0x00000381);
+    /* Clear IBRD/FBRD so byte_time=0 and LBE loopback is synchronous */
+    await machine.writel(DBGUART_BASE + 0x024, 0x00000000);
+    await machine.writel(DBGUART_BASE + 0x028, 0x00000000);
     await machine.writel(DBGUART_BASE + 0x02c, 0x00000010);
     await machine.writel(DBGUART_BASE + 0x034, 0x0000000a);
     await machine.writel(DBGUART_BASE + 0x038, 0x00000030);
@@ -6398,17 +6433,18 @@ async function testLcdifDataAccessContract() {
 
 async function testPinctrlCtrl() {
   await withMachine(async (machine) => {
-    /* Reset: SFTRST and CLKGATE set, PRESENT0/1/2 set, PRESENT3 clear, IRQOUT clear. */
+    /* After ROM boot init: SFTRST/CLKGATE cleared, PRESENT0/1/2 set,
+     * PRESENT3 clear, IRQOUT clear. */
     const ctrl = await machine.readl(PINCTRL_BASE + 0x000);
     assert.equal(
       (ctrl & 0xFC00000F) >>> 0,
-      0xDC000000,
-      'PINCTRL CTRL must reset with SFTRST/CLKGATE/PRESENT0/1/2 set and IRQOUT clear',
+      0x1C000000,
+      'PINCTRL CTRL must have SFTRST/CLKGATE cleared by ROM boot init with PRESENT0/1/2 set',
     );
     assert.equal(ctrl & (1 << 29), 0, 'PINCTRL PRESENT3 must be 0 on STMP3770');
 
-    /* Clear SFTRST/CLKGATE and set up a level-active GPIO0 interrupt. */
-    await machine.writel(PINCTRL_BASE + 0x008, 0xC0000000); /* CTRL_CLR */
+    /* Set up a level-active GPIO0 interrupt (SFTRST/CLKGATE already cleared
+     * by ROM boot init). */
     await machine.writel(PINCTRL_BASE + 0x600, 0x00000001); /* DOE0 */
     await machine.writel(PINCTRL_BASE + 0x700, 0x00000001); /* PIN2IRQ0 */
     await machine.writel(PINCTRL_BASE + 0x800, 0x00000001); /* IRQEN0 */
@@ -7050,7 +7086,8 @@ async function testPowerResetValues() {
     const batt = await machine.readl(POWER_BASE + 0x0d0);
     const sts = await machine.readl(POWER_BASE + 0x0b0);
 
-    assert.equal(ctrl, 0x40040024, `POWER CTRL reset mismatch: got 0x${ctrl.toString(16)}`);
+    /* After ROM boot init, POWER CTRL.CLKGATE (bit 30) is cleared. */
+    assert.equal(ctrl, 0x00040024, `POWER CTRL post-ROM-boot mismatch: got 0x${ctrl.toString(16)}`);
     assert.equal(v5ctrl, 0x00000100, `POWER 5VCTRL reset mismatch: got 0x${v5ctrl.toString(16)}`);
     assert.equal(charge, 0x00010000, `POWER CHARGE reset mismatch: got 0x${charge.toString(16)}`);
     assert.equal(vddd, 0x00310710, `POWER VDDDCTRL reset mismatch: got 0x${vddd.toString(16)}`);
@@ -8168,6 +8205,7 @@ const tests = [
   ['Application UART DMA FIFO data contract', testAppUartDmaFifoContract],
   ['Application UART serial timing contract', testAppUartSerialTimingContract],
   ['Debug UART register contract', testDebugUartRegisterContract],
+  ['ROM boot init contract', testRomBootInitContract],
   ['Debug UART FIFO IFLS threshold contract', testDebugUartFifoIflsContract],
   ['Debug UART serial timing contract', testDebugUartSerialTimingContract],
   ['LCDIF CTRL1 interrupt layout', testLcdifCtrl1Layout],

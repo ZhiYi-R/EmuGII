@@ -43,6 +43,9 @@
 #include "block/block-common.h"
 #include "qobject/qdict.h"
 #include "qemu/cutils.h"
+#include "target/arm/cpu.h"
+#include "exec/cputlb.h"
+#include "block/aio.h"
 
 /* HP 39gII hardware: 512KB SRAM only, no external DRAM */
 #define STMP3770_BOARD_RAM_DEFAULT  (0)
@@ -94,6 +97,130 @@ static char *stmp3770_default_file(const char *name)
 static bool stmp3770_file_exists(const char *path)
 {
     return g_file_test(path, G_FILE_TEST_IS_REGULAR);
+}
+
+/*
+ * Simulate a peripheral register write as the boot ROM would do.
+ * Uses address_space_write to go through the system address space,
+ * ensuring all side effects (state transitions, IRQ updates) are
+ * properly handled.
+ */
+static void stmp3770_rom_write(MemoryRegion *mr, hwaddr offset,
+                               uint64_t value)
+{
+    memory_region_dispatch_write(mr, offset, value,
+                                 MO_32, MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
+ * Simulate the STMP3770 mask ROM boot initialization sequence.
+ *
+ * This replicates the observable side effects of the real SigmaTel mask ROM
+ * (extracted from a 64 KiB OCROM dump) reset handler and early init functions:
+ *
+ *  1. Reset handler (0xFFFF2338, ARM mode):
+ *     - Ungate RTC, PINCTRL (SFTRST + CLKGATE clear)
+ *     - Ungate POWER (CLKGATE clear only; SFTRST is not asserted at reset)
+ *
+ *  2. init_func_1 (0xFFFF15A4): OCOTP bank open/read/close cycle
+ *
+ *  3. init_func_2 (0xFFFF1858): Debug UART configuration
+ *     - IBRD=0x0D, FBRD=0x01 (24 MHz / (16 * 115200) ≈ 13.02)
+ *     - LCR_H=0x70 (8-bit, FIFO enabled)
+ *     - CR=0x301 (UARTEN | TXE | RXE)
+ *
+ *  4. init_func_3/4 (0xFFFF1518/0xFFFF1538): CP15 TLB + I-cache invalidate
+ *  5. init_func_5/6 (0xFFFF154C/0xFFFF1554): CP15 SCTLR configuration
+ *     - Enable alignment checking (SCTLR_A, bit 1)
+ *     - Configure ARM926EJ-S control bits
+ */
+static void stmp3770_rom_boot_init(void *opaque)
+{
+    STMP3770State *soc = opaque;
+
+    /* Get memory regions for each device we need to write to */
+    MemoryRegion *rtc_mr = sysbus_mmio_get_region(
+        SYS_BUS_DEVICE(soc->rtc), 0);
+    MemoryRegion *pinctrl_mr = sysbus_mmio_get_region(
+        SYS_BUS_DEVICE(soc->pinctrl), 0);
+    MemoryRegion *power_mr = sysbus_mmio_get_region(
+        SYS_BUS_DEVICE(soc->power), 0);
+    MemoryRegion *ocotp_mr = sysbus_mmio_get_region(
+        SYS_BUS_DEVICE(soc->ocotp), 0);
+
+    /*
+     * 1. Reset handler: release peripheral soft-reset and clock gates.
+     *
+     * RTC CTRL_CLR (0x8005C008) = 0xC0000000  (SFTRST | CLKGATE)
+     * PINCTRL CTRL_CLR (0x80018008) = 0xC0000000  (SFTRST | CLKGATE)
+     * POWER CTRL_CLR (0x80044008) = 0x40000000  (CLKGATE only)
+     */
+    stmp3770_rom_write(rtc_mr, 0x008, 0xC0000000);
+    stmp3770_rom_write(pinctrl_mr, 0x008, 0xC0000000);
+    stmp3770_rom_write(power_mr, 0x008, 0x40000000);
+
+    /*
+     * 2. OCOTP init: open bank for shadow read, then close.
+     *
+     * OCOTP CTRL_SET (0x8002C004) = 0x00001000  (RD_BANK_OPEN, bit 12)
+     * OCOTP CTRL_CLR (0x8002C008) = 0x00001000  (close bank)
+     *
+     * The real ROM waits for the bank-ready status between set and close,
+     * but QEMU's OCOTP shadow read is synchronous so no polling is needed.
+     */
+    stmp3770_rom_write(ocotp_mr, 0x004, 0x00001000);
+    stmp3770_rom_write(ocotp_mr, 0x008, 0x00001000);
+
+    /*
+     * 3. Debug UART configuration (init_func_2).
+     *
+     * The ROM configures the debug UART for 115200 baud at 24 MHz XTAL:
+     *   IBRD = 13, FBRD = 1  →  24e6 / (16 * (13 + 1/64)) = 115384 Hz
+     *   LCR_H = 0x70         →  8-bit word, FIFO enabled
+     *   CR = 0x301           →  UARTEN | TXE | RXE
+     *
+     * Directly set the UART state registers because the UART device
+     * reset must run first (to initialize FIFOs and timers) and our
+     * bottom-half callback runs after reset completes.
+     */
+    {
+        STMP3770UARTDebugState *uart = soc->uartdbg;
+        uart->ibrd = 0x00D;
+        uart->fbrd = 0x001;
+        uart->lcr = 0x070;
+        uart->cr = 0x301;
+    }
+
+    /*
+     * 4. CP15 initialization (init_func_3/4/5/6).
+     *
+     * The ROM performs:
+     *   MCR p15, r0, c8, c7, #0  — invalidate entire TLB
+     *   MCR p15, r0, c7, c5, #0  — invalidate entire I-cache
+     *   MRC p15, r0, c1, c0, #0  — read SCTLR
+     *   ORR r0, r0, #2            — set SCTLR_A (alignment check enable)
+     *   AND r0, r0, mask          — clear unused/reserved bits
+     *   ORR r0, r0, value         — set ARM926 control bits
+     *   MCR p15, r0, c1, c0, #0  — write SCTLR
+     *
+     * In QEMU, TLB invalidation maps to tlb_flush().  I-cache invalidation
+     * is a no-op (QEMU manages translation caching internally).  The SCTLR
+     * is modified in-place and hflags are rebuilt.
+     */
+    {
+        CPUARMState *env = &soc->cpu.env;
+        uint64_t sctlr = env->cp15.sctlr_ns;
+
+        /* Flush TLB (MCR p15, c8, c7, #0) */
+        tlb_flush(CPU(&soc->cpu));
+
+        /* Modify SCTLR: enable alignment checking, configure control bits */
+        sctlr |= SCTLR_A;          /* bit 1: alignment check enable */
+        sctlr &= 0x0005F3FFULL;    /* clear upper bits and reserved fields */
+        sctlr |= 0x00050078ULL;    /* set ARM926 control bits */
+        env->cp15.sctlr_ns = sctlr;
+        arm_rebuild_hflags(env);
+    }
 }
 
 static BlockBackend *stmp3770_open_default_flash(const char *path)
@@ -397,28 +524,30 @@ static void stmp3770_board_init(MachineState *machine)
 
     /*
      * Simulate Boot ROM initialization.
-     * Real STMP3770 Boot ROM configures basic peripherals before firmware runs.
-     * Based on ExistOS-For-HP39GII BSP analysis.
-     */
-
-    /* 1. Pre-configure Debug UART
      *
-     * ExistOS Uart::init() is a no-op because Boot ROM already configured UART.
-     * UARTDBG Control Register (UARTDBGCR) @ offset 0x30:
-     *   Bit 0: UARTEN (UART enable)
-     *   Bit 8: TXE (transmit enable)
-     *   Bit 9: RXE (receive enable)
+     * The real STMP3770 mask ROM (SigmaTel OCROM, 64 KiB @ 0xFFFF0000)
+     * performs a sequence of peripheral initialization before handing
+     * control to the boot loader.  The sequence below replicates the
+     * observable side effects extracted from the actual ROM dump:
+     *
+     *   - Release soft-reset/clock-gate on RTC, PINCTRL, POWER
+     *   - Open/close OCOTP bank for shadow read
+     *   - Configure Debug UART (115200 8N1 at 24 MHz XTAL)
+     *   - Invalidate TLB and configure CP15 SCTLR (alignment check, etc.)
+     *
+     * This is registered as a reset handler so it runs AFTER all device
+     * reset handlers, matching the real hardware where the ROM runs after
+     * the reset deassertion sequence.
      */
-    {
-        uint32_t uartcr_val = (1 << 0) | (1 << 8) | (1 << 9);
-        MemoryRegion *uart_mr = sysbus_mmio_get_region(
-            SYS_BUS_DEVICE(s->soc.uartdbg), 0);
-        memory_region_dispatch_write(uart_mr, 0x30, uartcr_val,
-                                      MO_32, MEMTXATTRS_UNSPECIFIED);
-    }
+    /* Schedule the ROM boot init to run after all device reset handlers
+     * complete.  Using a bottom half ensures the init runs on the next
+     * main loop iteration, which is after the reset phase.  This matches
+     * real hardware where the mask ROM runs after reset deassertion. */
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            stmp3770_rom_boot_init, &s->soc);
 
     /*
-     * 2. CPU starts at 24MHz XTAL (not PLL)
+     * CPU starts at 24MHz XTAL (not PLL)
      *
      * Real hardware: CPU runs at 24MHz until firmware enables PLL and switches
      * to high-frequency domain. CLKCTRL reset values:
