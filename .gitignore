@@ -61,3 +61,4 @@ config-meson.cross
 /docs/
 /.codegraph/
 AGENTS.md
+temp
