@@ -17,6 +17,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "system/address-spaces.h"
 #include "hw/usb/stmp3770_usb.h"
 
 /* Register offsets */
@@ -201,10 +202,310 @@
 #define OTGSC_KNOWN_MASK    (OTGSC_EN_MASK | OTGSC_STATUS_MASK | \
                              OTGSC_STATUS_INPUT_MASK | OTGSC_CTRL_MASK)
 
+/* dTD token field bits. */
+#define DTD_STATUS_ACTIVE      (1U << 0)
+#define DTD_STATUS_HALTED      (1U << 1)
+#define DTD_STATUS_DATA_BUF_ERR (1U << 2)
+#define DTD_STATUS_TX_ERR      (1U << 3)
+#define DTD_IOC                (1U << 15)
+#define DTD_TOTAL_BYTES_SHIFT  16
+#define DTD_TOTAL_BYTES_MASK   (0x7FFFU << DTD_TOTAL_BYTES_SHIFT)
+#define DTD_NEXT_TERMINATE     (1U << 0)
+
+/* dQH capability field bits. */
+#define QH_IOS                 (1U << 15)
+#define QH_MAX_PKT_SHIFT       16
+#define QH_MAX_PKT_MASK        (0x07FFU << QH_MAX_PKT_SHIFT)
+#define QH_ZLT                 (1U << 29)
+
+/* USBSTS.UI - USB interrupt (transfer complete). */
+#define USBSTS_UI              (1U << 0)
+
+/* Forward declarations (used by device-mode transfer helpers below). */
+static void usb_update_irq(STMP3770USBState *s);
+static bool usb_host_mode(const STMP3770USBState *s);
+
 typedef struct STMP3770USBGPTimerCBInfo {
     STMP3770USBState *s;
     unsigned int idx;
 } STMP3770USBGPTimerCBInfo;
+
+/* ---- Device-mode dQH/dTD memory access helpers ---- */
+
+/*
+ * Calculate the dQH address for a given endpoint and direction.
+ * Layout: EPBASE + (ep * 2 + is_tx) * 64
+ */
+static hwaddr usb_dqh_addr(STMP3770USBState *s, unsigned int ep, bool is_tx)
+{
+    return (s->endptlistaddr & USBCTRL_ENDPTLISTADDR_WRITABLE_MASK) +
+           (hwaddr)(ep * 2 + (is_tx ? 1 : 0)) * USB_DQH_SIZE;
+}
+
+/* Write a 32-bit little-endian word to guest physical memory. */
+static void usb_mem_write32(hwaddr addr, uint32_t val)
+{
+    uint32_t le = cpu_to_le32(val);
+    address_space_write(&address_space_memory, addr,
+                        MEMTXATTRS_UNSPECIFIED, &le, 4);
+}
+
+/*
+ * Read a dTD (32 bytes) from guest memory into a local buffer.
+ * Returns true on success.
+ */
+static bool usb_dtd_read(hwaddr dtd_addr, uint32_t dtd[8])
+{
+    if (address_space_read(&address_space_memory, dtd_addr,
+                           MEMTXATTRS_UNSPECIFIED, dtd,
+                           USB_DTD_SIZE) != MEMTX_OK) {
+        return false;
+    }
+    for (int i = 0; i < 8; i++) {
+        dtd[i] = ldl_le_p(&dtd[i]);
+    }
+    return true;
+}
+
+/* Write a dTD (32 bytes) back to guest memory. */
+static void usb_dtd_write(hwaddr dtd_addr, const uint32_t dtd[8])
+{
+    uint32_t le[8];
+    for (int i = 0; i < 8; i++) {
+        le[i] = cpu_to_le32(dtd[i]);
+    }
+    address_space_write(&address_space_memory, dtd_addr,
+                        MEMTXATTRS_UNSPECIFIED, le, USB_DTD_SIZE);
+}
+
+/* Read a contiguous buffer from guest memory using dTD page pointers. */
+static bool usb_dtd_buffer_read(const uint32_t dtd[8],
+                                uint8_t *buf, uint32_t max_len,
+                                uint32_t *transferred)
+{
+    uint32_t total = (dtd[1] & DTD_TOTAL_BYTES_MASK) >> DTD_TOTAL_BYTES_SHIFT;
+    uint32_t to_read = MIN(total, max_len);
+    uint32_t page0_addr = dtd[2];  /* page[0] has full address */
+    uint32_t done = 0;
+
+    while (done < to_read) {
+        unsigned int page_idx = done / USB_DTD_PAGE_SIZE;
+        uint32_t page_offset = done % USB_DTD_PAGE_SIZE;
+        uint32_t chunk;
+        MemTxResult res;
+
+        if (page_idx >= USB_DTD_MAX_PAGES) {
+            break;
+        }
+        chunk = MIN(to_read - done, USB_DTD_PAGE_SIZE - page_offset);
+
+        hwaddr src = (page_idx == 0)
+            ? (page0_addr + page_offset)
+            : ((dtd[2 + page_idx] & ~0xFFFU) + page_offset);
+
+        res = address_space_read(&address_space_memory, src,
+                                 MEMTXATTRS_UNSPECIFIED,
+                                 buf + done, chunk);
+        if (res != MEMTX_OK) {
+            *transferred = done;
+            return false;
+        }
+        done += chunk;
+    }
+    *transferred = done;
+    return true;
+}
+
+/* Write a contiguous buffer to guest memory using dTD page pointers. */
+static bool usb_dtd_buffer_write(const uint32_t dtd[8],
+                                 const uint8_t *buf, uint32_t len,
+                                 uint32_t *transferred)
+{
+    uint32_t total = (dtd[1] & DTD_TOTAL_BYTES_MASK) >> DTD_TOTAL_BYTES_SHIFT;
+    uint32_t to_write = MIN(len, total);
+    uint32_t page0_addr = dtd[2];
+    uint32_t done = 0;
+
+    while (done < to_write) {
+        unsigned int page_idx = done / USB_DTD_PAGE_SIZE;
+        uint32_t page_offset = done % USB_DTD_PAGE_SIZE;
+        uint32_t chunk;
+        MemTxResult res;
+
+        if (page_idx >= USB_DTD_MAX_PAGES) {
+            break;
+        }
+        chunk = MIN(to_write - done, USB_DTD_PAGE_SIZE - page_offset);
+
+        hwaddr dst = (page_idx == 0)
+            ? (page0_addr + page_offset)
+            : ((dtd[2 + page_idx] & ~0xFFFU) + page_offset);
+
+        res = address_space_write(&address_space_memory, dst,
+                                  MEMTXATTRS_UNSPECIFIED,
+                                  buf + done, chunk);
+        if (res != MEMTX_OK) {
+            *transferred = done;
+            return false;
+        }
+        done += chunk;
+    }
+    *transferred = done;
+    return true;
+}
+
+/*
+ * Execute a device-mode IN transfer (device sends data to host).
+ * Reads data from the dTD buffer, marks the dTD complete, and sets
+ * ENDPTCOMPLETE / USBSTS.UI.
+ */
+static void usb_device_in_transfer(STMP3770USBState *s, unsigned int ep)
+{
+    hwaddr qh_addr = usb_dqh_addr(s, ep, true);
+    uint32_t dtd[8];
+    hwaddr dtd_addr;
+    uint32_t bytes_transferred = 0;
+    uint8_t buf[16 * 1024];
+
+    /* Read the overlay dTD from the QH (offset 0x08 in QH). */
+    dtd_addr = qh_addr + 0x08;
+    if (!usb_dtd_read(dtd_addr, dtd)) {
+        s->vh_in_status = VH_IN_STATUS_ERROR;
+        return;
+    }
+
+    /* Check if the dTD is active. */
+    if (!(dtd[1] & DTD_STATUS_ACTIVE)) {
+        s->vh_in_status = VH_IN_STATUS_ERROR;
+        return;
+    }
+
+    /* Read the data from the dTD buffer (for inspection). */
+    usb_dtd_buffer_read(dtd, buf, sizeof(buf), &bytes_transferred);
+
+    /* Update dTD status: clear active, set bytes transferred. */
+    dtd[1] &= ~DTD_STATUS_ACTIVE;
+    dtd[1] = (dtd[1] & ~DTD_TOTAL_BYTES_MASK) |
+             (bytes_transferred << DTD_TOTAL_BYTES_SHIFT);
+    usb_dtd_write(dtd_addr, dtd);
+
+    /* Set ENDPTCOMPLETE (TX bit = 16 + ep) and clear ENDPTSTAT. */
+    s->endptcomplete |= (1U << (16 + ep));
+    s->endptstat &= ~(1U << (16 + ep));
+    s->usbsts |= USBSTS_UI;
+    s->vh_in_status = bytes_transferred & VH_IN_STATUS_BYTES;
+    usb_update_irq(s);
+}
+
+/*
+ * Execute a device-mode OUT transfer (device receives data from host).
+ * Writes data from the virtual host buffer to the dTD buffer, marks the
+ * dTD complete, and sets ENDPTCOMPLETE / USBSTS.UI.
+ */
+static void usb_device_out_transfer(STMP3770USBState *s, unsigned int ep)
+{
+    hwaddr qh_addr = usb_dqh_addr(s, ep, false);
+    uint32_t dtd[8];
+    hwaddr dtd_addr;
+    uint32_t bytes_transferred = 0;
+    uint32_t out_len = s->vh_out_len;
+    g_autofree uint8_t *buf = NULL;
+
+    /* Read the overlay dTD from the QH (offset 0x08 in QH). */
+    dtd_addr = qh_addr + 0x08;
+    if (!usb_dtd_read(dtd_addr, dtd)) {
+        return;
+    }
+
+    /* Check if the dTD is active. */
+    if (!(dtd[1] & DTD_STATUS_ACTIVE)) {
+        return;
+    }
+
+    /* Read OUT data from guest memory (provided by test harness). */
+    if (out_len > 0) {
+        buf = g_malloc(out_len);
+        if (address_space_read(&address_space_memory, s->vh_out_addr,
+                               MEMTXATTRS_UNSPECIFIED, buf,
+                               out_len) != MEMTX_OK) {
+            return;
+        }
+    }
+
+    /* Write data to the dTD buffer. */
+    if (out_len > 0) {
+        usb_dtd_buffer_write(dtd, buf, out_len, &bytes_transferred);
+    } else {
+        bytes_transferred = 0;
+    }
+
+    /* Update dTD status: clear active, set bytes transferred. */
+    dtd[1] &= ~DTD_STATUS_ACTIVE;
+    dtd[1] = (dtd[1] & ~DTD_TOTAL_BYTES_MASK) |
+             (bytes_transferred << DTD_TOTAL_BYTES_SHIFT);
+    usb_dtd_write(dtd_addr, dtd);
+
+    /* Set ENDPTCOMPLETE (RX bit = ep) and clear ENDPTSTAT. */
+    s->endptcomplete |= (1U << ep);
+    s->endptstat &= ~(1U << ep);
+    s->usbsts |= USBSTS_UI;
+    usb_update_irq(s);
+}
+
+/*
+ * Inject a SETUP packet on the given endpoint.
+ * Writes 8 bytes to the dQH setup buffer and sets ENDPTSETUPSTAT.
+ */
+static void usb_device_setup_inject(STMP3770USBState *s, unsigned int ep)
+{
+    hwaddr qh_addr = usb_dqh_addr(s, ep, false);
+    uint32_t setup[2];
+
+    setup[0] = s->vh_setup_lo;
+    setup[1] = s->vh_setup_hi;
+
+    /* Write SETUP data to QH setup buffer (offset 0x2C in QH). */
+    usb_mem_write32(qh_addr + 0x2C, setup[0]);
+    usb_mem_write32(qh_addr + 0x30, setup[1]);
+
+    /* Set ENDPTSETUPSTAT for this endpoint. */
+    s->endptsetupstat |= (1U << ep);
+    s->usbsts |= USBSTS_UI;
+    usb_update_irq(s);
+}
+
+/*
+ * Process a virtual host action (triggered by writing to REG_VH_ACTION).
+ */
+static void usb_vh_process_action(STMP3770USBState *s, uint32_t action)
+{
+    unsigned int ep = action & 0x1F;
+    unsigned int type = (action >> VH_ACTION_TYPE_SHIFT) & 0x7;
+
+    if (ep >= STMP3770_USB_NUM_ENDPOINTS) {
+        return;
+    }
+
+    /* Only valid in device mode. */
+    if (usb_host_mode(s)) {
+        return;
+    }
+
+    switch (type) {
+    case VH_ACTION_SETUP:
+        usb_device_setup_inject(s, ep);
+        break;
+    case VH_ACTION_IN:
+        s->vh_in_status = 0;
+        usb_device_in_transfer(s, ep);
+        break;
+    case VH_ACTION_OUT:
+        usb_device_out_transfer(s, ep);
+        break;
+    default:
+        break;
+    }
+}
 
 static void usb_update_irq(STMP3770USBState *s)
 {
@@ -359,6 +660,12 @@ static void usb_controller_reset(STMP3770USBState *s)
     ptimer_transaction_begin(s->frindex_ptimer);
     ptimer_stop(s->frindex_ptimer);
     ptimer_transaction_commit(s->frindex_ptimer);
+
+    s->vh_setup_lo = 0;
+    s->vh_setup_hi = 0;
+    s->vh_out_addr = 0;
+    s->vh_out_len = 0;
+    s->vh_in_status = 0;
 }
 
 static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
@@ -505,6 +812,16 @@ static uint64_t usb_read(void *opaque, hwaddr offset, unsigned size)
         return s->endptcomplete;
     case REG_ENDPTCTRL0 ... REG_ENDPTCTRL4:
         return s->endptctrl[(offset - REG_ENDPTCTRL0) / 4];
+    case REG_VH_SETUP_LO:
+        return s->vh_setup_lo;
+    case REG_VH_SETUP_HI:
+        return s->vh_setup_hi;
+    case REG_VH_OUT_ADDR:
+        return s->vh_out_addr;
+    case REG_VH_OUT_LEN:
+        return s->vh_out_len;
+    case REG_VH_IN_STATUS:
+        return s->vh_in_status;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-usb: read from unimplemented offset "
@@ -684,7 +1001,13 @@ static void usb_write(void *opaque, hwaddr offset,
         s->endptsetupstat &= ~((uint32_t)value & USBCTRL_ENDPTSETUP_MASK);
         break;
     case REG_ENDPTPRIME:
-        /* For stub, immediately clear prime and set status */
+        /*
+         * Priming an endpoint prepares it for a transfer.  In real hardware
+         * the controller reads the dQH/dTD from memory and sets ENDPTSTAT
+         * when the endpoint is ready.  We set ENDPTSTAT immediately (the
+         * dQH/dTD is parsed on demand when a transfer is triggered by the
+         * virtual host).  ENDPTPRIME self-clears.
+         */
         s->endptprime = 0;
         s->endptstat |= (uint32_t)value & USBCTRL_ENDPOINT_BITMAP_MASK;
         break;
@@ -732,6 +1055,21 @@ static void usb_write(void *opaque, hwaddr offset,
         usb_gptimer_configure(s, idx, reload);
         break;
     }
+    case REG_VH_SETUP_LO:
+        s->vh_setup_lo = (uint32_t)value;
+        break;
+    case REG_VH_SETUP_HI:
+        s->vh_setup_hi = (uint32_t)value;
+        break;
+    case REG_VH_OUT_ADDR:
+        s->vh_out_addr = (uint32_t)value;
+        break;
+    case REG_VH_OUT_LEN:
+        s->vh_out_len = (uint32_t)value;
+        break;
+    case REG_VH_ACTION:
+        usb_vh_process_action(s, (uint32_t)value);
+        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "stmp3770-usb: write to unimplemented offset "
@@ -786,8 +1124,8 @@ static void usb_finalize(Object *obj)
 
 static const VMStateDescription vmstate_usb = {
     .name = "stmp3770-usb",
-    .version_id = 7,
-    .minimum_version_id = 7,
+    .version_id = 8,
+    .minimum_version_id = 8,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(usbcmd, STMP3770USBState),
         VMSTATE_UINT32(usbsts, STMP3770USBState),
@@ -821,6 +1159,11 @@ static const VMStateDescription vmstate_usb = {
         VMSTATE_PTIMER(port_reset_ptimer, STMP3770USBState),
         VMSTATE_PTIMER(otgsc_1ms_ptimer, STMP3770USBState),
         VMSTATE_PTIMER(frindex_ptimer, STMP3770USBState),
+        VMSTATE_UINT32_V(vh_setup_lo, STMP3770USBState, 8),
+        VMSTATE_UINT32_V(vh_setup_hi, STMP3770USBState, 8),
+        VMSTATE_UINT32_V(vh_out_addr, STMP3770USBState, 8),
+        VMSTATE_UINT32_V(vh_out_len, STMP3770USBState, 8),
+        VMSTATE_UINT32_V(vh_in_status, STMP3770USBState, 8),
         VMSTATE_END_OF_LIST()
     }
 };

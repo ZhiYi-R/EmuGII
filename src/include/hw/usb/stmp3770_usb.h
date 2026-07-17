@@ -25,6 +25,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770USBState, STMP3770_USB)
 /* Keep the pre-v3 migration stream layout while exposing only EP0 through EP4. */
 #define STMP3770_USB_MIGRATION_ENDPOINTS 8
 
+/* Device-mode dQH/dTD geometry (ChipIdea ARC USB IP). */
+#define USB_DQH_SIZE          64    /* bytes per queue head */
+#define USB_DTD_SIZE          32    /* bytes per transfer descriptor */
+#define USB_DTD_MAX_PAGES     5     /* page pointers per dTD */
+#define USB_DTD_PAGE_SIZE     4096  /* 4 KiB per page pointer */
+
+/* Virtual USB host test-injection registers (offset 0x800+, non-architectural). */
+#define REG_VH_ACTION         0x800
+#define REG_VH_SETUP_LO       0x804
+#define REG_VH_SETUP_HI       0x808
+#define REG_VH_OUT_ADDR       0x80C
+#define REG_VH_OUT_LEN        0x810
+#define REG_VH_IN_STATUS      0x814
+#define VH_ACTION_TYPE_SHIFT  5
+#define VH_ACTION_TRIGGER     (1U << 31)
+#define VH_ACTION_SETUP       0
+#define VH_ACTION_IN          1
+#define VH_ACTION_OUT         2
+#define VH_IN_STATUS_BYTES    0x0000FFFF
+#define VH_IN_STATUS_ERROR    (1U << 16)
+
 struct STMP3770USBState {
     SysBusDevice parent_obj;
 
@@ -63,6 +84,13 @@ struct STMP3770USBState {
     ptimer_state *port_reset_ptimer;
     ptimer_state *otgsc_1ms_ptimer;
     ptimer_state *frindex_ptimer;
+
+    /* Virtual USB host test-injection state (non-architectural). */
+    uint32_t vh_setup_lo;
+    uint32_t vh_setup_hi;
+    uint32_t vh_out_addr;
+    uint32_t vh_out_len;
+    uint32_t vh_in_status;
 };
 
 #endif /* STMP3770_USB_H */

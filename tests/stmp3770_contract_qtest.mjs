@@ -3599,6 +3599,259 @@ async function testUsbAddrSchedAndIaaContract() {
   });
 }
 
+/*
+ * USB Device Mode transfer contract: dQH/dTD parsing, SETUP injection,
+ * IN/OUT transfer completion, ENDPTCOMPLETE and USBSTS.UI.
+ *
+ * Uses the virtual USB host test-injection registers at offset 0x800 to
+ * simulate host-side USB transactions without a real USB host controller.
+ */
+async function testUsbDeviceTransferContract() {
+  await withMachine(async (machine) => {
+    const USBCMD = USB_BASE + 0x140;
+    const USBSTS = USB_BASE + 0x144;
+    const USBINTR = USB_BASE + 0x148;
+    const USBMODE = USB_BASE + 0x1a8;
+    const ENDPTLISTADDR = USB_BASE + 0x158;
+    const ENDPTSETUPSTAT = USB_BASE + 0x1ac;
+    const ENDPTPRIME = USB_BASE + 0x1b0;
+    const ENDPTSTAT = USB_BASE + 0x1b8;
+    const ENDPTCOMPLETE = USB_BASE + 0x1bc;
+    const ENDPTCTRL0 = USB_BASE + 0x1c0;
+
+    /* Virtual host registers. */
+    const VH_ACTION = USB_BASE + 0x800;
+    const VH_SETUP_LO = USB_BASE + 0x804;
+    const VH_SETUP_HI = USB_BASE + 0x808;
+    const VH_OUT_ADDR = USB_BASE + 0x80c;
+    const VH_OUT_LEN = USB_BASE + 0x810;
+    const VH_IN_STATUS = USB_BASE + 0x814;
+
+    /* dQH/dTD geometry. */
+    const DQH_SIZE = 64;
+    const DTD_ACTIVE = 1;
+    const DTD_IOC = 1 << 15;
+    const DTD_TERMINATE = 1;
+
+    /* Use OCRAM for dQH list, dTDs and data buffers. */
+    const QH_BASE = 0x00010000;  /* 64-byte aligned */
+    const EP0_RX_QH = QH_BASE + 0 * DQH_SIZE;  /* EP0 OUT */
+    const EP0_TX_QH = QH_BASE + 1 * DQH_SIZE;  /* EP0 IN  */
+    const IN_DATA_BUF = 0x00010400;  /* buffer for IN transfer data */
+    const OUT_DATA_BUF = 0x00010800;  /* buffer for OUT transfer source data */
+
+    /* Reset controller and set device mode. */
+    await machine.writel(USBCMD, 0x00000002);
+    assert.equal(await machine.readl(USBCMD), 0x00080000);
+    await machine.writel(USBMODE, 0x00000002);
+    assert.equal(await machine.readl(USBMODE), 0x00000002);
+
+    /* Set endpoint list address. */
+    await machine.writel(ENDPTLISTADDR, QH_BASE);
+    assert.equal(
+      await machine.readl(ENDPTLISTADDR),
+      QH_BASE,
+      'USBCTRL ENDPTLISTADDR must accept the dQH base address',
+    );
+
+    /* Enable USB interrupt (USBSTS.UI). */
+    await machine.writel(USBINTR, 0x00000001);
+
+    /*
+     * Set up EP0 TX (IN) dQH with an active dTD in the overlay.
+     * The overlay starts at QH offset 0x08.
+     * - next = T (terminate, no next dTD)
+     * - token = ACTIVE | IOC | (8 << 16)  (8 bytes to transfer)
+     * - page[0] = IN_DATA_BUF
+     */
+    const tx_qh_overlay = EP0_TX_QH + 0x08;
+    await machine.writel(tx_qh_overlay + 0x00, DTD_TERMINATE);
+    await machine.writel(tx_qh_overlay + 0x04, DTD_ACTIVE | DTD_IOC | (8 << 16));
+    await machine.writel(tx_qh_overlay + 0x08, IN_DATA_BUF);
+
+    /* Write test data to the IN buffer. */
+    await machine.writel(IN_DATA_BUF, 0x44332211);
+    await machine.writel(IN_DATA_BUF + 4, 0x88776655);
+
+    /* Prime EP0 TX (IN) - bit 16 in ENDPTPRIME. */
+    await machine.writel(ENDPTPRIME, 1 << 16);
+    assert.equal(
+      (await machine.readl(ENDPTSTAT)) & (1 << 16),
+      1 << 16,
+      'USBCTRL ENDPTPRIME for EP0 TX must set ENDPTSTAT bit 16',
+    );
+
+    /* Trigger IN transfer via virtual host. */
+    await machine.writel(VH_ACTION, ((1 << 5) | 0 | (1 << 31)) >>> 0);  /* ep=0, IN */
+
+    /* Verify ENDPTCOMPLETE (TX bit = 16 + ep = 16). */
+    assert.equal(
+      (await machine.readl(ENDPTCOMPLETE)) & (1 << 16),
+      1 << 16,
+      'USBCTRL IN transfer must set ENDPTCOMPLETE TX bit for EP0',
+    );
+
+    /* Verify ENDPTSTAT is cleared for the completed endpoint. */
+    assert.equal(
+      (await machine.readl(ENDPTSTAT)) & (1 << 16),
+      0,
+      'USBCTRL ENDPTSTAT must clear after IN transfer completes',
+    );
+
+    /* Verify USBSTS.UI is set. */
+    assert.equal(
+      (await machine.readl(USBSTS)) & 0x01,
+      0x01,
+      'USBCTRL IN transfer must set USBSTS.UI',
+    );
+
+    /* Verify ICOLL source 11 is asserted. */
+    assert.notEqual(
+      (await machine.readl(ICOLL_BASE + 0x040)) & (1 << 11),
+      0,
+      'USBCTRL UI interrupt must assert ICOLL source 11',
+    );
+
+    /* Verify dTD status: active bit cleared, bytes transferred = 8. */
+    const tx_token = await machine.readl(tx_qh_overlay + 0x04);
+    assert.equal(
+      tx_token & DTD_ACTIVE,
+      0,
+      'USBCTRL IN transfer must clear dTD active bit',
+    );
+    assert.equal(
+      (tx_token >> 16) & 0x7FFF,
+      8,
+      'USBCTRL IN transfer must record 8 bytes transferred in dTD',
+    );
+
+    /* Verify VH_IN_STATUS reports bytes transferred. */
+    assert.equal(
+      await machine.readl(VH_IN_STATUS),
+      8,
+      'USBCTRL virtual host IN status must report 8 bytes transferred',
+    );
+
+    /* Clear ENDPTCOMPLETE and USBSTS.UI. */
+    await machine.writel(ENDPTCOMPLETE, 1 << 16);
+    await machine.writel(USBSTS, 0x01);
+    assert.equal(await machine.readl(USBSTS) & 0x01, 0);
+
+    /*
+     * Set up EP0 RX (OUT) dQH with an active dTD in the overlay.
+     * - next = T (terminate)
+     * - token = ACTIVE | IOC | (16 << 16)  (16 bytes to receive)
+     * - page[0] = IN_DATA_BUF + 0x100 (reuse OCRAM area for receive buffer)
+     */
+    const OUT_RECV_BUF = IN_DATA_BUF + 0x200;
+    const rx_qh_overlay = EP0_RX_QH + 0x08;
+    await machine.writel(rx_qh_overlay + 0x00, DTD_TERMINATE);
+    await machine.writel(rx_qh_overlay + 0x04, DTD_ACTIVE | DTD_IOC | (16 << 16));
+    await machine.writel(rx_qh_overlay + 0x08, OUT_RECV_BUF);
+
+    /* Write OUT data to guest memory (simulating host sending data). */
+    for (let i = 0; i < 4; i++) {
+      await machine.writel(OUT_DATA_BUF + i * 4, (0xAABBCCDD ^ (i << 24)) >>> 0);
+    }
+
+    /* Prime EP0 RX (OUT) - bit 0 in ENDPTPRIME. */
+    await machine.writel(ENDPTPRIME, 1 << 0);
+    assert.equal(
+      (await machine.readl(ENDPTSTAT)) & (1 << 0),
+      1 << 0,
+      'USBCTRL ENDPTPRIME for EP0 RX must set ENDPTSTAT bit 0',
+    );
+
+    /* Set up virtual host OUT data and trigger OUT transfer. */
+    await machine.writel(VH_OUT_ADDR, OUT_DATA_BUF);
+    await machine.writel(VH_OUT_LEN, 16);
+    await machine.writel(VH_ACTION, ((2 << 5) | 0 | (1 << 31)) >>> 0);  /* ep=0, OUT */
+
+    /* Verify ENDPTCOMPLETE (RX bit = ep = 0). */
+    assert.equal(
+      (await machine.readl(ENDPTCOMPLETE)) & (1 << 0),
+      1 << 0,
+      'USBCTRL OUT transfer must set ENDPTCOMPLETE RX bit for EP0',
+    );
+
+    /* Verify USBSTS.UI is set. */
+    assert.equal(
+      (await machine.readl(USBSTS)) & 0x01,
+      0x01,
+      'USBCTRL OUT transfer must set USBSTS.UI',
+    );
+
+    /* Verify dTD status: active bit cleared, bytes transferred = 16. */
+    const rx_token = await machine.readl(rx_qh_overlay + 0x04);
+    assert.equal(
+      rx_token & DTD_ACTIVE,
+      0,
+      'USBCTRL OUT transfer must clear dTD active bit',
+    );
+    assert.equal(
+      (rx_token >> 16) & 0x7FFF,
+      16,
+      'USBCTRL OUT transfer must record 16 bytes transferred in dTD',
+    );
+
+    /* Verify received data matches what the host sent. */
+    for (let i = 0; i < 4; i++) {
+      assert.equal(
+        await machine.readl(OUT_RECV_BUF + i * 4),
+        (0xAABBCCDD ^ (i << 24)) >>> 0,
+        `USBCTRL OUT transfer must write correct data to dTD buffer word ${i}`,
+      );
+    }
+
+    /* Clear completion and status. */
+    await machine.writel(ENDPTCOMPLETE, 1 << 0);
+    await machine.writel(USBSTS, 0x01);
+
+    /*
+     * SETUP packet injection: write SETUP data to virtual host registers
+     * and trigger SETUP action. The controller must write the 8-byte SETUP
+     * data to the dQH setup buffer (offset 0x2C) and set ENDPTSETUPSTAT.
+     */
+    const setup_lo = 0x01234567;
+    const setup_hi = (0x89ABCDEF) >>> 0;
+    await machine.writel(VH_SETUP_LO, setup_lo);
+    await machine.writel(VH_SETUP_HI, setup_hi);
+    await machine.writel(VH_ACTION, ((0 << 5) | 0 | (1 << 31)) >>> 0);  /* ep=0, SETUP */
+
+    /* Verify ENDPTSETUPSTAT is set for EP0. */
+    assert.equal(
+      (await machine.readl(ENDPTSETUPSTAT)) & 0x01,
+      0x01,
+      'USBCTRL SETUP injection must set ENDPTSETUPSTAT for EP0',
+    );
+
+    /* Verify USBSTS.UI is set. */
+    assert.equal(
+      (await machine.readl(USBSTS)) & 0x01,
+      0x01,
+      'USBCTRL SETUP injection must set USBSTS.UI',
+    );
+
+    /* Verify SETUP data was written to the dQH setup buffer. */
+    assert.equal(
+      await machine.readl(EP0_RX_QH + 0x2C),
+      setup_lo,
+      'USBCTRL SETUP injection must write SETUP bytes 0-3 to dQH setup buffer',
+    );
+    assert.equal(
+      await machine.readl(EP0_RX_QH + 0x30),
+      setup_hi,
+      'USBCTRL SETUP injection must write SETUP bytes 4-7 to dQH setup buffer',
+    );
+
+    /* Clear ENDPTSETUPSTAT (W1C) and USBSTS.UI. */
+    await machine.writel(ENDPTSETUPSTAT, 0x01);
+    await machine.writel(USBSTS, 0x01);
+    assert.equal(await machine.readl(ENDPTSETUPSTAT), 0);
+    assert.equal(await machine.readl(USBSTS) & 0x01, 0);
+  });
+}
+
 async function testSspRegisterLayoutAndResetContract() {
   await withMachine(async (machine) => {
     for (const [name, base] of [['SSP1', SSP1_BASE], ['SSP2', SSP2_BASE]]) {
@@ -10208,6 +10461,7 @@ const tests = [
   ['USBCTRL GPTIMER contract', testUsbGptimerContract],
   ['USBCTRL FRINDEX and host status contract', testUsbFrindexAndStatusContract],
   ['USBCTRL addr/sched and IAA contract', testUsbAddrSchedAndIaaContract],
+  ['USBCTRL device transfer contract', testUsbDeviceTransferContract],
   ['SSP register layout and reset contract', testSspRegisterLayoutAndResetContract],
   ['SSP soft reset and clock gate contract', testSspSoftResetAndClockGateContract],
   ['SSP soft reset hold contract', testSspSoftResetHoldContract],
