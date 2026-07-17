@@ -10397,6 +10397,123 @@ async function testSbImageFillCommand() {
   }
 }
 
+/*
+ * NAND boot contract: NCB/LDLB search and firmware loading.
+ *
+ * Builds a minimal NAND image with:
+ *   Block 0 page 0: NCB (NAND Control Block)
+ *   Block 1 page 0: LDLB (Logical Drive Layout Block)
+ *   Block 2 page 0..N: SB firmware image (one 2K page per sector)
+ *
+ * The boot mode is set to GPMI ECC8 (bm=0xC) via the lcd-rs/lcd-data
+ * machine properties.  The ROM boot loader should find the NCB, parse
+ * the LDLB, load the firmware pages, and execute the SB image.
+ */
+async function testNandBootContract() {
+  const tmpDir = os.tmpdir();
+  const nandPath = path.join(tmpDir,
+    `stmp3770_nand_boot_${process.pid}_${Date.now()}.bin`);
+
+  const PAGE_SIZE = 2048;
+  const PAGES_PER_BLOCK = 64;
+  const BLOCK_SIZE = PAGE_SIZE * PAGES_PER_BLOCK;
+
+  /* Build a small SB firmware image (LOAD + JUMP). */
+  const payload = Buffer.alloc(4, 0);
+  payload.writeUInt32LE(0xDEADBEEF, 0);
+  const loadAddr = 0x00001000;
+  const jumpAddr = 0x00002000;
+
+  const sbImage = buildSbImage({
+    payload,
+    loadAddr,
+    jumpAddr,
+    jumpArg: 0xCAFEBABE,
+  });
+
+  /* Pad SB image to a multiple of PAGE_SIZE. */
+  const fwPages = Math.ceil(sbImage.length / PAGE_SIZE);
+  const fwPadded = Buffer.alloc(fwPages * PAGE_SIZE, 0xFF);
+  sbImage.copy(fwPadded);
+
+  /* NCB block (block 0 page 0). */
+  const ncb = Buffer.alloc(PAGE_SIZE, 0xFF);
+  ncb.writeUInt32LE(0x504D5453, 0);   /* 'STMP' */
+  /* Block1: NCB timing + geometry */
+  ncb[4] = 10;   /* data_setup */
+  ncb[5] = 8;    /* data_hold */
+  ncb[6] = 5;    /* address_setup */
+  ncb[7] = 6;    /* dsample_time */
+  ncb.writeUInt32LE(PAGE_SIZE, 8);          /* data_page_size = 2048 */
+  ncb.writeUInt32LE(PAGE_SIZE + 64, 12);    /* total_page_size = 2112 */
+  ncb.writeUInt32LE(PAGES_PER_BLOCK, 16);   /* sectors_per_block = 64 */
+  ncb.writeUInt32LE(0, 20);                 /* sector_in_page_mask = 0 */
+  ncb.writeUInt32LE(0, 24);                 /* sector_to_page_shift = 0 */
+  ncb.writeUInt32LE(1, 28);                 /* number_of_nands = 1 */
+  /* fingerprint2 at offset 44 */
+  ncb.writeUInt32LE(0x2042434E, 44);  /* 'NCB ' */
+  /* Block2: NCB ECC config (minimal) */
+  ncb.writeUInt32LE(2, 48);   /* num_row_bytes */
+  ncb.writeUInt32LE(2, 52);   /* num_column_bytes */
+  ncb.writeUInt32LE(1, 56);   /* total_internal_die */
+  ncb.writeUInt32LE(1, 60);   /* internal_planes_per_die */
+  ncb.writeUInt32LE(0, 64);   /* cell_type = SLC */
+  ncb.writeUInt32LE(1, 68);   /* ecc_type = RS_Ecc_8bit */
+  /* fingerprint3 at offset 128 */
+  ncb.writeUInt32LE(0x4E494252, 128);  /* 'RBIN' */
+
+  /* LDLB block (block 1 page 0). */
+  const ldlb = Buffer.alloc(PAGE_SIZE, 0xFF);
+  ldlb.writeUInt32LE(0x504D5453, 0);   /* 'STMP' */
+  /* Block1: LDLB version + NAND bitmap */
+  ldlb.writeUInt16LE(1, 4);    /* version major */
+  ldlb.writeUInt16LE(0, 6);    /* version minor */
+  ldlb.writeUInt16LE(0, 8);    /* version sub */
+  ldlb.writeUInt16LE(0, 10);   /* version reserved */
+  ldlb.writeUInt32LE(1, 12);   /* nand_bitmap = NAND0 */
+  /* fingerprint2 at offset 44 */
+  ldlb.writeUInt32LE(0x424C444C, 44);  /* 'LDLB' */
+  /* Block2: LDLB firmware location */
+  const fwStartBlock = 2;
+  const fwStartPage = fwStartBlock * PAGES_PER_BLOCK;
+  ldlb.writeUInt32LE(0, 48);           /* firmware_starting_nand = 0 */
+  ldlb.writeUInt32LE(fwStartPage, 52); /* firmware_starting_sector */
+  ldlb.writeUInt32LE(0, 56);           /* firmware_sector_stride = 0 */
+  ldlb.writeUInt32LE(fwPages, 60);     /* sectors_in_firmware */
+  /* fingerprint3 at offset 128 */
+  ldlb.writeUInt32LE(0x4C494252, 128);  /* 'RBIL' */
+
+  /* Assemble NAND image: block 0 (NCB) + block 1 (LDLB) + block 2 (firmware). */
+  const nandImage = Buffer.alloc(3 * BLOCK_SIZE, 0xFF);
+  ncb.copy(nandImage, 0 * BLOCK_SIZE);
+  ldlb.copy(nandImage, 1 * BLOCK_SIZE);
+  fwPadded.copy(nandImage, 2 * BLOCK_SIZE);
+
+  fs.writeFileSync(nandPath, nandImage);
+
+  try {
+    await withMachine(async (machine) => {
+      /* Verify the SB payload was loaded to loadAddr. */
+      const loaded = await machine.readl(loadAddr);
+      assert.equal(loaded, 0xDEADBEEF,
+        `NAND boot did not load SB payload: got 0x${loaded.toString(16)}`);
+
+      /* Verify the boot log mentions NCB and LDLB discovery. */
+      assert.match(machine.stderr, /NCB found in block 0/i,
+        `NCB search not logged: ${machine.stderr}`);
+      assert.match(machine.stderr, /LDLB found in block 1/i,
+        `LDLB search not logged: ${machine.stderr}`);
+      assert.match(machine.stderr, /STMP3770 SB: JUMP to 0x00002000/i,
+        `SB JUMP not logged: ${machine.stderr}`);
+    }, [
+      '-M', 'stmp3770,boot-lcd-rs=1,boot-lcd-data=0xC',
+      '-drive', `if=none,format=raw,file=${nandPath}`,
+    ]);
+  } finally {
+    try { fs.unlinkSync(nandPath); } catch (e) { /* ignore */ }
+  }
+}
+
 const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
   ['RTC reset and persistent0 contract', testRtcResetAndPersistent0Contract],
@@ -10562,6 +10679,7 @@ const tests = [
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
   ['SB image LOAD and JUMP contract', testSbImageLoadAndJump],
   ['SB image FILL command contract', testSbImageFillCommand],
+  ['NAND boot NCB/LDLB contract', testNandBootContract],
 ];
 
 const filter = process.env.EMUGII_QTEST_FILTER;

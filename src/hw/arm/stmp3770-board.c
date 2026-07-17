@@ -241,6 +241,209 @@ static void sb_get_image_key(STMP3770BoardState *s, uint8_t *key)
     }
 }
 
+/* ---- NCB/LDLB/DBBT NAND boot control block parsing ---- */
+
+#define NCB_FINGERPRINT1    0x504D5453  /* 'STMP' */
+#define NCB_FINGERPRINT2    0x2042434E  /* 'NCB ' */
+#define NCB_FINGERPRINT3    0x4E494252  /* 'RBIN' */
+#define LDLB_FINGERPRINT2   0x424C444C  /* 'LDLB' */
+#define LDLB_FINGERPRINT3   0x4C494252  /* 'RBIL' */
+#define DBBT_FINGERPRINT2   0x54424244  /* 'DBBT' */
+#define DBBT_FINGERPRINT3   0x44494252  /* 'RBID' */
+
+#define NCB_BOOT_SEARCH_BLOCKS  4   /* ROM searches blocks 0-3 for NCB */
+#define NCB_BOOT_READ_SIZE      2048 /* ROM reads first 2K of each page */
+
+/*
+ * NCB/LDLB/DBBT share a common 3-fingerprint layout (NCB_BootBlockStruct_t
+ * from NXP imx-kobs BootControlBlocks.h).  The structure is 144 bytes but
+ * only the first ~100 bytes contain fields used by the ROM boot loader.
+ *
+ * Layout:
+ *   [0]   FingerPrint1 ('STMP')
+ *   [4]   Block1 union (40 bytes): NCB timing+geometry / LDLB version+bitmap / DBBT bad-block counts
+ *   [44]  FingerPrint2 ('NCB '/'LDLB'/'DBBT')
+ *   [48]  Block2 union (80 bytes): NCB ECC config / LDLB firmware location / DBBT reserved
+ *   [128] FingerPrint3 ('RBIN'/'RBIL'/'RBID')
+ */
+typedef struct QEMU_PACKED NCBBootBlock {
+    uint32_t fingerprint1;
+    union {
+        struct QEMU_PACKED {
+            uint8_t  data_setup;
+            uint8_t  data_hold;
+            uint8_t  address_setup;
+            uint8_t  dsample_time;
+            uint32_t data_page_size;
+            uint32_t total_page_size;
+            uint32_t sectors_per_block;
+            uint32_t sector_in_page_mask;
+            uint32_t sector_to_page_shift;
+            uint32_t number_of_nands;
+        } ncb1;
+        struct QEMU_PACKED {
+            uint16_t ldlb_version_major;
+            uint16_t ldlb_version_minor;
+            uint16_t ldlb_version_sub;
+            uint16_t ldlb_version_reserved;
+            uint32_t nand_bitmap;
+        } ldlb1;
+        struct QEMU_PACKED {
+            uint32_t number_bb_nand0;
+            uint32_t number_bb_nand1;
+            uint32_t number_bb_nand2;
+            uint32_t number_bb_nand3;
+            uint32_t num_2k_pages_bb_nand0;
+            uint32_t num_2k_pages_bb_nand1;
+            uint32_t num_2k_pages_bb_nand2;
+            uint32_t num_2k_pages_bb_nand3;
+        } dbbt1;
+        uint32_t reserved1[10];
+    } block1;
+    uint32_t fingerprint2;
+    union {
+        struct QEMU_PACKED {
+            uint32_t num_row_bytes;
+            uint32_t num_column_bytes;
+            uint32_t total_internal_die;
+            uint32_t internal_planes_per_die;
+            uint32_t cell_type;
+            uint32_t ecc_type;
+            uint32_t ecc_block0_size;
+            uint32_t ecc_block_n_size;
+            uint32_t ecc_block0_ecc_level;
+            uint32_t num_ecc_blocks_per_page;
+            uint32_t metadata_bytes;
+            uint32_t erase_threshold;
+            uint32_t read1st_code;
+            uint32_t read2nd_code;
+            uint32_t boot_patch;
+            uint32_t patch_sectors;
+            uint32_t firmware_starting_nand2;
+        } ncb2;
+        struct QEMU_PACKED {
+            uint32_t firmware_starting_nand;
+            uint32_t firmware_starting_sector;
+            uint32_t firmware_sector_stride;
+            uint32_t sectors_in_firmware;
+            uint32_t firmware_starting_nand2;
+            uint32_t firmware_starting_sector2;
+            uint32_t firmware_sector_stride2;
+            uint32_t sectors_in_firmware2;
+            uint16_t firmware_version_major;
+            uint16_t firmware_version_minor;
+            uint16_t firmware_version_sub;
+            uint16_t firmware_version_reserved;
+            uint32_t discovered_bb_table_sector;
+            uint32_t discovered_bb_table_sector2;
+        } ldlb2;
+        uint32_t reserved2[20];
+    } block2;
+    uint32_t fingerprint3;
+} NCBBootBlock;
+
+QEMU_BUILD_BUG_MSG(sizeof(NCBBootBlock) != 132, "NCB boot block size mismatch");
+
+/*
+ * Read the data portion of a NAND page from the GPMI storage backend.
+ * Returns true on success, false if the page is out of range or no storage.
+ */
+static bool stmp3770_nand_read_page(STMP3770GPMIState *gpmi,
+                                    uint32_t page_row,
+                                    uint8_t *buf, uint32_t max_len)
+{
+    uint64_t data_offset;
+    uint32_t page_size;
+
+    if (!gpmi || !gpmi->storage) {
+        return false;
+    }
+
+    page_size = gpmi->page_size;
+    if (page_row >= (uint64_t)gpmi->pages_per_block * gpmi->num_blocks) {
+        return false;
+    }
+
+    if (gpmi->storage_layout == GPMI_STORAGE_LAYOUT_INTERLEAVED_OOB) {
+        data_offset = (uint64_t)page_row * (page_size + gpmi->oob_size);
+    } else {
+        data_offset = (uint64_t)page_row * page_size;
+    }
+
+    if (data_offset + page_size > gpmi->storage_size) {
+        return false;
+    }
+
+    uint32_t to_copy = MIN(page_size, max_len);
+    memcpy(buf, gpmi->storage + data_offset, to_copy);
+    return true;
+}
+
+/*
+ * Search for an NCB (NAND Control Block) in the first page of blocks 0-3.
+ * On success, fills in *ncb and returns the block index where it was found.
+ * Returns -1 if not found.
+ */
+static int stmp3770_boot_search_ncb(STMP3770GPMIState *gpmi,
+                                    NCBBootBlock *ncb)
+{
+    uint8_t page_data[NCB_BOOT_READ_SIZE];
+
+    for (int block = 0; block < NCB_BOOT_SEARCH_BLOCKS; block++) {
+        uint32_t page_row = (uint32_t)block * gpmi->pages_per_block;
+
+        if (!stmp3770_nand_read_page(gpmi, page_row, page_data,
+                                     sizeof(page_data))) {
+            continue;
+        }
+
+        memcpy(ncb, page_data, sizeof(*ncb));
+
+        if (ncb->fingerprint1 == NCB_FINGERPRINT1 &&
+            ncb->fingerprint2 == NCB_FINGERPRINT2 &&
+            ncb->fingerprint3 == NCB_FINGERPRINT3) {
+            return block;
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * Search for an LDLB (Logical Drive Layout Block) in the first page of
+ * the block after the NCB block.  On success, fills in *ldlb and returns
+ * the block index.  Returns -1 if not found.
+ */
+static int stmp3770_boot_search_ldlb(STMP3770GPMIState *gpmi,
+                                     int ncb_block,
+                                     NCBBootBlock *ldlb)
+{
+    uint8_t page_data[NCB_BOOT_READ_SIZE];
+    int ldlb_block = ncb_block + 1;
+    uint32_t page_row;
+
+    if (ldlb_block >= gpmi->num_blocks) {
+        return -1;
+    }
+
+    page_row = (uint32_t)ldlb_block * gpmi->pages_per_block;
+
+    if (!stmp3770_nand_read_page(gpmi, page_row, page_data,
+                                 sizeof(page_data))) {
+        return -1;
+    }
+
+    memcpy(ldlb, page_data, sizeof(*ldlb));
+
+    if (ldlb->fingerprint1 == NCB_FINGERPRINT1 &&
+        ldlb->fingerprint2 == LDLB_FINGERPRINT2 &&
+        ldlb->fingerprint3 == LDLB_FINGERPRINT3) {
+        return ldlb_block;
+    }
+
+    return -1;
+}
+
 /*
  * Parse and execute an SB boot image.
  *
@@ -768,7 +971,112 @@ static STMP3770BootResult stmp3770_boot_load_ssp(STMP3770BoardState *s,
 static STMP3770BootResult stmp3770_boot_load_gpmi(STMP3770BoardState *s,
                                                   hwaddr *entry, bool ecc8)
 {
-    return STMP3770_BOOT_RESULT_FAILED;
+    STMP3770GPMIState *gpmi = s->soc.gpmi;
+    NCBBootBlock ncb, ldlb;
+    int ncb_block, ldlb_block;
+    uint32_t fw_start_sector, fw_sectors;
+    uint32_t page_size, pages_per_block;
+    uint8_t *fw_data;
+    uint32_t fw_size;
+    uint32_t page_row;
+    uint32_t copied;
+
+    if (!gpmi || !gpmi->storage) {
+        info_report("STMP3770 boot: GPMI has no NAND backing, skipping NAND boot");
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    page_size = gpmi->page_size;
+    pages_per_block = gpmi->pages_per_block;
+
+    /* Step 1: Search for NCB in the first page of blocks 0-3. */
+    ncb_block = stmp3770_boot_search_ncb(gpmi, &ncb);
+    if (ncb_block < 0) {
+        info_report("STMP3770 boot: NCB not found in NAND blocks 0-%d",
+                    NCB_BOOT_SEARCH_BLOCKS - 1);
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    info_report("STMP3770 boot: NCB found in block %d "
+                "(page_size=%u, sectors_per_block=%u, nands=%u)",
+                ncb_block, ncb.block1.ncb1.data_page_size,
+                ncb.block1.ncb1.sectors_per_block,
+                ncb.block1.ncb1.number_of_nands);
+
+    /* Step 2: Search for LDLB in the block after NCB. */
+    ldlb_block = stmp3770_boot_search_ldlb(gpmi, ncb_block, &ldlb);
+    if (ldlb_block < 0) {
+        info_report("STMP3770 boot: LDLB not found after NCB block %d",
+                    ncb_block);
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    fw_start_sector = ldlb.block2.ldlb2.firmware_starting_sector;
+    fw_sectors = ldlb.block2.ldlb2.sectors_in_firmware;
+
+    info_report("STMP3770 boot: LDLB found in block %d "
+                "(fw_start_sector=%u, fw_sectors=%u)",
+                ldlb_block, fw_start_sector, fw_sectors);
+
+    if (fw_sectors == 0) {
+        warn_report("STMP3770 boot: LDLB reports zero firmware sectors");
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    /*
+     * Step 3: Load firmware pages from NAND.
+     *
+     * The ROM reads firmware starting at the LDLB-specified sector,
+     * reading one NAND page per sector.  We assemble the pages into
+     * a contiguous buffer and then feed it to the SB image parser.
+     *
+     * For simplicity (and matching the ROM behavior for small images),
+     * we read fw_sectors pages sequentially, starting from the page
+     * at (fw_start_sector * pages_per_block / sectors_per_block) if
+     * sectors are block-aligned, or more commonly from page
+     * fw_start_sector directly when sector == page.
+     *
+     * In the STMP3770 ROM, "sector" means "2K page", so
+     * firmware_starting_sector is a page index.  For 2K pages this
+     * is a 1:1 mapping; for 4K pages the sector_to_page_shift applies.
+     */
+    uint32_t sector_to_page_shift = 0;
+    if (ncb.block1.ncb1.data_page_size > 0 &&
+        ncb.block1.ncb1.data_page_size != NCB_BOOT_READ_SIZE) {
+        sector_to_page_shift = ncb.block1.ncb1.sector_to_page_shift;
+    }
+
+    fw_size = fw_sectors * NCB_BOOT_READ_SIZE;
+    fw_data = g_malloc(fw_size);
+    copied = 0;
+
+    for (uint32_t i = 0; i < fw_sectors; i++) {
+        uint32_t sector_idx = fw_start_sector + i;
+        page_row = sector_idx << sector_to_page_shift;
+
+        if (!stmp3770_nand_read_page(gpmi, page_row,
+                                     fw_data + copied,
+                                     fw_size - copied)) {
+            warn_report("STMP3770 boot: failed to read firmware page %u "
+                        "(sector %u)", page_row, sector_idx);
+            g_free(fw_data);
+            return STMP3770_BOOT_RESULT_FAILED;
+        }
+
+        copied += MIN(page_size, fw_size - copied);
+        if (copied >= fw_size) {
+            break;
+        }
+    }
+
+    info_report("STMP3770 boot: loaded %u bytes of firmware from NAND",
+                copied);
+
+    /* Step 4: Parse and execute the SB image. */
+    bool ok = stmp3770_sb_parse_execute(s, fw_data, copied, entry);
+    g_free(fw_data);
+
+    return ok ? STMP3770_BOOT_RESULT_LOADED : STMP3770_BOOT_RESULT_FAILED;
 }
 
 /*
