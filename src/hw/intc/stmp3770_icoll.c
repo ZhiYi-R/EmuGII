@@ -611,6 +611,12 @@ static uint64_t stmp3770_icoll_read(void *opaque, hwaddr offset, unsigned size)
         }
         break;
 
+    case REG_LEVELACK:
+        /* LEVELACK is a write-only interrupt level acknowledge register;
+         * reads return 0 on hardware. */
+        value = 0;
+        break;
+
     case REG_CTRL:
         value = s->ctrl;
         break;
