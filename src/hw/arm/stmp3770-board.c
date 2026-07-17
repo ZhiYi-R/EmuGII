@@ -46,6 +46,7 @@
 #include "target/arm/cpu.h"
 #include "exec/cputlb.h"
 #include "block/aio.h"
+#include "crypto/aes.h"
 
 /* HP 39gII hardware: 512KB SRAM only, no external DRAM */
 #define STMP3770_BOARD_RAM_DEFAULT  (0)
@@ -62,6 +63,9 @@ struct STMP3770BoardState {
     /* Boot strap pins (modeled as board-level properties). */
     uint8_t boot_lcd_rs;
     uint8_t boot_lcd_data;
+
+    /* Optional SB image file for direct boot (bypasses boot media search). */
+    char *sb_image;
 
     /* Boot state machine state, exposed for introspection. */
     uint32_t boot_state;
@@ -97,6 +101,399 @@ static char *stmp3770_default_file(const char *name)
 static bool stmp3770_file_exists(const char *path)
 {
     return g_file_test(path, G_FILE_TEST_IS_REGULAR);
+}
+
+/* ------------------------------------------------------------------------- */
+/* SB (Safe Boot) image parser — STMP3770 boot image format v1.x             */
+/* ------------------------------------------------------------------------- */
+
+#define SB_BLOCK_SIZE          16
+#define SB_SIGNATURE_STMP      0x504D5453  /* 'STMP' */
+#define SB_SIGNATURE_SGTL      0x7367746C  /* 'sgtl' */
+
+/* SB boot image header (see elftosb / u-boot mxsimage.h) */
+typedef struct QEMU_PACKED SBBootImageHeader {
+    union {
+        uint8_t digest[20];     /* SHA1 of header (also CBC-MAC IV) */
+        struct {
+            uint8_t iv[16];     /* CBC-MAC initialization vector */
+            uint8_t extra[4];
+        };
+    };
+    uint8_t  signature1[4];     /* 'STMP' */
+    uint8_t  major_version;
+    uint8_t  minor_version;
+    uint16_t flags;
+    uint32_t image_blocks;      /* total size in 16-byte blocks */
+    uint32_t first_boot_tag_block;
+    uint32_t first_boot_section_id;
+    uint16_t key_count;
+    uint16_t key_dictionary_block;
+    uint16_t header_blocks;     /* header size in 16-byte blocks */
+    uint16_t section_count;
+    uint16_t section_header_size;
+    uint8_t  padding0[2];
+    uint8_t  signature2[4];     /* 'sgtl' (v1.1+) */
+    uint64_t timestamp_us;
+    uint16_t product_version_major;
+    uint16_t product_version_pad0;
+    uint16_t product_version_minor;
+    uint16_t product_version_pad1;
+    uint16_t product_version_revision;
+    uint16_t product_version_pad2;
+    uint16_t component_version_major;
+    uint16_t component_version_pad0;
+    uint16_t component_version_minor;
+    uint16_t component_version_pad1;
+    uint16_t component_version_revision;
+    uint16_t component_version_pad2;
+    uint16_t drive_tag;
+    uint8_t  padding1[6];
+} SBBootImageHeader;
+
+QEMU_BUILD_BUG_MSG(sizeof(SBBootImageHeader) != 96, "SB header size mismatch");
+
+/* Key dictionary entry */
+typedef struct QEMU_PACKED SBKeyDictionaryKey {
+    uint8_t cbc_mac[SB_BLOCK_SIZE];  /* CBC-MAC of section headers */
+    uint8_t key[SB_BLOCK_SIZE];      /* AES key encrypted by image key */
+} SBKeyDictionaryKey;
+
+/* Section header */
+typedef struct QEMU_PACKED SBSectionsHeader {
+    uint32_t section_number;
+    uint32_t section_offset;   /* offset in 16-byte blocks after TAG */
+    uint32_t section_size;     /* size in 16-byte blocks */
+    uint32_t section_flags;
+} SBSectionsHeader;
+
+#define SB_SECTION_FLAG_BOOTABLE  (1 << 0)
+
+/* Boot command tags */
+enum {
+    ROM_NOP_CMD  = 0x00,
+    ROM_TAG_CMD  = 0x01,
+    ROM_LOAD_CMD = 0x02,
+    ROM_FILL_CMD = 0x03,
+    ROM_JUMP_CMD = 0x04,
+    ROM_CALL_CMD = 0x05,
+    ROM_MODE_CMD = 0x06,
+};
+
+#define ROM_TAG_CMD_FLAG_LAST_TAG  0x1
+
+/* Boot command (16 bytes) */
+typedef struct QEMU_PACKED SBCommand {
+    uint8_t  checksum;
+    uint8_t  tag;
+    uint16_t flags;
+    uint32_t args[3];
+} SBCommand;
+
+QEMU_BUILD_BUG_MSG(sizeof(SBCommand) != SB_BLOCK_SIZE, "SB command size mismatch");
+
+/* AES-128 CBC decrypt one block in-place */
+static void sb_aes_cbc_decrypt_block(const AES_KEY *key, const uint8_t *iv,
+                                     uint8_t *block)
+{
+    uint8_t tmp[SB_BLOCK_SIZE];
+    AES_decrypt(block, tmp, key);
+    for (int i = 0; i < SB_BLOCK_SIZE; i++) {
+        tmp[i] ^= iv[i];
+    }
+    memcpy(block, tmp, SB_BLOCK_SIZE);
+}
+
+/* AES-128 CBC decrypt a buffer in-place */
+static void sb_aes_cbc_decrypt(const AES_KEY *key, uint8_t *buf,
+                               uint32_t len, const uint8_t *iv_in)
+{
+    uint8_t iv[SB_BLOCK_SIZE];
+    uint8_t prev_ct[SB_BLOCK_SIZE];
+
+    memcpy(iv, iv_in, SB_BLOCK_SIZE);
+    g_assert(len % SB_BLOCK_SIZE == 0);
+
+    for (uint32_t off = 0; off < len; off += SB_BLOCK_SIZE) {
+        memcpy(prev_ct, buf + off, SB_BLOCK_SIZE);
+        sb_aes_cbc_decrypt_block(key, iv, buf + off);
+        memcpy(iv, prev_ct, SB_BLOCK_SIZE);
+    }
+}
+
+/* Get the image key from OCOTP CRYPTO_KEY or zeros for unencrypted boot */
+static void sb_get_image_key(STMP3770BoardState *s, uint8_t *key)
+{
+    STMP3770State *soc = &s->soc;
+    uint32_t enable_unencrypted = soc->ocotp->rom[0] & (1U << 4);
+
+    if (enable_unencrypted || soc->ocotp->crypto[0] == 0) {
+        memset(key, 0, SB_BLOCK_SIZE);
+        return;
+    }
+
+    /* OCOTP CRYPTO0-3 provide the 128-bit AES key (4 × 32-bit LE words) */
+    for (int i = 0; i < 4; i++) {
+        key[i * 4 + 0] = soc->ocotp->crypto[i] & 0xFF;
+        key[i * 4 + 1] = (soc->ocotp->crypto[i] >> 8) & 0xFF;
+        key[i * 4 + 2] = (soc->ocotp->crypto[i] >> 16) & 0xFF;
+        key[i * 4 + 3] = (soc->ocotp->crypto[i] >> 24) & 0xFF;
+    }
+}
+
+/*
+ * Parse and execute an SB boot image.
+ *
+ * The SB image format (v1.x) is used by STMP3770/i.MX23/i.MX28 ROM boot
+ * loaders.  The image is divided into 16-byte blocks and may be
+ * AES-128 CBC encrypted.  Unencrypted images use a zero key with CBC
+ * pass-through (the data is still XORed through CBC-MAC but the key is
+ * all zeros, so the "decryption" is effectively a no-op on the plaintext).
+ *
+ * Layout:
+ *   [header (header_blocks × 16 bytes)]
+ *   [section headers (section_count × section_header_size × 16 bytes)]
+ *   [key dictionary (key_count × 32 bytes)]
+ *   [section data (tag + commands + load data)]
+ *   [SHA1 digest (16 bytes, encrypted)]
+ *
+ * Returns true if a JUMP/CALL command set the entry point.
+ */
+static bool stmp3770_sb_parse_execute(STMP3770BoardState *s,
+                                      uint8_t *data, uint32_t size,
+                                      hwaddr *entry)
+{
+    SBBootImageHeader *hdr;
+    AES_KEY aes_key;
+    uint8_t image_key[SB_BLOCK_SIZE];
+    uint8_t saved_iv[SB_BLOCK_SIZE];
+    uint32_t hdr_blocks, total_blocks;
+    uint32_t off;
+
+    if (size < sizeof(SBBootImageHeader)) {
+        error_report("STMP3770 SB: image too small (%u bytes)", size);
+        return false;
+    }
+
+    hdr = (SBBootImageHeader *)data;
+    total_blocks = size / SB_BLOCK_SIZE;
+
+    /* Save the first 16 bytes (ciphertext) as the IV for section data
+     * decryption (per u-boot mxsimage.c: sb_aes_reinit uses header.iv
+     * = first 16 bytes of encrypted header). */
+    memcpy(saved_iv, data, SB_BLOCK_SIZE);
+
+    /* Get the image key (zero for unencrypted, OCOTP CRYPTO_KEY for encrypted) */
+    sb_get_image_key(s, image_key);
+
+    /* Save the last ciphertext block of the header area — it is the IV
+     * for decrypting the section headers (the CBC chain continues from
+     * the header into the section headers during encryption). */
+    uint32_t hdr_bytes = sizeof(SBBootImageHeader);
+    uint8_t sect_hdr_iv[SB_BLOCK_SIZE];
+    memcpy(sect_hdr_iv, data + hdr_bytes - SB_BLOCK_SIZE, SB_BLOCK_SIZE);
+
+    /* Initialize AES-128 CBC decrypt with image key and IV = image key */
+    AES_set_decrypt_key(image_key, 128, &aes_key);
+    sb_aes_cbc_decrypt(&aes_key, data, hdr_bytes, image_key);
+
+    /* Verify signature */
+    if (ldl_le_p(hdr->signature1) != SB_SIGNATURE_STMP) {
+        error_report("STMP3770 SB: bad signature 0x%08x (expected 0x%08x)",
+                     ldl_le_p(hdr->signature1), SB_SIGNATURE_STMP);
+        return false;
+    }
+
+    hdr_blocks = hdr->header_blocks;
+    if (hdr_blocks == 0 || hdr_blocks > total_blocks) {
+        error_report("STMP3770 SB: invalid header_blocks %u", hdr_blocks);
+        return false;
+    }
+
+    if (hdr->image_blocks > total_blocks) {
+        error_report("STMP3770 SB: image_blocks %u > total %u",
+                     hdr->image_blocks, total_blocks);
+        return false;
+    }
+
+    info_report("STMP3770 SB: v%u.%u, %u blocks, %u sections, %u keys",
+                hdr->major_version, hdr->minor_version,
+                hdr->image_blocks, hdr->section_count, hdr->key_count);
+
+    /* Decrypt section headers (immediately after the header) */
+    off = hdr_blocks * SB_BLOCK_SIZE;
+    uint32_t sect_hdr_size = hdr->section_count * hdr->section_header_size
+                             * SB_BLOCK_SIZE;
+    if (off + sect_hdr_size > size) {
+        error_report("STMP3770 SB: section headers exceed image size");
+        return false;
+    }
+    sb_aes_cbc_decrypt(&aes_key, data + off, sect_hdr_size, sect_hdr_iv);
+    SBSectionsHeader *sects = (SBSectionsHeader *)(data + off);
+
+    /* Decrypt key dictionary (if present) */
+    if (hdr->key_count > 0) {
+        uint32_t key_off = hdr->key_dictionary_block * SB_BLOCK_SIZE;
+        uint32_t key_size = hdr->key_count * sizeof(SBKeyDictionaryKey);
+        if (key_off + key_size > size) {
+            error_report("STMP3770 SB: key dictionary exceeds image size");
+            return false;
+        }
+        /* Reinit AES with saved IV for key dictionary decryption */
+        sb_aes_cbc_decrypt(&aes_key, data + key_off, key_size, saved_iv);
+    }
+
+    /* Find the bootable section and execute its commands */
+    bool found_boot = false;
+    bool jumped = false;
+
+    for (uint16_t si = 0; si < hdr->section_count && !jumped; si++) {
+        SBSectionsHeader *sh = &sects[si];
+        if (!(sh->section_flags & SB_SECTION_FLAG_BOOTABLE)) {
+            continue;
+        }
+        if (sh->section_number != hdr->first_boot_section_id && found_boot) {
+            continue;
+        }
+        found_boot = true;
+
+        /* Section data starts at first_boot_tag_block for the boot section */
+        uint32_t tag_block = hdr->first_boot_tag_block;
+        if (tag_block >= total_blocks) {
+            error_report("STMP3770 SB: tag block %u out of range", tag_block);
+            break;
+        }
+
+        /* Decrypt and execute commands in this section */
+        uint32_t sect_end = tag_block + sh->section_size;
+        if (sect_end > total_blocks) {
+            sect_end = total_blocks;
+        }
+
+        /* Reinit AES for each section (IV = saved_iv) */
+        uint8_t cmd_iv[SB_BLOCK_SIZE];
+        memcpy(cmd_iv, saved_iv, SB_BLOCK_SIZE);
+
+        uint32_t cur_block = tag_block;
+        while (cur_block < sect_end && !jumped) {
+            uint8_t *cmd_ptr = data + cur_block * SB_BLOCK_SIZE;
+
+            /* Decrypt one command block */
+            uint8_t prev_ct[SB_BLOCK_SIZE];
+            memcpy(prev_ct, cmd_ptr, SB_BLOCK_SIZE);
+            sb_aes_cbc_decrypt_block(&aes_key, cmd_iv, cmd_ptr);
+            memcpy(cmd_iv, prev_ct, SB_BLOCK_SIZE);
+
+            SBCommand *cmd = (SBCommand *)cmd_ptr;
+
+            switch (cmd->tag) {
+            case ROM_NOP_CMD:
+                cur_block++;
+                break;
+
+            case ROM_TAG_CMD:
+                /* TAG marks the start of a section; reinit IV */
+                memcpy(cmd_iv, saved_iv, SB_BLOCK_SIZE);
+                cur_block++;
+                if (cmd->flags & ROM_TAG_CMD_FLAG_LAST_TAG) {
+                    jumped = true; /* stop after last tag */
+                }
+                break;
+
+            case ROM_LOAD_CMD: {
+                uint32_t addr = cmd->args[0];
+                uint32_t count = cmd->args[1]; /* in bytes */
+                uint32_t num_blocks = (count + SB_BLOCK_SIZE - 1) / SB_BLOCK_SIZE;
+                cur_block++;
+
+                if (cur_block + num_blocks > sect_end) {
+                    error_report("STMP3770 SB: LOAD data exceeds section");
+                    jumped = true;
+                    break;
+                }
+
+                /* Decrypt load data in-place */
+                uint8_t *load_data = data + cur_block * SB_BLOCK_SIZE;
+                /* Save last ciphertext block before in-place decrypt
+                 * overwrites it — it becomes the IV for the next command. */
+                uint8_t last_ct[SB_BLOCK_SIZE];
+                memcpy(last_ct, load_data + (num_blocks - 1) * SB_BLOCK_SIZE,
+                       SB_BLOCK_SIZE);
+                sb_aes_cbc_decrypt(&aes_key, load_data,
+                                   num_blocks * SB_BLOCK_SIZE, cmd_iv);
+                memcpy(cmd_iv, last_ct, SB_BLOCK_SIZE);
+
+                /* Write data to target address */
+                address_space_write(&address_space_memory, addr,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    load_data, count);
+
+                cur_block += num_blocks;
+                break;
+            }
+
+            case ROM_FILL_CMD: {
+                uint32_t addr = cmd->args[0];
+                uint32_t count = cmd->args[1]; /* in bytes */
+                uint32_t pattern = cmd->args[2];
+
+                /* Fill memory with pattern (32-bit pattern, count bytes) */
+                uint32_t pat_le = cpu_to_le32(pattern);
+                for (uint32_t i = 0; i < count; i += 4) {
+                    uint32_t sz = (count - i < 4) ? (count - i) : 4;
+                    address_space_write(&address_space_memory, addr + i,
+                                        MEMTXATTRS_UNSPECIFIED,
+                                        &pat_le, sz);
+                }
+                cur_block++;
+                break;
+            }
+
+            case ROM_JUMP_CMD: {
+                uint32_t addr = cmd->args[0];
+                uint32_t arg = cmd->args[2];
+                info_report("STMP3770 SB: JUMP to 0x%08x (r0=0x%08x)",
+                            addr, arg);
+                s->soc.cpu.env.regs[0] = arg;
+                *entry = addr;
+                jumped = true;
+                break;
+            }
+
+            case ROM_CALL_CMD: {
+                uint32_t addr = cmd->args[0];
+                uint32_t arg = cmd->args[2];
+                info_report("STMP3770 SB: CALL 0x%08x (r0=0x%08x)",
+                            addr, arg);
+                /* For CALL, set r0 and jump — the called function is
+                 * expected to return to the boot loader, but in QEMU
+                 * we treat it like JUMP for simplicity. */
+                s->soc.cpu.env.regs[0] = arg;
+                *entry = addr;
+                jumped = true;
+                break;
+            }
+
+            case ROM_MODE_CMD:
+                /* MODE command changes boot mode — not applicable after
+                 * the image is already loaded.  Skip. */
+                cur_block++;
+                break;
+
+            default:
+                error_report("STMP3770 SB: unknown command tag 0x%02x at "
+                             "block %u", cmd->tag, cur_block);
+                jumped = true;
+                break;
+            }
+        }
+    }
+
+    if (!found_boot) {
+        error_report("STMP3770 SB: no bootable section found");
+    }
+
+    return jumped;
 }
 
 /*
@@ -374,10 +771,51 @@ static STMP3770BootResult stmp3770_boot_load_gpmi(STMP3770BoardState *s,
     return STMP3770_BOOT_RESULT_FAILED;
 }
 
+/*
+ * Load and parse an SB image from a file specified by the `sb-image`
+ * machine property.  This bypasses the boot media search (NCB/LDLB/DBBT
+ * for NAND, config block for SPI, etc.) and directly parses the SB image,
+ * which is useful for testing the boot loader path without a full boot
+ * media image.
+ */
+static STMP3770BootResult stmp3770_boot_load_sb_file(STMP3770BoardState *s,
+                                                     hwaddr *entry)
+{
+    g_autofree char *path = NULL;
+    gsize size;
+    GError *err = NULL;
+    uint8_t *data;
+
+    if (!s->sb_image) {
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    path = g_strdup(s->sb_image);
+    if (!g_file_get_contents(path, (gchar **)&data, &size, &err)) {
+        warn_report("STMP3770 boot: could not read SB image '%s': %s",
+                    path, err->message);
+        g_error_free(err);
+        return STMP3770_BOOT_RESULT_FAILED;
+    }
+
+    info_report("STMP3770 boot: loading SB image '%s' (%lu bytes)",
+                path, (unsigned long)size);
+
+    bool ok = stmp3770_sb_parse_execute(s, data, size, entry);
+    g_free(data);
+
+    return ok ? STMP3770_BOOT_RESULT_LOADED : STMP3770_BOOT_RESULT_FAILED;
+}
+
 static STMP3770BootResult stmp3770_boot_load(STMP3770BoardState *s,
                                              hwaddr *entry)
 {
     STMP3770BootMode mode = s->boot_mode;
+
+    /* Direct SB image loading takes priority over boot media search */
+    if (s->sb_image) {
+        return stmp3770_boot_load_sb_file(s, entry);
+    }
 
     switch (mode) {
     case STMP3770_BOOT_MODE_USB:
@@ -468,6 +906,22 @@ static void stmp3770_board_set_boot_lcd_data(Object *obj, Visitor *v,
     STMP3770BoardState *s = STMP3770_BOARD(obj);
 
     visit_type_uint8(v, name, &s->boot_lcd_data, errp);
+}
+
+static char *stmp3770_board_get_sb_image(Object *obj, Error **errp)
+{
+    STMP3770BoardState *s = STMP3770_BOARD(obj);
+
+    return g_strdup(s->sb_image);
+}
+
+static void stmp3770_board_set_sb_image(Object *obj, const char *value,
+                                        Error **errp)
+{
+    STMP3770BoardState *s = STMP3770_BOARD(obj);
+
+    g_free(s->sb_image);
+    s->sb_image = g_strdup(value);
 }
 
 static void stmp3770_board_init(MachineState *machine)
@@ -665,6 +1119,12 @@ static void stmp3770_board_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "boot-lcd-data",
         "LCD_DATA[5:0] boot strap vector when boot-lcd-rs is 1");
+
+    object_class_property_add_str(oc, "sb-image",
+                                  stmp3770_board_get_sb_image,
+                                  stmp3770_board_set_sb_image);
+    object_class_property_set_description(oc, "sb-image",
+        "Path to an SB (Safe Boot) image file for direct boot loader parsing");
 }
 
 static const TypeInfo stmp3770_board_type = {

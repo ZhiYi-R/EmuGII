@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -45,7 +47,7 @@ const SRAM_BASE = 0x00000000;
 const OCROM_BASE = 0xffff0000;
 
 class QTestMachine {
-  constructor(port) {
+  constructor(port, extraArgs = []) {
     this.buffer = '';
     this.queue = [];
     this.waiters = [];
@@ -61,6 +63,7 @@ class QTestMachine {
         '-chardev', `socket,id=qtest,host=127.0.0.1,port=${port},server=on,wait=off`,
         '-accel', 'qtest',
         '-qtest', 'chardev:qtest',
+        ...extraArgs,
       ],
       {
         cwd: qemuCwd,
@@ -256,9 +259,9 @@ async function reservePort() {
   });
 }
 
-async function withMachine(fn) {
+async function withMachine(fn, extraArgs = []) {
   const port = await reservePort();
-  const machine = new QTestMachine(port);
+  const machine = new QTestMachine(port, extraArgs);
   machine.port = port;
   try {
     await machine.connect();
@@ -9777,6 +9780,370 @@ async function testOcotpLockAndShadowContract() {
   });
 }
 
+/* ------------------------------------------------------------------------- */
+/* SB (Safe Boot) image parser tests                                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Build a minimal unencrypted SB v1.1 image that LOADs a 4-byte payload
+ * to SRAM and then JUMPs to it.  The image uses a zero AES key (the
+ * unencrypted-boot default), so "encryption" is a pass-through CBC-MAC
+ * with an all-zero key.
+ *
+ * Layout (all offsets in 16-byte blocks):
+ *   [0 .. header_blocks-1]                : SB header (96 bytes + padding)
+ *   [header_blocks .. +sect_hdr_blocks-1] : section headers
+ *   [first_boot_tag_block .. ]            : TAG + LOAD cmd + data + JUMP cmd
+ *
+ * The QEMU parser decrypts in-place using AES-128-CBC with key=0 and IV=0,
+ * which for an all-zero key is equivalent to: plaintext = CBC_decrypt(ct).
+ * To keep the generator simple we pre-encrypt the payload by computing
+ * AES-128-CBC encrypt with key=0 and IV=0, so the parser's decrypt recovers
+ * the original plaintext.
+ *
+ * However, since we don't have AES available in Node stdlib, we take
+ * advantage of the fact that AES-128 with an all-zero key is NOT the
+ * identity function.  Instead, we use a different approach: we construct
+ * the image as plaintext and then encrypt it with a simple AES-128-CBC
+ * implementation using the Node.js `crypto` module.
+ */
+
+import crypto from 'node:crypto';
+
+const SB_BLOCK_SIZE_JS = 16;
+
+/**
+ * Encrypt a buffer with AES-128-CBC, no padding, using the given key and IV.
+ * Returns a new Buffer of the same length.
+ */
+function aesCbcEncrypt(key, iv, plaintext) {
+  const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
+  cipher.setAutoPadding(false);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+/**
+ * Build a minimal SB v1.1 image.
+ *
+ * @param {object} opts
+ * @param {Buffer} opts.payload - data to LOAD
+ * @param {number} opts.loadAddr - target address for LOAD
+ * @param {number} opts.jumpAddr - JUMP target address
+ * @param {number} opts.jumpArg - r0 argument for JUMP
+ * @returns {Buffer} - complete SB image (encrypted)
+ */
+function buildSbImage(opts) {
+  const key = Buffer.alloc(16, 0);  // zero key for unencrypted boot
+  const iv = Buffer.alloc(16, 0);   // initial IV = key
+
+  // Build the plaintext image, then encrypt it block-by-block using
+  // the same CBC chain the ROM parser will use to decrypt.
+  //
+  // The encryption order (per u-boot mxsimage.c sb_encrypt_image):
+  //   1. Header: AES-CBC encrypt with IV=key
+  //   2. Section headers: continue CBC chain (IV = last ct of header)
+  //   3. Key dictionary: reinit CBC with IV = header.iv (first 16 bytes of ct header)
+  //   4. Section data: for each section, reinit CBC with IV = header.iv
+  //      - TAG command: encrypt, then reinit IV
+  //      - LOAD command: encrypt cmd, then encrypt data (continuing chain)
+  //      - JUMP command: encrypt
+
+  // --- Build plaintext components ---
+
+  // SB Header (96 bytes = 6 blocks)
+  const header = Buffer.alloc(96, 0);
+  // digest/iv: first 16 bytes (will be overwritten by CBC-MAC, but for
+  // unencrypted boot the ROM uses IV = key = 0, so we leave it as zero)
+  // signature1 = 'STMP'
+  header.write('STMP', 20, 'ascii');
+  // major_version = 1, minor_version = 1
+  header[24] = 1;
+  header[25] = 1;
+  // flags = 0
+  header.writeUInt16LE(0, 26);
+  // image_blocks: fill in later
+  // first_boot_tag_block: fill in later
+  // first_boot_section_id = 0
+  header.writeUInt32LE(0, 36);
+  // key_count = 0 (unencrypted, no key dictionary)
+  header.writeUInt16LE(0, 40);
+  // key_dictionary_block = 0
+  header.writeUInt16LE(0, 42);
+  // header_blocks = 6 (96 bytes / 16)
+  header.writeUInt16LE(6, 44);
+  // section_count = 1
+  header.writeUInt16LE(1, 46);
+  // section_header_size = 1 (16 bytes / 16 = 1 block per section header)
+  header.writeUInt16LE(1, 48);
+  // padding0[2] = 0
+  // signature2 = 'sgtl' (v1.1)
+  header.write('sgtl', 52, 'ascii');
+  // timestamp_us = 0
+  // product version = 1.0.0
+  header.writeUInt16LE(1, 64);
+  // component version = 1.0.0
+  header.writeUInt16LE(1, 76);
+  // drive_tag = 0
+  // padding1[6] = 0
+
+  const headerBlocks = 6;
+  const sectHdrBlocks = 1;  // 1 section × 1 block
+  const firstBootTagBlock = headerBlocks + sectHdrBlocks;  // block 7
+
+  // Section header (16 bytes)
+  const sectHdr = Buffer.alloc(16, 0);
+  sectHdr.writeUInt32LE(0, 0);  // section_number = 0
+  sectHdr.writeUInt32LE(0, 4);  // section_offset = 0 (after TAG)
+  // section_size: TAG(1) + LOAD cmd(1) + data blocks + JUMP cmd(1)
+  const payloadBlocks = Math.ceil(opts.payload.length / SB_BLOCK_SIZE_JS);
+  const sectionSize = 1 + 1 + payloadBlocks + 1;
+  sectHdr.writeUInt32LE(sectionSize, 8);  // section_size
+  sectHdr.writeUInt32LE(1, 12);  // section_flags = BOOTABLE
+
+  // TAG command (16 bytes)
+  const tagCmd = Buffer.alloc(16, 0);
+  tagCmd[1] = 0x01;  // ROM_TAG_CMD
+  tagCmd.writeUInt16LE(0, 2);  // flags = 0 (not last)
+
+  // LOAD command (16 bytes)
+  const loadCmd = Buffer.alloc(16, 0);
+  loadCmd[1] = 0x02;  // ROM_LOAD_CMD
+  loadCmd.writeUInt32LE(opts.loadAddr, 4);   // address
+  loadCmd.writeUInt32LE(opts.payload.length, 8);  // count (bytes)
+  // CRC32 of payload (we compute it properly)
+  const crc32 = crypto.createHash('crc32' in crypto ? 'crc32' : 'sha256');
+  // Node.js doesn't have CRC32 in stdlib; compute manually
+  const crc = crc32ofBuffer(opts.payload);
+  loadCmd.writeUInt32LE(crc, 12);  // crc32
+
+  // JUMP command (16 bytes)
+  const jumpCmd = Buffer.alloc(16, 0);
+  jumpCmd[1] = 0x04;  // ROM_JUMP_CMD
+  jumpCmd.writeUInt32LE(opts.jumpAddr, 4);  // address
+  jumpCmd.writeUInt32LE(0, 8);  // reserved
+  jumpCmd.writeUInt32LE(opts.jumpArg, 12);  // argument (r0)
+
+  // Pad payload to block boundary
+  const payloadPadded = Buffer.alloc(payloadBlocks * SB_BLOCK_SIZE_JS, 0);
+  opts.payload.copy(payloadPadded);
+
+  // Total image blocks
+  const totalBlocks = firstBootTagBlock + sectionSize;
+  // Update header fields
+  header.writeUInt32LE(totalBlocks, 28);  // image_blocks
+  header.writeUInt32LE(firstBootTagBlock, 32);  // first_boot_tag_block
+
+  // --- Assemble plaintext and encrypt ---
+
+  // The ROM encryption process:
+  // 1. Encrypt header with IV=key(=0)
+  // 2. Encrypt section headers continuing the CBC chain
+  // 3. (no key dictionary since key_count=0)
+  // 4. For the section: reinit IV = header.iv (first 16 bytes of ENCRYPTED header)
+  //    - Encrypt TAG, then reinit IV
+  //    - Encrypt LOAD cmd, then encrypt data continuing chain
+  //    - Encrypt JUMP cmd
+
+  // Step 1: Encrypt header
+  const encHeader = aesCbcEncrypt(key, iv, header);
+  // The "saved IV" for later sections = first 16 bytes of encrypted header
+  const savedIv = encHeader.subarray(0, 16);
+
+  // Step 2: Encrypt section header continuing chain (IV = last ct block of header)
+  const lastHeaderCt = encHeader.subarray(encHeader.length - 16);
+  const encSectHdr = aesCbcEncrypt(key, lastHeaderCt, sectHdr);
+
+  // Step 4: Section data with IV = savedIv
+  // Encrypt TAG
+  let sectionIv = Buffer.from(savedIv);
+  const encTagCmd = aesCbcEncrypt(key, sectionIv, tagCmd);
+  // After TAG, reinit IV = savedIv (per mxsimage.c: sb_aes_reinit after TAG)
+  sectionIv = Buffer.from(savedIv);
+
+  // Encrypt LOAD cmd
+  const encLoadCmd = aesCbcEncrypt(key, sectionIv, loadCmd);
+  // Continue chain: IV = last ct of LOAD cmd
+  sectionIv = encLoadCmd.subarray(encLoadCmd.length - 16);
+  // Encrypt payload data
+  const encPayload = aesCbcEncrypt(key, sectionIv, payloadPadded);
+  // Continue chain: IV = last ct of payload
+  sectionIv = encPayload.subarray(encPayload.length - 16);
+  // Encrypt JUMP cmd
+  const encJumpCmd = aesCbcEncrypt(key, sectionIv, jumpCmd);
+
+  // Assemble final image
+  const image = Buffer.concat([
+    encHeader,     // 96 bytes
+    encSectHdr,    // 16 bytes
+    encTagCmd,     // 16 bytes
+    encLoadCmd,    // 16 bytes
+    encPayload,    // payloadBlocks * 16
+    encJumpCmd,    // 16 bytes
+  ]);
+
+  return image;
+}
+
+/* Simple CRC32 (IEEE 802.3 polynomial 0xEDB88320) */
+function crc32ofBuffer(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      if (crc & 1) {
+        crc = (crc >>> 1) ^ 0xEDB88320;
+      } else {
+        crc = crc >>> 1;
+      }
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+async function testSbImageLoadAndJump() {
+  const tmpDir = os.tmpdir();
+  const sbPath = path.join(tmpDir, `stmp3770_sb_test_${process.pid}_${Date.now()}.sb`);
+
+  // Payload: a small ARM program that writes 0x12345678 to 0x100 and loops
+  // MOV R0, #0x12345678 -> actually we just load a 4-byte value
+  // The payload is just 4 bytes: 0xDEADBEEF
+  const payload = Buffer.alloc(4, 0);
+  payload.writeUInt32LE(0xDEADBEEF, 0);
+
+  const loadAddr = 0x00001000;  // SRAM + 4KB
+  const jumpAddr = 0x00002000;  // SRAM + 8KB
+
+  const image = buildSbImage({
+    payload,
+    loadAddr,
+    jumpAddr,
+    jumpArg: 0xCAFEBABE,
+  });
+
+  fs.writeFileSync(sbPath, image);
+
+  try {
+    await withMachine(async (machine) => {
+      // The SB image should have been parsed during machine init.
+      // Verify that the payload was loaded to loadAddr.
+      const loaded = await machine.readl(loadAddr);
+      assert.equal(loaded, 0xDEADBEEF,
+        `SB LOAD did not write payload: got 0x${loaded.toString(16)}`);
+
+      // Verify that the CPU entry point was set to jumpAddr
+      // and r0 was set to jumpArg.
+      // In qtest mode, we can check PC via the ARM CPU regs.
+      // The boot loader sets env.regs[15] = jumpAddr and env.regs[0] = jumpArg.
+      // We can read PC through the monitor or by checking that execution
+      // would start at jumpAddr.  Since qtest doesn't execute instructions,
+      // we verify via the stderr log which should contain the JUMP message.
+      assert.match(machine.stderr, /STMP3770 SB: JUMP to 0x00002000/i,
+        `SB JUMP not logged in stderr: ${machine.stderr}`);
+
+      // Verify r0 was set to jumpArg
+      // We can read the CPU register via 'readl' on the CPU state...
+      // Actually, qtest doesn't expose CPU regs directly.  The stderr
+      // log confirms the JUMP command was executed with the right args.
+      assert.match(machine.stderr, /r0=0xcafebabe/i,
+        `SB JUMP r0 arg not logged: ${machine.stderr}`);
+    }, ['-M', 'stmp3770,sb-image=' + sbPath]);
+  } finally {
+    try { fs.unlinkSync(sbPath); } catch (e) { /* ignore */ }
+  }
+}
+
+async function testSbImageFillCommand() {
+  const tmpDir = os.tmpdir();
+  const sbPath = path.join(tmpDir, `stmp3770_sb_fill_${process.pid}_${Date.now()}.sb`);
+
+  // Build an SB image with a FILL command instead of LOAD.
+  // We need a custom builder for this.
+
+  const key = Buffer.alloc(16, 0);
+  const iv = Buffer.alloc(16, 0);
+
+  const fillAddr = 0x00003000;
+  const fillCount = 16;  // 16 bytes
+  const fillPattern = 0xAABBCCDD;
+
+  // SB Header
+  const header = Buffer.alloc(96, 0);
+  header.write('STMP', 20, 'ascii');
+  header[24] = 1; header[25] = 1;
+  header.writeUInt16LE(0, 26);
+  header.writeUInt32LE(0, 36);  // first_boot_section_id
+  header.writeUInt16LE(0, 40);  // key_count
+  header.writeUInt16LE(0, 42);  // key_dictionary_block
+  header.writeUInt16LE(6, 44);  // header_blocks
+  header.writeUInt16LE(1, 46);  // section_count
+  header.writeUInt16LE(1, 48);  // section_header_size
+  header.write('sgtl', 52, 'ascii');
+  header.writeUInt16LE(1, 64);  // product version
+  header.writeUInt16LE(1, 76);  // component version
+
+  const headerBlocks = 6;
+  const sectHdrBlocks = 1;
+  const firstBootTagBlock = headerBlocks + sectHdrBlocks;
+
+  // Section: TAG + FILL + JUMP
+  const sectionSize = 1 + 1 + 1;  // TAG + FILL + JUMP
+  const totalBlocks = firstBootTagBlock + sectionSize;
+
+  header.writeUInt32LE(totalBlocks, 28);
+  header.writeUInt32LE(firstBootTagBlock, 32);
+
+  const sectHdr = Buffer.alloc(16, 0);
+  sectHdr.writeUInt32LE(0, 0);
+  sectHdr.writeUInt32LE(0, 4);
+  sectHdr.writeUInt32LE(sectionSize, 8);
+  sectHdr.writeUInt32LE(1, 12);  // BOOTABLE
+
+  const tagCmd = Buffer.alloc(16, 0);
+  tagCmd[1] = 0x01;
+
+  const fillCmd = Buffer.alloc(16, 0);
+  fillCmd[1] = 0x03;  // ROM_FILL_CMD
+  fillCmd.writeUInt32LE(fillAddr, 4);
+  fillCmd.writeUInt32LE(fillCount, 8);
+  fillCmd.writeUInt32LE(fillPattern, 12);
+
+  const jumpCmd = Buffer.alloc(16, 0);
+  jumpCmd[1] = 0x04;
+  jumpCmd.writeUInt32LE(0x00002000, 4);
+  jumpCmd.writeUInt32LE(0, 8);
+  jumpCmd.writeUInt32LE(0, 12);
+
+  // Encrypt
+  const encHeader = aesCbcEncrypt(key, iv, header);
+  const savedIv = encHeader.subarray(0, 16);
+  const lastHeaderCt = encHeader.subarray(encHeader.length - 16);
+  const encSectHdr = aesCbcEncrypt(key, lastHeaderCt, sectHdr);
+
+  let sectionIv = Buffer.from(savedIv);
+  const encTagCmd = aesCbcEncrypt(key, sectionIv, tagCmd);
+  sectionIv = Buffer.from(savedIv);
+  const encFillCmd = aesCbcEncrypt(key, sectionIv, fillCmd);
+  sectionIv = encFillCmd.subarray(encFillCmd.length - 16);
+  const encJumpCmd = aesCbcEncrypt(key, sectionIv, jumpCmd);
+
+  const image = Buffer.concat([encHeader, encSectHdr, encTagCmd, encFillCmd, encJumpCmd]);
+  fs.writeFileSync(sbPath, image);
+
+  try {
+    await withMachine(async (machine) => {
+      // Verify FILL wrote the pattern to memory
+      for (let i = 0; i < fillCount; i += 4) {
+        const val = await machine.readl(fillAddr + i);
+        assert.equal(val, fillPattern,
+          `SB FILL pattern mismatch at 0x${(fillAddr + i).toString(16)}: ` +
+          `got 0x${val.toString(16)}, expected 0x${fillPattern.toString(16)}`);
+      }
+    }, ['-M', 'stmp3770,sb-image=' + sbPath]);
+  } finally {
+    try { fs.unlinkSync(sbPath); } catch (e) { /* ignore */ }
+  }
+}
+
 const tests = [
   ['RTC 1ms IRQ routing', testRtc1MsecIrq],
   ['RTC reset and persistent0 contract', testRtcResetAndPersistent0Contract],
@@ -9939,6 +10306,8 @@ const tests = [
   ['CLKCTRL CLKSEQ gate contract', testClkctrlClkseqGateContract],
   ['OCOTP bank-open contract', testOcotpBankOpenContract],
   ['OCOTP lock and shadow contract', testOcotpLockAndShadowContract],
+  ['SB image LOAD and JUMP contract', testSbImageLoadAndJump],
+  ['SB image FILL command contract', testSbImageFillCommand],
 ];
 
 const filter = process.env.EMUGII_QTEST_FILTER;
