@@ -27,9 +27,9 @@
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "ui/pixel_ops.h"
-#include "ui/vgafont.h"
 #include "hw/display/framebuffer.h"
 #include "hw/display/stmp3770_lcdif.h"
+#include "hw/display/hp39gii_frontpanel.h"
 
 #define LCDIF_VERSION   0x02000000
 
@@ -120,37 +120,6 @@
 
 #define REFRESH_RATE_HZ     60
 #define NS_PER_SEC          1000000000ULL
-
-#define FP_LCD_X        40
-#define FP_LCD_Y        50
-#define FP_LCD_SCALE    2
-#define FP_LCD_W        (STMP3770_LCDIF_VIEW_WIDTH * FP_LCD_SCALE)
-#define FP_LCD_H        (STMP3770_LCDIF_VIEW_HEIGHT * FP_LCD_SCALE)
-
-#define FP_STATUS_X     560
-#define FP_STATUS_Y     42
-#define FP_STATUS_W     430
-#define FP_STATUS_H     58
-
-#define FP_RIGHT_X      560
-#define FP_RIGHT_Y      130
-#define FP_KEY_W        72
-#define FP_KEY_H        40
-#define FP_KEY_GAP_X    20
-#define FP_KEY_GAP_Y    22
-
-#define FP_LEFT_X       64
-#define FP_LEFT_F_Y     385
-#define FP_LEFT_KEY_W   56
-#define FP_LEFT_KEY_H   32
-#define FP_LEFT_GAP_X   22
-
-#define FP_NAV_X        325
-#define FP_NAV_Y        410
-#define FP_NAV_SIZE     150
-
-#define HP39GII_KEY(row, col) (((row) << 3) | (col))
-#define HP39GII_KEY_NONE (-1)
 
 static inline bool lcdif_enabled(STMP3770LCDIFState *s)
 {
@@ -317,6 +286,18 @@ static void lcdif_panel_command_byte(STMP3770LCDIFState *s, uint8_t value)
         s->panel_param_len = 0;
         lcdif_panel_seek_start(s);
         break;
+    case 0x28: /* Display off: the glass goes blank. */
+        s->display_on = false;
+        s->panel_dirty = true;
+        s->panel_param_cmd = 0;
+        s->panel_param_len = 0;
+        break;
+    case 0x29: /* Display on. */
+        s->display_on = true;
+        s->panel_dirty = true;
+        s->panel_param_cmd = 0;
+        s->panel_param_len = 0;
+        break;
     default:
         s->panel_param_cmd = 0;
         s->panel_param_len = 0;
@@ -456,83 +437,6 @@ static void lcdif_store_surface_pixel(uint8_t *dest, int deststep,
     }
 }
 
-typedef struct STMP3770FrontpanelButton {
-    int x;
-    int y;
-    int w;
-    int h;
-    int key;
-    QKeyCode qcode;
-    const char *primary;
-    const char *secondary;
-} STMP3770FrontpanelButton;
-
-#define FP_RX(col) (FP_RIGHT_X + (col) * (FP_KEY_W + FP_KEY_GAP_X))
-#define FP_RY(row) (FP_RIGHT_Y + (row) * (FP_KEY_H + FP_KEY_GAP_Y))
-#define FP_LFX(idx) (FP_LEFT_X + (idx) * (FP_LEFT_KEY_W + FP_LEFT_GAP_X))
-
-static const STMP3770FrontpanelButton frontpanel_buttons[] = {
-    { FP_RX(0), FP_RY(0), FP_KEY_W, FP_KEY_H, HP39GII_KEY(3, 0), Q_KEY_CODE_UNMAPPED, "Vars", "Chars A" },
-    { FP_RX(1), FP_RY(0), FP_KEY_W, FP_KEY_H, HP39GII_KEY(4, 1), Q_KEY_CODE_UNMAPPED, "Math", "Cmds B" },
-    { FP_RX(2), FP_RY(0), FP_KEY_W, FP_KEY_H, HP39GII_KEY(3, 2), Q_KEY_CODE_UNMAPPED, "a b/c", "'' C" },
-    { FP_RX(3), FP_RY(0), FP_KEY_W, FP_KEY_H, HP39GII_KEY(2, 3), Q_KEY_CODE_UNMAPPED, "x,T,N", "EEX D" },
-    { FP_RX(4), FP_RY(0), FP_KEY_W, FP_KEY_H, HP39GII_KEY(3, 3), Q_KEY_CODE_BACKSPACE, "<-", "Clear" },
-
-    { FP_RX(0), FP_RY(1), FP_KEY_W, FP_KEY_H, HP39GII_KEY(4, 0), Q_KEY_CODE_UNMAPPED, "SIN", "ASIN E" },
-    { FP_RX(1), FP_RY(1), FP_KEY_W, FP_KEY_H, HP39GII_KEY(5, 1), Q_KEY_CODE_UNMAPPED, "COS", "ACOS F" },
-    { FP_RX(2), FP_RY(1), FP_KEY_W, FP_KEY_H, HP39GII_KEY(4, 2), Q_KEY_CODE_UNMAPPED, "TAN", "ATAN G" },
-    { FP_RX(3), FP_RY(1), FP_KEY_W, FP_KEY_H, HP39GII_KEY(4, 3), Q_KEY_CODE_UNMAPPED, "LN", "exp H" },
-    { FP_RX(4), FP_RY(1), FP_KEY_W, FP_KEY_H, HP39GII_KEY(4, 4), Q_KEY_CODE_UNMAPPED, "LOG", "10^x I" },
-
-    { FP_RX(0), FP_RY(2), FP_KEY_W, FP_KEY_H, HP39GII_KEY(5, 0), Q_KEY_CODE_UNMAPPED, "x^2", "sqrt J" },
-    { FP_RX(1), FP_RY(2), FP_KEY_W, FP_KEY_H, HP39GII_KEY(6, 1), Q_KEY_CODE_UNMAPPED, "x^y", "root K" },
-    { FP_RX(2), FP_RY(2), FP_KEY_W, FP_KEY_H, HP39GII_KEY(5, 2), Q_KEY_CODE_BRACKET_LEFT, "(", "Copy L" },
-    { FP_RX(3), FP_RY(2), FP_KEY_W, FP_KEY_H, HP39GII_KEY(5, 3), Q_KEY_CODE_BRACKET_RIGHT, ")", "Paste M" },
-    { FP_RX(4), FP_RY(2), FP_KEY_W, FP_KEY_H, HP39GII_KEY(5, 4), Q_KEY_CODE_KP_DIVIDE, "/", "x^-1 N" },
-
-    { FP_RX(0), FP_RY(3), FP_KEY_W, FP_KEY_H, HP39GII_KEY(6, 0), Q_KEY_CODE_COMMA, ",", "Memo O" },
-    { FP_RX(1), FP_RY(3), FP_KEY_W, FP_KEY_H, HP39GII_KEY(7, 1), Q_KEY_CODE_7, "7", "List P" },
-    { FP_RX(2), FP_RY(3), FP_KEY_W, FP_KEY_H, HP39GII_KEY(6, 2), Q_KEY_CODE_8, "8", "{ Q" },
-    { FP_RX(3), FP_RY(3), FP_KEY_W, FP_KEY_H, HP39GII_KEY(6, 3), Q_KEY_CODE_9, "9", "} R" },
-    { FP_RX(4), FP_RY(3), FP_KEY_W, FP_KEY_H, HP39GII_KEY(6, 4), Q_KEY_CODE_KP_MULTIPLY, "*", "! S" },
-
-    { FP_RX(0), FP_RY(4), FP_KEY_W, FP_KEY_H, HP39GII_KEY(7, 0), Q_KEY_CODE_A, "ALPHA", "alpha" },
-    { FP_RX(1), FP_RY(4), FP_KEY_W, FP_KEY_H, HP39GII_KEY(8, 1), Q_KEY_CODE_4, "4", "Matrix T" },
-    { FP_RX(2), FP_RY(4), FP_KEY_W, FP_KEY_H, HP39GII_KEY(7, 2), Q_KEY_CODE_5, "5", "U" },
-    { FP_RX(3), FP_RY(4), FP_KEY_W, FP_KEY_H, HP39GII_KEY(7, 3), Q_KEY_CODE_6, "6", "V" },
-    { FP_RX(4), FP_RY(4), FP_KEY_W, FP_KEY_H, HP39GII_KEY(7, 4), Q_KEY_CODE_KP_SUBTRACT, "-", "W" },
-
-    { FP_RX(0), FP_RY(5), FP_KEY_W, FP_KEY_H, HP39GII_KEY(8, 0), Q_KEY_CODE_SHIFT, "SHIFT", "" },
-    { FP_RX(1), FP_RY(5), FP_KEY_W, FP_KEY_H, HP39GII_KEY(9, 1), Q_KEY_CODE_1, "1", "Prgm X" },
-    { FP_RX(2), FP_RY(5), FP_KEY_W, FP_KEY_H, HP39GII_KEY(8, 2), Q_KEY_CODE_2, "2", "i Y" },
-    { FP_RX(3), FP_RY(5), FP_KEY_W, FP_KEY_H, HP39GII_KEY(8, 3), Q_KEY_CODE_3, "3", "pi Z" },
-    { FP_RX(4), FP_RY(5), FP_KEY_W, FP_KEY_H, HP39GII_KEY(8, 4), Q_KEY_CODE_KP_ADD, "+", "sum" },
-
-    { FP_RX(0), FP_RY(6), FP_KEY_W, FP_KEY_H, HP39GII_KEY(10, 0), Q_KEY_CODE_POWER, "ON/C", "OFF" },
-    { FP_RX(1), FP_RY(6), FP_KEY_W, FP_KEY_H, HP39GII_KEY(9, 0), Q_KEY_CODE_0, "0", "Notes" },
-    { FP_RX(2), FP_RY(6), FP_KEY_W, FP_KEY_H, HP39GII_KEY(9, 2), Q_KEY_CODE_DOT, ".", "=" },
-    { FP_RX(3), FP_RY(6), FP_KEY_W, FP_KEY_H, HP39GII_KEY(9, 3), Q_KEY_CODE_UNMAPPED, "(-)", "ABS" },
-    { FP_RX(4), FP_RY(6), FP_KEY_W, FP_KEY_H, HP39GII_KEY(9, 4), Q_KEY_CODE_RET, "ENTER", "ANS" },
-
-    { FP_LFX(0), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(0, 0), Q_KEY_CODE_F1, "F1", "" },
-    { FP_LFX(1), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(1, 1), Q_KEY_CODE_F2, "F2", "" },
-    { FP_LFX(2), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(0, 1), Q_KEY_CODE_F3, "F3", "" },
-    { FP_LFX(3), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(0, 2), Q_KEY_CODE_F4, "F4", "" },
-    { FP_LFX(4), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(0, 3), Q_KEY_CODE_F5, "F5", "" },
-    { FP_LFX(5), FP_LEFT_F_Y, FP_LEFT_KEY_W, FP_LEFT_KEY_H, HP39GII_KEY(1, 3), Q_KEY_CODE_F6, "F6", "" },
-
-    { FP_LEFT_X, FP_LEFT_F_Y + 62, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(1, 0), Q_KEY_CODE_UNMAPPED, "Symb", "Setup" },
-    { FP_LEFT_X + 78, FP_LEFT_F_Y + 62, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(2, 1), Q_KEY_CODE_UNMAPPED, "Plot", "Setup" },
-    { FP_LEFT_X + 156, FP_LEFT_F_Y + 62, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(1, 2), Q_KEY_CODE_NUM_LOCK, "Num", "Setup" },
-    { FP_LEFT_X, FP_LEFT_F_Y + 136, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(2, 0), Q_KEY_CODE_HOME, "Home", "Modes" },
-    { FP_LEFT_X + 78, FP_LEFT_F_Y + 136, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(3, 1), Q_KEY_CODE_UNMAPPED, "Apps", "Info" },
-    { FP_LEFT_X + 156, FP_LEFT_F_Y + 136, FP_LEFT_KEY_W, FP_KEY_H, HP39GII_KEY(2, 2), Q_KEY_CODE_UNMAPPED, "Views", "Help" },
-};
-
-#undef FP_RX
-#undef FP_RY
-#undef FP_LFX
-
 static bool frontpanel_key_is_down(STMP3770LCDIFState *s, int key)
 {
     if (key < 0 || key >= 128) {
@@ -560,455 +464,11 @@ static void frontpanel_set_key(STMP3770LCDIFState *s, int key, bool down)
     s->panel_dirty = true;
 }
 
-static void frontpanel_put_pixel(STMP3770LCDIFState *s, DisplaySurface *surface,
-                                 int x, int y, uint32_t pixel)
-{
-    int deststep;
-    int stride;
-
-    if (x < 0 || y < 0 ||
-        x >= surface_width(surface) || y >= surface_height(surface)) {
-        return;
-    }
-
-    deststep = surface_bytes_per_pixel(surface);
-    stride = surface_stride(surface);
-    if (deststep <= 0 || stride <= 0) {
-        return;
-    }
-
-    lcdif_store_surface_pixel(surface_data(surface) + y * stride + x * deststep,
-                              deststep, pixel);
-}
-
-static void frontpanel_fill_rect(STMP3770LCDIFState *s,
-                                 DisplaySurface *surface,
-                                 int x, int y, int w, int h,
-                                 uint32_t pixel)
-{
-    int yy;
-    int xx;
-
-    for (yy = MAX(y, 0); yy < MIN(y + h, surface_height(surface)); yy++) {
-        for (xx = MAX(x, 0); xx < MIN(x + w, surface_width(surface)); xx++) {
-            frontpanel_put_pixel(s, surface, xx, yy, pixel);
-        }
-    }
-}
-
-static void frontpanel_draw_rect(STMP3770LCDIFState *s,
-                                 DisplaySurface *surface,
-                                 int x, int y, int w, int h,
-                                 uint32_t pixel)
-{
-    int i;
-
-    for (i = 0; i < w; i++) {
-        frontpanel_put_pixel(s, surface, x + i, y, pixel);
-        frontpanel_put_pixel(s, surface, x + i, y + h - 1, pixel);
-    }
-    for (i = 0; i < h; i++) {
-        frontpanel_put_pixel(s, surface, x, y + i, pixel);
-        frontpanel_put_pixel(s, surface, x + w - 1, y + i, pixel);
-    }
-}
-
-static int frontpanel_text_width(const char *text, int scale)
-{
-    return (int)strlen(text) * 8 * scale;
-}
-
-static void frontpanel_draw_text(STMP3770LCDIFState *s,
-                                 DisplaySurface *surface,
-                                 int x, int y, const char *text,
-                                 int scale, uint32_t pixel)
-{
-    const unsigned char *p = (const unsigned char *)text;
-    int cx = x;
-
-    while (*p) {
-        const uint8_t *glyph = &vgafont16[*p * 16];
-        int row;
-        int bit;
-        int sy;
-        int sx;
-
-        for (row = 0; row < 16; row++) {
-            uint8_t bits = glyph[row];
-            for (bit = 0; bit < 8; bit++) {
-                if ((bits & (0x80 >> bit)) == 0) {
-                    continue;
-                }
-                for (sy = 0; sy < scale; sy++) {
-                    for (sx = 0; sx < scale; sx++) {
-                        frontpanel_put_pixel(s, surface,
-                                             cx + bit * scale + sx,
-                                             y + row * scale + sy,
-                                             pixel);
-                    }
-                }
-            }
-        }
-        cx += 8 * scale;
-        p++;
-    }
-}
-
-static void frontpanel_draw_button(STMP3770LCDIFState *s,
-                                   DisplaySurface *surface,
-                                   const STMP3770FrontpanelButton *button)
-{
-    bool down = frontpanel_key_is_down(s, button->key);
-    uint32_t border = lcdif_rgb_to_surface_pixel(s, 28, 28, 28);
-    uint32_t shadow = lcdif_rgb_to_surface_pixel(s, 80, 80, 80);
-    uint32_t hi = lcdif_rgb_to_surface_pixel(s, down ? 120 : 232,
-                                             down ? 145 : 232,
-                                             down ? 165 : 232);
-    uint32_t mid = lcdif_rgb_to_surface_pixel(s, down ? 92 : 190,
-                                              down ? 118 : 196,
-                                              down ? 138 : 198);
-    uint32_t text = lcdif_rgb_to_surface_pixel(s, 0, 0, 0);
-    uint32_t blue = lcdif_rgb_to_surface_pixel(s, 0, 76, 170);
-    int y;
-    int primary_scale;
-    int tx;
-
-    frontpanel_fill_rect(s, surface, button->x + 3, button->y + 3,
-                         button->w, button->h, shadow);
-    frontpanel_fill_rect(s, surface, button->x, button->y,
-                         button->w, button->h, border);
-    frontpanel_fill_rect(s, surface, button->x + 3, button->y + 3,
-                         button->w - 6, button->h - 6, mid);
-    for (y = button->y + 3; y < button->y + button->h / 2; y++) {
-        frontpanel_fill_rect(s, surface, button->x + 4, y,
-                             button->w - 8, 1, hi);
-    }
-
-    primary_scale = strlen(button->primary) <= 2 ? 2 : 1;
-    tx = button->x + (button->w -
-         frontpanel_text_width(button->primary, primary_scale)) / 2;
-    frontpanel_draw_text(s, surface, tx, button->y + 6,
-                         button->primary, primary_scale, text);
-
-    if (button->secondary && button->secondary[0]) {
-        tx = button->x + (button->w -
-             frontpanel_text_width(button->secondary, 1)) / 2;
-        frontpanel_draw_text(s, surface, tx, button->y + button->h - 18,
-                             button->secondary, 1, blue);
-    }
-}
-
-static void frontpanel_draw_lcd(STMP3770LCDIFState *s,
-                                DisplaySurface *surface)
-{
-    uint32_t border = lcdif_rgb_to_surface_pixel(s, 24, 24, 24);
-    uint32_t bezel = lcdif_rgb_to_surface_pixel(s, 75, 75, 75);
-    int x;
-    int y;
-    int sx;
-    int sy;
-
-    frontpanel_fill_rect(s, surface, FP_LCD_X - 4, FP_LCD_Y - 4,
-                         FP_LCD_W + 8, FP_LCD_H + 8, bezel);
-    frontpanel_draw_rect(s, surface, FP_LCD_X - 5, FP_LCD_Y - 5,
-                         FP_LCD_W + 10, FP_LCD_H + 10, border);
-
-    for (y = 0; y < STMP3770_LCDIF_VIEW_HEIGHT; y++) {
-        const uint8_t *src =
-            &s->panel_vram[(y + STMP3770_LCDIF_VIEW_Y) *
-                           STMP3770_LCDIF_PANEL_WIDTH];
-
-        for (x = 0; x < STMP3770_LCDIF_VIEW_WIDTH; x++) {
-            uint8_t gray = src[x];
-            uint32_t pixel = lcdif_rgb_to_surface_pixel(s, gray, gray, gray);
-
-            for (sy = 0; sy < FP_LCD_SCALE; sy++) {
-                for (sx = 0; sx < FP_LCD_SCALE; sx++) {
-                    frontpanel_put_pixel(s, surface,
-                                         FP_LCD_X + x * FP_LCD_SCALE + sx,
-                                         FP_LCD_Y + y * FP_LCD_SCALE + sy,
-                                         pixel);
-                }
-            }
-        }
-    }
-}
-
-static bool frontpanel_indicator_active(STMP3770LCDIFState *s, int panel_x)
-{
-    int y;
-
-    if (panel_x < 0 || panel_x >= STMP3770_LCDIF_PANEL_WIDTH) {
-        return false;
-    }
-
-    for (y = 0; y < 24 && y < STMP3770_LCDIF_PANEL_HEIGHT; y++) {
-        if (s->panel_vram[y * STMP3770_LCDIF_PANEL_WIDTH + panel_x] < 128) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void frontpanel_draw_status(STMP3770LCDIFState *s,
-                                   DisplaySurface *surface)
-{
-    static const struct {
-        int sample_x;
-        const char *label;
-    } indicators[] = {
-        { 10, "A-Z" },
-        { 28, "TX" },
-        { 37, "L" },
-        { 44, "a-z" },
-        { 50, "RX" },
-        { 64, "R" },
-        { 82, "BUSY" },
-        { 76, "BAT" },
-    };
-    uint32_t white = lcdif_rgb_to_surface_pixel(s, 248, 248, 248);
-    uint32_t border = lcdif_rgb_to_surface_pixel(s, 120, 120, 120);
-    uint32_t inactive = lcdif_rgb_to_surface_pixel(s, 226, 226, 226);
-    uint32_t active = lcdif_rgb_to_surface_pixel(s, 35, 93, 132);
-    uint32_t text = lcdif_rgb_to_surface_pixel(s, 20, 20, 20);
-    uint32_t active_text = lcdif_rgb_to_surface_pixel(s, 255, 255, 255);
-    int i;
-    int x = FP_STATUS_X + 12;
-
-    frontpanel_fill_rect(s, surface, FP_STATUS_X, FP_STATUS_Y,
-                         FP_STATUS_W, FP_STATUS_H, white);
-    frontpanel_draw_rect(s, surface, FP_STATUS_X, FP_STATUS_Y,
-                         FP_STATUS_W, FP_STATUS_H, border);
-
-    for (i = 0; i < ARRAY_SIZE(indicators); i++) {
-        bool on = frontpanel_indicator_active(s, indicators[i].sample_x);
-        uint32_t fill = on ? active : inactive;
-        uint32_t fg = on ? active_text : text;
-
-        frontpanel_fill_rect(s, surface, x, FP_STATUS_Y + 16, 45, 24, fill);
-        frontpanel_draw_rect(s, surface, x, FP_STATUS_Y + 16, 45, 24, border);
-        frontpanel_draw_text(s, surface, x + 5, FP_STATUS_Y + 20,
-                             indicators[i].label, 1, fg);
-        x += 50;
-    }
-}
-
-static void frontpanel_draw_nav(STMP3770LCDIFState *s, DisplaySurface *surface)
-{
-    uint32_t dark = lcdif_rgb_to_surface_pixel(s, 58, 58, 58);
-    uint32_t mid = lcdif_rgb_to_surface_pixel(s, 170, 170, 170);
-    uint32_t light = lcdif_rgb_to_surface_pixel(s, 225, 225, 225);
-    uint32_t blue = lcdif_rgb_to_surface_pixel(s, 0, 72, 160);
-    int cx = FP_NAV_X + FP_NAV_SIZE / 2;
-    int cy = FP_NAV_Y + FP_NAV_SIZE / 2;
-    int r = FP_NAV_SIZE / 2;
-    int x;
-    int y;
-
-    for (y = -r; y <= r; y++) {
-        for (x = -r; x <= r; x++) {
-            int d2 = x * x + y * y;
-            if (d2 <= r * r) {
-                uint32_t pixel = (d2 < (r - 18) * (r - 18)) ? mid : dark;
-                if (x < -20 || y < -20) {
-                    pixel = light;
-                }
-                frontpanel_put_pixel(s, surface, cx + x, cy + y, pixel);
-            }
-        }
-    }
-
-    frontpanel_draw_text(s, surface, cx - 4, FP_NAV_Y + 12, "^", 1, blue);
-    frontpanel_draw_text(s, surface, cx - 4, FP_NAV_Y + FP_NAV_SIZE - 28,
-                         "v", 1, blue);
-    frontpanel_draw_text(s, surface, FP_NAV_X + 16, cy - 8, "<", 1, blue);
-    frontpanel_draw_text(s, surface, FP_NAV_X + FP_NAV_SIZE - 24, cy - 8,
-                         ">", 1, blue);
-}
-
-static void frontpanel_draw_background(STMP3770LCDIFState *s,
-                                       DisplaySurface *surface)
-{
-    uint32_t bg = lcdif_rgb_to_surface_pixel(s, 244, 244, 244);
-    uint32_t dot = lcdif_rgb_to_surface_pixel(s, 185, 185, 185);
-    uint32_t border = lcdif_rgb_to_surface_pixel(s, 16, 115, 155);
-    uint32_t text = lcdif_rgb_to_surface_pixel(s, 0, 0, 0);
-    int x;
-    int y;
-
-    frontpanel_fill_rect(s, surface, 0, 0,
-                         STMP3770_LCDIF_FRONTPANEL_WIDTH,
-                         STMP3770_LCDIF_FRONTPANEL_HEIGHT, bg);
-
-    for (y = 22; y < STMP3770_LCDIF_FRONTPANEL_HEIGHT - 18; y += 8) {
-        for (x = 8; x < STMP3770_LCDIF_FRONTPANEL_WIDTH - 8; x += 8) {
-            frontpanel_put_pixel(s, surface, x, y, dot);
-        }
-    }
-
-    frontpanel_draw_rect(s, surface, 0, 0,
-                         STMP3770_LCDIF_FRONTPANEL_WIDTH,
-                         STMP3770_LCDIF_FRONTPANEL_HEIGHT, border);
-    frontpanel_draw_text(s, surface, 8, 8, "Exist OS Emulator (ARM)", 1, text);
-}
-
-static int frontpanel_find_key_at(int x, int y)
-{
-    int i;
-    int nx = x - FP_NAV_X;
-    int ny = y - FP_NAV_Y;
-
-    for (i = 0; i < ARRAY_SIZE(frontpanel_buttons); i++) {
-        const STMP3770FrontpanelButton *button = &frontpanel_buttons[i];
-
-        if (x >= button->x && x < button->x + button->w &&
-            y >= button->y && y < button->y + button->h) {
-            return button->key;
-        }
-    }
-
-    if (nx >= 0 && ny >= 0 && nx < FP_NAV_SIZE && ny < FP_NAV_SIZE) {
-        if (ny < 50 && nx >= 45 && nx < 105) {
-            return HP39GII_KEY(0, 4);
-        }
-        if (ny >= 100 && nx >= 45 && nx < 105) {
-            return HP39GII_KEY(3, 4);
-        }
-        if (nx < 50 && ny >= 45 && ny < 105) {
-            return HP39GII_KEY(2, 4);
-        }
-        if (nx >= 100 && ny >= 45 && ny < 105) {
-            return HP39GII_KEY(1, 4);
-        }
-    }
-
-    return HP39GII_KEY_NONE;
-}
-
-static int frontpanel_key_for_qcode(QKeyCode qcode)
-{
-    int i;
-
-    for (i = 0; i < ARRAY_SIZE(frontpanel_buttons); i++) {
-        if (frontpanel_buttons[i].qcode == qcode) {
-            return frontpanel_buttons[i].key;
-        }
-    }
-
-    switch (qcode) {
-    case Q_KEY_CODE_UP:
-        return HP39GII_KEY(0, 4);
-    case Q_KEY_CODE_RIGHT:
-        return HP39GII_KEY(1, 4);
-    case Q_KEY_CODE_LEFT:
-        return HP39GII_KEY(2, 4);
-    case Q_KEY_CODE_DOWN:
-        return HP39GII_KEY(3, 4);
-    case Q_KEY_CODE_KP_ENTER:
-        return HP39GII_KEY(9, 4);
-    case Q_KEY_CODE_KP_0:
-        return HP39GII_KEY(9, 0);
-    case Q_KEY_CODE_KP_1:
-        return HP39GII_KEY(9, 1);
-    case Q_KEY_CODE_KP_2:
-        return HP39GII_KEY(8, 2);
-    case Q_KEY_CODE_KP_3:
-        return HP39GII_KEY(8, 3);
-    case Q_KEY_CODE_KP_4:
-        return HP39GII_KEY(8, 1);
-    case Q_KEY_CODE_KP_5:
-        return HP39GII_KEY(7, 2);
-    case Q_KEY_CODE_KP_6:
-        return HP39GII_KEY(7, 3);
-    case Q_KEY_CODE_KP_7:
-        return HP39GII_KEY(7, 1);
-    case Q_KEY_CODE_KP_8:
-        return HP39GII_KEY(6, 2);
-    case Q_KEY_CODE_KP_9:
-        return HP39GII_KEY(6, 3);
-    case Q_KEY_CODE_EQUAL:
-        return HP39GII_KEY(8, 4);
-    case Q_KEY_CODE_MINUS:
-        return HP39GII_KEY(7, 4);
-    case Q_KEY_CODE_SLASH:
-        return HP39GII_KEY(5, 4);
-    case Q_KEY_CODE_ASTERISK:
-        return HP39GII_KEY(6, 4);
-    case Q_KEY_CODE_ESC:
-        return HP39GII_KEY(10, 0);
-    case Q_KEY_CODE_DELETE:
-        return HP39GII_KEY(3, 3);
-    default:
-        return HP39GII_KEY_NONE;
-    }
-}
-
-static void frontpanel_draw(STMP3770LCDIFState *s, DisplaySurface *surface)
-{
-    int i;
-
-    frontpanel_draw_background(s, surface);
-    frontpanel_draw_status(s, surface);
-    frontpanel_draw_lcd(s, surface);
-    frontpanel_draw_nav(s, surface);
-
-    for (i = 0; i < ARRAY_SIZE(frontpanel_buttons); i++) {
-        frontpanel_draw_button(s, surface, &frontpanel_buttons[i]);
-    }
-}
-
 static void frontpanel_release_mouse_key(STMP3770LCDIFState *s)
 {
-    if (s->frontpanel_mouse_key != HP39GII_KEY_NONE) {
+    if (s->frontpanel_mouse_key != HP39GII_FP_KEY_NONE) {
         frontpanel_set_key(s, s->frontpanel_mouse_key, false);
-        s->frontpanel_mouse_key = HP39GII_KEY_NONE;
-    }
-}
-
-static void frontpanel_pointer_abs(STMP3770LCDIFState *s, InputMoveEvent *move)
-{
-    if (move->axis == INPUT_AXIS_X) {
-        s->frontpanel_mouse_x =
-            qemu_input_scale_axis(move->value,
-                                  INPUT_EVENT_ABS_MIN,
-                                  INPUT_EVENT_ABS_MAX,
-                                  0,
-                                  STMP3770_LCDIF_FRONTPANEL_WIDTH - 1);
-    } else if (move->axis == INPUT_AXIS_Y) {
-        s->frontpanel_mouse_y =
-            qemu_input_scale_axis(move->value,
-                                  INPUT_EVENT_ABS_MIN,
-                                  INPUT_EVENT_ABS_MAX,
-                                  0,
-                                  STMP3770_LCDIF_FRONTPANEL_HEIGHT - 1);
-    }
-}
-
-static void frontpanel_pointer_button(STMP3770LCDIFState *s,
-                                      InputBtnEvent *btn)
-{
-    int key;
-
-    if (btn->button != INPUT_BUTTON_LEFT) {
-        return;
-    }
-
-    if (!btn->down) {
-        frontpanel_release_mouse_key(s);
-        return;
-    }
-
-    key = frontpanel_find_key_at(s->frontpanel_mouse_x,
-                                 s->frontpanel_mouse_y);
-    if (key == HP39GII_KEY_NONE) {
-        frontpanel_release_mouse_key(s);
-        return;
-    }
-
-    if (s->frontpanel_mouse_key != key) {
-        frontpanel_release_mouse_key(s);
-        frontpanel_set_key(s, key, true);
-        s->frontpanel_mouse_key = key;
+        s->frontpanel_mouse_key = HP39GII_FP_KEY_NONE;
     }
 }
 
@@ -1020,17 +480,45 @@ static void lcdif_frontpanel_input_event(DeviceState *dev, QemuConsole *src,
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_KEY:
-        key = frontpanel_key_for_qcode(
+        key = hp39gii_fp_key_for_qcode(
             qemu_input_key_value_to_qcode(evt->u.key.data->key));
-        if (key != HP39GII_KEY_NONE) {
+        if (key != HP39GII_FP_KEY_NONE) {
             frontpanel_set_key(s, key, evt->u.key.data->down);
         }
         break;
     case INPUT_EVENT_KIND_ABS:
-        frontpanel_pointer_abs(s, evt->u.abs.data);
+        if (evt->u.abs.data->axis == INPUT_AXIS_X) {
+            s->frontpanel_mouse_x =
+                qemu_input_scale_axis(evt->u.abs.data->value,
+                                      INPUT_EVENT_ABS_MIN,
+                                      INPUT_EVENT_ABS_MAX,
+                                      0, HP39GII_FP_WIDTH - 1);
+        } else if (evt->u.abs.data->axis == INPUT_AXIS_Y) {
+            s->frontpanel_mouse_y =
+                qemu_input_scale_axis(evt->u.abs.data->value,
+                                      INPUT_EVENT_ABS_MIN,
+                                      INPUT_EVENT_ABS_MAX,
+                                      0, HP39GII_FP_HEIGHT - 1);
+        }
         break;
     case INPUT_EVENT_KIND_BTN:
-        frontpanel_pointer_button(s, evt->u.btn.data);
+        if (evt->u.btn.data->button != INPUT_BUTTON_LEFT) {
+            break;
+        }
+        if (!evt->u.btn.data->down) {
+            frontpanel_release_mouse_key(s);
+            break;
+        }
+        key = hp39gii_fp_key_at(s->frontpanel_mouse_x, s->frontpanel_mouse_y);
+        if (key == HP39GII_FP_KEY_NONE) {
+            frontpanel_release_mouse_key(s);
+            break;
+        }
+        if (s->frontpanel_mouse_key != key) {
+            frontpanel_release_mouse_key(s);
+            frontpanel_set_key(s, key, true);
+            s->frontpanel_mouse_key = key;
+        }
         break;
     default:
         break;
@@ -1082,23 +570,13 @@ static DisplaySurface *lcdif_prepare_surface(STMP3770LCDIFState *s,
 
 static bool lcdif_update_panel_display(STMP3770LCDIFState *s)
 {
-    DisplaySurface *surface;
-
     if (!s->panel_dirty) {
         return false;
     }
 
-    surface = lcdif_prepare_surface(s, STMP3770_LCDIF_FRONTPANEL_WIDTH,
-                                    STMP3770_LCDIF_FRONTPANEL_HEIGHT);
-    if (!surface) {
-        return false;
-    }
-
-    frontpanel_draw(s, surface);
+    hp39gii_fp_render(s->con, s->panel_vram, s->frontpanel_key_state,
+                      s->display_on);
     s->panel_dirty = false;
-    dpy_gfx_update(s->con, 0, 0,
-                   STMP3770_LCDIF_FRONTPANEL_WIDTH,
-                   STMP3770_LCDIF_FRONTPANEL_HEIGHT);
     return true;
 }
 
@@ -1698,7 +1176,8 @@ static void lcdif_reset(DeviceState *dev)
     memset(s->frontpanel_key_state, 0, sizeof(s->frontpanel_key_state));
     s->frontpanel_mouse_x = 0;
     s->frontpanel_mouse_y = 0;
-    s->frontpanel_mouse_key = HP39GII_KEY_NONE;
+    s->frontpanel_mouse_key = HP39GII_FP_KEY_NONE;
+    s->display_on = false;
     s->panel_dirty = true;
     lcdif_panel_reset_window(s);
 }
@@ -1732,8 +1211,8 @@ static void lcdif_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "stmp3770-lcdif: failed to initialize graphic console");
         return;
     }
-    qemu_console_resize(s->con, STMP3770_LCDIF_FRONTPANEL_WIDTH,
-                        STMP3770_LCDIF_FRONTPANEL_HEIGHT);
+    qemu_console_resize(s->con, HP39GII_FP_WIDTH,
+                        HP39GII_FP_HEIGHT);
 
     s->input_handler =
         qemu_input_handler_register(dev, &lcdif_frontpanel_input_handler);
@@ -1747,7 +1226,7 @@ static void lcdif_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_lcdif = {
     .name = "stmp3770-lcdif",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl0, STMP3770LCDIFState),
@@ -1779,6 +1258,7 @@ static const VMStateDescription vmstate_lcdif = {
         VMSTATE_UINT8_ARRAY(panel_vram, STMP3770LCDIFState,
                             STMP3770_LCDIF_PANEL_SIZE),
         VMSTATE_BOOL(panel_dirty, STMP3770LCDIFState),
+        VMSTATE_BOOL_V(display_on, STMP3770LCDIFState, 4),
         VMSTATE_UINT64_ARRAY(frontpanel_key_state, STMP3770LCDIFState, 2),
         VMSTATE_INT32(frontpanel_mouse_x, STMP3770LCDIFState),
         VMSTATE_INT32(frontpanel_mouse_y, STMP3770LCDIFState),
@@ -1798,7 +1278,7 @@ static void lcdif_init(Object *obj)
     s->surface_format = PIXMAN_x8r8g8b8;
     s->panel_dirty = true;
     s->dma_channel = -1;
-    s->frontpanel_mouse_key = HP39GII_KEY_NONE;
+    s->frontpanel_mouse_key = HP39GII_FP_KEY_NONE;
     lcdif_panel_reset_window(s);
 }
 

@@ -1,0 +1,8 @@
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 1111111..2222222 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -61,3 +61,3 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
+ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
+-system_ss.add(when: 'CONFIG_STMP3770_LCDIF', if_true: files('stmp3770_lcdif.c'))
++system_ss.add(when: 'CONFIG_STMP3770_LCDIF', if_true: files('stmp3770_lcdif.c', 'hp39gii_frontpanel.c'))

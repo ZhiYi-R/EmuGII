@@ -38,9 +38,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(STMP3770LCDIFState, STMP3770_LCDIF)
 #define STMP3770_LCDIF_VIEW_HEIGHT 128
 #define STMP3770_LCDIF_VIEW_Y      8
 
-#define STMP3770_LCDIF_FRONTPANEL_WIDTH  1000
-#define STMP3770_LCDIF_FRONTPANEL_HEIGHT 625
-
 struct STMP3770LCDIFState {
     SysBusDevice parent_obj;
 
@@ -84,6 +81,7 @@ struct STMP3770LCDIFState {
     bool first_read_dummy_pending;
     uint8_t panel_vram[STMP3770_LCDIF_PANEL_SIZE];
     bool panel_dirty;
+    bool display_on;
 
     STMP3770PINCTRLState *pinctrl;
     QemuInputHandlerState *input_handler;
