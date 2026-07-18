@@ -52,6 +52,7 @@ env = Environment(ENV=os.environ)
 # 构建类型：默认 release；通过 scons debug=1 或 EMUGII_DEBUG=1 启用 debug
 DEBUG_BUILD = ARGUMENTS.get('debug', os.environ.get('EMUGII_DEBUG', '0')).lower() in (
     '1', 'yes', 'true', 'on')
+QEMU_BUILD_TYPE = 'debug' if DEBUG_BUILD else 'release'
 QEMU_DEBUG_FLAG = '--enable-debug' if DEBUG_BUILD else ''
 
 
@@ -176,6 +177,7 @@ def apply_patches(target, source, env):
         ('src/hw/block/stmp3770_gpmi.c', 'hw/block/stmp3770_gpmi.c'),
         ('src/hw/i2c/stmp3770_i2c.c', 'hw/i2c/stmp3770_i2c.c'),
         ('src/hw/ssi/stmp3770_ssp.c', 'hw/ssi/stmp3770_ssp.c'),
+        ('src/contrib/plugins/mmio_profile.c', 'contrib/plugins/mmio_profile.c'),
     ]
 
     # 将 QEMU 工作树统一归一化为 LF，避免 Windows 下的 CRLF 导致补丁/编译异常
@@ -259,9 +261,10 @@ def configure_qemu(target, source, env):
 
     configure_cmd = [
         bash, '-lc',
-        'cd {} && CC=gcc CXX=g++ {} --target-list=arm-softmmu {} --disable-werror --disable-vhost-user --disable-libvduse --disable-guest-agent'.format(
+        'cd {} && CC=gcc CXX=g++ {} --target-list=arm-softmmu --enable-plugins -Dbuildtype={} {} --disable-werror --disable-vhost-user --disable-libvduse --disable-guest-agent'.format(
             shlex.quote(build_dir_unix),
             shlex.quote(f'{qemu_dir_unix}/configure'),
+            QEMU_BUILD_TYPE,
             QEMU_DEBUG_FLAG
         )
     ]
@@ -518,7 +521,7 @@ patched_qemu = env.Command(
 # 3. 配置 QEMU
 configured_qemu = env.Command(
     os.path.join(QEMU_BUILDDIR, '.configured'),
-    patched_qemu,
+    [patched_qemu, Value(f'buildtype={QEMU_BUILD_TYPE}')],
     configure_qemu
 )
 
