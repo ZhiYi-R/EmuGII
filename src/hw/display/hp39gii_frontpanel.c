@@ -41,6 +41,7 @@
 #define GLASS_X      32
 #define GLASS_Y      104
 #define GLASS_W      512
+#define GLASS_H      308
 
 #define STRIP_Y      104   /* annunciator strip inside the glass */
 #define STRIP_H      44
@@ -972,7 +973,7 @@ static void fp_draw_glass(const FPCtx *ctx, const uint8_t *vram,
 {
     /* The whole glass area is repainted on every call; the bezel around
      * it belongs to the static backdrop (fp_draw_body). */
-    fp_fill_rect(ctx, GLASS_X, GLASS_Y, GLASS_W, 308,
+    fp_fill_rect(ctx, GLASS_X, GLASS_Y, GLASS_W, GLASS_H,
                  fp_rgb(ctx, COL_GLASS));
 
     if (!display_on) {
@@ -1049,7 +1050,13 @@ void hp39gii_fp_render(QemuConsole *con, const uint8_t *vram,
 
     fp_draw_glass(&ctx, vram, display_on);
 
-    dpy_gfx_update(con, 0, 0, HP39GII_FP_WIDTH, HP39GII_FP_HEIGHT);
+    /* Only the glass area changes when the static body/keys are not stale.
+     * Limiting the damaged region reduces host display-backend work. */
+    if (backdrop_stale) {
+        dpy_gfx_update(con, 0, 0, HP39GII_FP_WIDTH, HP39GII_FP_HEIGHT);
+    } else {
+        dpy_gfx_update(con, GLASS_X, GLASS_Y, GLASS_W, GLASS_H);
+    }
 }
 
 int hp39gii_fp_key_at(int x, int y)
